@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"errors"
 	"fmt"
 
 	log "gopkg.in/inconshreveable/log15.v2"
@@ -10,6 +9,7 @@ import (
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/project"
+	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/lxd/storage/drivers"
 	"github.com/lxc/lxd/shared/api"
@@ -49,7 +49,7 @@ func volIDFuncMake(state *state.State, poolID int64) func(volType drivers.Volume
 
 		volID, _, err := state.Cluster.GetLocalStoragePoolVolume(projectName, volName, volTypeID, poolID)
 		if err != nil {
-			if err == db.ErrNoSuchObject {
+			if response.IsNotFoundError(err) {
 				return -1, fmt.Errorf("Failed to get volume ID for project %q, volume %q, type %q: Volume doesn't exist", projectName, volName, volType)
 			}
 
@@ -255,31 +255,39 @@ func GetPoolByInstance(s *state.State, inst instance.Instance) (Pool, error) {
 	return nil, drivers.ErrNotSupported
 }
 
-// UnavailablePools returns the names of storage pools not available on the local server.
-func UnavailablePools() []string {
+// IsAvailable checks if a pool is available.
+func IsAvailable(poolName string) bool {
 	unavailablePoolsMu.Lock()
 	defer unavailablePoolsMu.Unlock()
 
-	unavailablePoolNames := make([]string, 0, len(unavailablePools))
-	for unavailablePoolName := range unavailablePools {
-		unavailablePoolNames = append(unavailablePoolNames, unavailablePoolName)
+	if _, found := unavailablePools[poolName]; found {
+		return false
 	}
 
-	return unavailablePoolNames
+	return true
 }
 
 // Patch applies specified patch to all storage pools.
 // All storage pools must be available locally before any storage pools are patched.
 func Patch(s *state.State, patchName string) error {
-	unavailablePoolNames := UnavailablePools()
+	unavailablePoolsMu.Lock()
+
 	if len(unavailablePools) > 0 {
+		unavailablePoolNames := make([]string, 0, len(unavailablePools))
+		for unavailablePoolName := range unavailablePools {
+			unavailablePoolNames = append(unavailablePoolNames, unavailablePoolName)
+		}
+
+		unavailablePoolsMu.Unlock()
 		return fmt.Errorf("Unvailable storage pools: %v", unavailablePoolNames)
 	}
+
+	unavailablePoolsMu.Unlock()
 
 	// Load all the pools.
 	pools, err := s.Cluster.GetStoragePoolNames()
 	if err != nil {
-		if errors.Is(err, db.ErrNoSuchObject) {
+		if response.IsNotFoundError(err) {
 			return nil
 		}
 
