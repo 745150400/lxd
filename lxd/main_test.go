@@ -3,15 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 
-	"github.com/lxc/lxd/lxd/db"
-	"github.com/lxc/lxd/lxd/sys"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"golang.org/x/sys/unix"
 
+	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/sys"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/idmap"
 )
@@ -28,7 +28,8 @@ func mockStartDaemon() (*Daemon, error) {
 		return nil, err
 	}
 
-	if err := d.Init(); err != nil {
+	err = d.Init()
+	if err != nil {
 		return nil, err
 	}
 
@@ -50,13 +51,15 @@ type lxdTestSuite struct {
 const lxdTestSuiteDefaultStoragePool string = "lxdTestrunPool"
 
 func (suite *lxdTestSuite) SetupTest() {
-	tmpdir, err := ioutil.TempDir("", "lxd_testrun_")
+	tmpdir, err := os.MkdirTemp("", "lxd_testrun_")
 	if err != nil {
 		suite.T().Errorf("failed to create temp dir: %v", err)
 	}
+
 	suite.tmpdir = tmpdir
 
-	if err := os.Setenv("LXD_DIR", suite.tmpdir); err != nil {
+	err = os.Setenv("LXD_DIR", suite.tmpdir)
+	if err != nil {
 		suite.T().Errorf("failed to set LXD_DIR: %v", err)
 	}
 
@@ -79,19 +82,19 @@ func (suite *lxdTestSuite) SetupTest() {
 	rootDev := map[string]string{}
 	rootDev["path"] = "/"
 	rootDev["pool"] = lxdTestSuiteDefaultStoragePool
-	device := db.Device{
+	device := cluster.Device{
 		Name:   "root",
-		Type:   db.TypeDisk,
+		Type:   cluster.TypeDisk,
 		Config: rootDev,
 	}
 
-	err = suite.d.cluster.Transaction(func(tx *db.ClusterTx) error {
-		profile, err := tx.GetProfile("default", "default")
+	err = suite.d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		profile, err := cluster.GetProfile(ctx, tx.Tx(), "default", "default")
 		if err != nil {
 			return err
 		}
-		profile.Devices["root"] = device
-		return tx.UpdateProfile("default", "default", *profile)
+
+		return cluster.UpdateProfileDevices(ctx, tx.Tx(), int64(profile.ID), map[string]cluster.Device{"root": device})
 	})
 	if err != nil {
 		suite.T().Errorf("failed to update default profile: %v", err)
@@ -105,6 +108,7 @@ func (suite *lxdTestSuite) TearDownTest() {
 	if err != nil {
 		suite.T().Errorf("failed to stop daemon: %v", err)
 	}
+
 	err = os.RemoveAll(suite.tmpdir)
 	if err != nil {
 		suite.T().Errorf("failed to remove temp dir: %v", err)

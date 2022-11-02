@@ -11,12 +11,10 @@ import (
 	"sync"
 	"time"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/db/query"
-	"github.com/lxc/lxd/lxd/node"
+	"github.com/lxc/lxd/lxd/db/warningtype"
 	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/lxd/task"
 	"github.com/lxc/lxd/lxd/warnings"
@@ -102,7 +100,8 @@ func (hbState *APIHeartbeat) Update(fullStateList bool, raftNodes []db.RaftNode,
 			Roles:         node.Roles,
 		}
 
-		if raftNode, exists := raftNodeMap[member.Address]; exists {
+		raftNode, exists := raftNodeMap[member.Address]
+		if exists {
 			member.RaftID = raftNode.ID
 			member.RaftRole = int(raftNode.Role)
 			delete(raftNodeMap, member.Address) // Used to check any remaining later.
@@ -127,9 +126,9 @@ func (hbState *APIHeartbeat) Update(fullStateList bool, raftNodes []db.RaftNode,
 	}
 
 	if len(raftNodeMap) > 0 && hbState.cluster != nil {
-		hbState.cluster.Transaction(func(tx *db.ClusterTx) error {
+		_ = hbState.cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			for addr, raftNode := range raftNodeMap {
-				_, err := tx.GetPendingNodeByAddress(addr)
+				_, err := tx.GetPendingNodeByAddress(ctx, addr)
 				if err != nil {
 					logger.Errorf("Unaccounted raft node(s) not found in 'nodes' table for heartbeat: %+v", raftNode)
 				}
@@ -138,8 +137,6 @@ func (hbState *APIHeartbeat) Update(fullStateList bool, raftNodes []db.RaftNode,
 			return nil
 		})
 	}
-
-	return
 }
 
 // Send sends heartbeat requests to the nodes supplied and updates heartbeat state.
@@ -179,26 +176,26 @@ func (hbState *APIHeartbeat) Send(ctx context.Context, networkCert *shared.CertI
 			hbNode.updated = true
 			heartbeatData.Members[nodeID] = hbNode
 			heartbeatData.Unlock()
-			logger.Debug("Successful heartbeat", log.Ctx{"remote": address})
+			logger.Debug("Successful heartbeat", logger.Ctx{"remote": address})
 
-			err = warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(hbState.cluster, "", db.WarningOfflineClusterMember, cluster.TypeNode, int(nodeID))
+			err = warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(hbState.cluster, "", warningtype.OfflineClusterMember, cluster.TypeNode, int(nodeID))
 			if err != nil {
-				logger.Warn("Failed to resolve warning", log.Ctx{"err": err})
+				logger.Warn("Failed to resolve warning", logger.Ctx{"err": err})
 			}
 		} else {
-			logger.Warn("Failed heartbeat", log.Ctx{"remote": address, "err": err})
+			logger.Warn("Failed heartbeat", logger.Ctx{"remote": address, "err": err})
 
 			if ctx.Err() == nil {
-				err = hbState.cluster.UpsertWarningLocalNode("", cluster.TypeNode, int(nodeID), db.WarningOfflineClusterMember, err.Error())
+				err = hbState.cluster.UpsertWarningLocalNode("", cluster.TypeNode, int(nodeID), warningtype.OfflineClusterMember, err.Error())
 				if err != nil {
-					logger.Warn("Failed to create warning", log.Ctx{"err": err})
+					logger.Warn("Failed to create warning", logger.Ctx{"err": err})
 				}
 			}
 		}
 	}
 
 	for _, node := range nodes {
-		// Special case for the local node - just record the time now.
+		// Special case for the local member - just record the time now.
 		if node.Address == localAddress {
 			hbState.Lock()
 			hbNode := hbState.Members[node.ID]
@@ -317,20 +314,21 @@ func (g *Gateway) heartbeat(ctx context.Context, mode heartbeatMode) {
 			return
 		}
 
-		logger.Error("Failed to get current raft members", log.Ctx{"err": err})
+		logger.Error("Failed to get current raft members", logger.Ctx{"err": err})
 		return
 	}
 
 	// Address of this node.
-	localAddress, err := node.ClusterAddress(g.db)
-	if err != nil {
-		logger.Error("Failed to fetch local cluster address", log.Ctx{"err": err})
+	var localClusterAddress string
+	s := g.state()
+
+	if s.LocalConfig != nil {
+		localClusterAddress = s.LocalConfig.ClusterAddress()
 	}
 
-	var allNodes []db.NodeInfo
-	err = g.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		var err error
-		allNodes, err = tx.GetNodes()
+	var members []db.NodeInfo
+	err = g.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		members, err = tx.GetNodes(ctx)
 		if err != nil {
 			return err
 		}
@@ -338,7 +336,7 @@ func (g *Gateway) heartbeat(ctx context.Context, mode heartbeatMode) {
 		return nil
 	})
 	if err != nil {
-		logger.Warn("Failed to get current cluster members", log.Ctx{"err": err})
+		logger.Warn("Failed to get current cluster members", logger.Ctx{"err": err})
 		return
 	}
 
@@ -352,27 +350,27 @@ func (g *Gateway) heartbeat(ctx context.Context, mode heartbeatMode) {
 
 	if mode != hearbeatNormal {
 		// Log unscheduled heartbeats with a higher level than normal heartbeats.
-		logger.Info("Starting heartbeat round", log.Ctx{"mode": modeStr, "local": localAddress})
+		logger.Info("Starting heartbeat round", logger.Ctx{"mode": modeStr, "local": localClusterAddress})
 	} else {
 		// Don't spam the normal log with regular heartbeat messages.
-		logger.Debug("Starting heartbeat round", log.Ctx{"mode": modeStr, "local": localAddress})
+		logger.Debug("Starting heartbeat round", logger.Ctx{"mode": modeStr, "local": localClusterAddress})
 	}
 
 	// Replace the local raft_nodes table immediately because it
 	// might miss a row containing ourselves, since we might have
 	// been elected leader before the former leader had chance to
 	// send us a fresh update through the heartbeat pool.
-	logger.Debug("Heartbeat updating local raft members", log.Ctx{"members": raftNodes})
-	err = g.db.Transaction(func(tx *db.NodeTx) error {
+	logger.Debug("Heartbeat updating local raft members", logger.Ctx{"members": raftNodes})
+	err = g.db.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		return tx.ReplaceRaftNodes(raftNodes)
 	})
 	if err != nil {
-		logger.Warn("Failed to replace local raft members", log.Ctx{"err": err, "mode": modeStr, "local": localAddress})
+		logger.Warn("Failed to replace local raft members", logger.Ctx{"err": err, "mode": modeStr, "local": localClusterAddress})
 		return
 	}
 
-	if localAddress == "" {
-		logger.Error("No local address set, aborting heartbeat round", log.Ctx{"mode": modeStr})
+	if localClusterAddress == "" {
+		logger.Error("No local address set, aborting heartbeat round", logger.Ctx{"mode": modeStr})
 		return
 	}
 
@@ -390,19 +388,21 @@ func (g *Gateway) heartbeat(ctx context.Context, mode heartbeatMode) {
 		spreadDuration = heartbeatInterval
 	}
 
+	serverCert := g.state().ServerCert()
+
 	// If this leader node hasn't sent a heartbeat recently, then its node state records
 	// are likely out of date, this can happen when a node becomes a leader.
 	// Send stale set to all nodes in database to get a fresh set of active nodes.
 	if mode == hearbeatInitial {
-		hbState.Update(false, raftNodes, allNodes, g.HeartbeatOfflineThreshold)
-		hbState.Send(ctx, g.networkCert, g.serverCert(), localAddress, allNodes, spreadDuration)
+		hbState.Update(false, raftNodes, members, g.HeartbeatOfflineThreshold)
+		hbState.Send(ctx, g.networkCert, serverCert, localClusterAddress, members, spreadDuration)
 
 		// We have the latest set of node states now, lets send that state set to all nodes.
 		hbState.FullStateList = true
-		hbState.Send(ctx, g.networkCert, g.serverCert(), localAddress, allNodes, spreadDuration)
+		hbState.Send(ctx, g.networkCert, serverCert, localClusterAddress, members, spreadDuration)
 	} else {
-		hbState.Update(true, raftNodes, allNodes, g.HeartbeatOfflineThreshold)
-		hbState.Send(ctx, g.networkCert, g.serverCert(), localAddress, allNodes, spreadDuration)
+		hbState.Update(true, raftNodes, members, g.HeartbeatOfflineThreshold)
+		hbState.Send(ctx, g.networkCert, serverCert, localClusterAddress, members, spreadDuration)
 	}
 
 	// Check if context has been cancelled.
@@ -410,10 +410,10 @@ func (g *Gateway) heartbeat(ctx context.Context, mode heartbeatMode) {
 
 	// Look for any new node which appeared since sending last heartbeat.
 	if ctxErr == nil {
-		var currentNodes []db.NodeInfo
-		err = g.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		var currentMembers []db.NodeInfo
+		err = g.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			var err error
-			currentNodes, err = tx.GetNodes()
+			currentMembers, err = tx.GetNodes(ctx)
 			if err != nil {
 				return err
 			}
@@ -421,15 +421,15 @@ func (g *Gateway) heartbeat(ctx context.Context, mode heartbeatMode) {
 			return nil
 		})
 		if err != nil {
-			logger.Warn("Failed to get current cluster members", log.Ctx{"err": err, "mode": modeStr, "local": localAddress})
+			logger.Warn("Failed to get current cluster members", logger.Ctx{"err": err, "mode": modeStr, "local": localClusterAddress})
 			return
 		}
 
-		newNodes := []db.NodeInfo{}
-		for _, currentNode := range currentNodes {
+		newMembers := []db.NodeInfo{}
+		for _, currentMember := range currentMembers {
 			existing := false
-			for _, node := range allNodes {
-				if node.Address == currentNode.Address && node.ID == currentNode.ID {
+			for _, member := range members {
+				if member.Address == currentMember.Address && member.ID == currentMember.ID {
 					existing = true
 					break
 				}
@@ -437,15 +437,15 @@ func (g *Gateway) heartbeat(ctx context.Context, mode heartbeatMode) {
 
 			if !existing {
 				// We found a new node
-				allNodes = append(allNodes, currentNode)
-				newNodes = append(newNodes, currentNode)
+				members = append(members, currentMember)
+				newMembers = append(newMembers, currentMember)
 			}
 		}
 
 		// If any new nodes found, send heartbeat to just them (with full node state).
-		if len(newNodes) > 0 {
-			hbState.Update(true, raftNodes, allNodes, g.HeartbeatOfflineThreshold)
-			hbState.Send(ctx, g.networkCert, g.serverCert(), localAddress, newNodes, 0)
+		if len(newMembers) > 0 {
+			hbState.Update(true, raftNodes, members, g.HeartbeatOfflineThreshold)
+			hbState.Send(ctx, g.networkCert, serverCert, localClusterAddress, newMembers, 0)
 		}
 	}
 
@@ -458,7 +458,7 @@ func (g *Gateway) heartbeat(ctx context.Context, mode heartbeatMode) {
 			return fmt.Errorf("Cluster unavailable")
 		}
 
-		return g.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		return g.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			for _, node := range hbState.Members {
 				if !node.updated {
 					// If member has not been updated during this heartbeat round it means
@@ -479,13 +479,13 @@ func (g *Gateway) heartbeat(ctx context.Context, mode heartbeatMode) {
 		})
 	})
 	if err != nil {
-		logger.Error("Failed updating cluster heartbeats", log.Ctx{"err": err})
+		logger.Error("Failed updating cluster heartbeats", logger.Ctx{"err": err})
 		return
 	}
 
 	// If the context has been cancelled, return prematurely after saving the members we did manage to ping.
 	if ctxErr != nil {
-		logger.Warn("Aborting heartbeat round", log.Ctx{"err": ctxErr, "mode": modeStr, "local": localAddress})
+		logger.Warn("Aborting heartbeat round", logger.Ctx{"err": ctxErr, "mode": modeStr, "local": localClusterAddress})
 		return
 	}
 
@@ -494,18 +494,23 @@ func (g *Gateway) heartbeat(ctx context.Context, mode heartbeatMode) {
 		g.HeartbeatNodeHook(hbState, true, unavailableMembers)
 	}
 
-	duration := time.Now().Sub(startTime)
+	duration := time.Since(startTime)
 	if duration > heartbeatInterval {
-		logger.Warn("Heartbeat round duration greater than heartbeat interval", log.Ctx{"duration": duration, "interval": heartbeatInterval})
+		logger.Warn("Heartbeat round duration greater than heartbeat interval", logger.Ctx{"duration": duration, "interval": heartbeatInterval})
 	}
 
-	// Update last leader heartbeat time so next time a full node state list can be sent (if not this time).
-	logger.Debug("Completed heartbeat round", log.Ctx{"duration": duration, "local": localAddress})
+	if mode != hearbeatNormal {
+		// Log unscheduled heartbeats with a higher level than normal heartbeats.
+		logger.Info("Completed heartbeat round", logger.Ctx{"duration": duration, "local": localClusterAddress})
+	} else {
+		// Don't spam the normal log with regular heartbeat messages.
+		logger.Debug("Completed heartbeat round", logger.Ctx{"duration": duration, "local": localClusterAddress})
+	}
 }
 
 // HeartbeatNode performs a single heartbeat request against the node with the given address.
 func HeartbeatNode(taskCtx context.Context, address string, networkCert *shared.CertInfo, serverCert *shared.CertInfo, heartbeatData *APIHeartbeat) error {
-	logger.Debug("Sending heartbeat request", log.Ctx{"address": address})
+	logger.Debug("Sending heartbeat request", logger.Ctx{"address": address})
 
 	config, err := tlsClientConfig(networkCert, serverCert)
 	if err != nil {
@@ -533,6 +538,7 @@ func HeartbeatNode(taskCtx context.Context, address string, networkCert *shared.
 	if err != nil {
 		return err
 	}
+
 	setDqliteVersionHeader(request)
 
 	// Use 1s later timeout to give HTTP client chance timeout with more useful info.
@@ -545,7 +551,8 @@ func HeartbeatNode(taskCtx context.Context, address string, networkCert *shared.
 	if err != nil {
 		return fmt.Errorf("Failed to send heartbeat request: %w", err)
 	}
-	defer response.Body.Close()
+
+	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("Heartbeat request failed with status: %w", api.StatusErrorf(response.StatusCode, response.Status))

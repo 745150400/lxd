@@ -10,17 +10,8 @@ import (
 	"github.com/lxc/lxd/shared/logger"
 )
 
-// Transaction executes the given function within a database transaction.
-func Transaction(db *sql.DB, f func(*sql.Tx) error) error {
-	funcCtx := func(ctx context.Context, tx *sql.Tx) error {
-		return f(tx)
-	}
-
-	return TransactionCtx(context.Background(), db, funcCtx)
-}
-
-// TransactionCtx executes the given function within a database transaction with a 10s context timeout.
-func TransactionCtx(ctx context.Context, db *sql.DB, f func(context.Context, *sql.Tx) error) error {
+// Transaction executes the given function within a database transaction with a 10s context timeout.
+func Transaction(ctx context.Context, db *sql.DB, f func(context.Context, *sql.Tx) error) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
 
@@ -29,9 +20,10 @@ func TransactionCtx(ctx context.Context, db *sql.DB, f func(context.Context, *sq
 		// If there is a leftover transaction let's try to rollback,
 		// we'll then retry again.
 		if strings.Contains(err.Error(), "cannot start a transaction within a transaction") {
-			db.Exec("ROLLBACK")
+			_, _ = db.Exec("ROLLBACK")
 		}
-		return fmt.Errorf("failed to begin transaction: %w", err)
+
+		return fmt.Errorf("Failed to begin transaction: %w", err)
 	}
 
 	err = f(ctx, tx)
@@ -43,6 +35,7 @@ func TransactionCtx(ctx context.Context, db *sql.DB, f func(context.Context, *sq
 	if err == sql.ErrTxDone {
 		err = nil // Ignore duplicate commits/rollbacks
 	}
+
 	return err
 }
 

@@ -46,7 +46,7 @@ func (d *mock) Delete(op *operations.Operation) error {
 
 // Validate checks that all provide keys are supported and that no conflicting or missing configuration is present.
 func (d *mock) Validate(config map[string]string) error {
-	return d.validatePool(config, nil)
+	return d.validatePool(config, nil, nil)
 }
 
 // Update applies any driver changes required from a configuration change.
@@ -80,7 +80,7 @@ func (d *mock) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcData
 }
 
 // CreateVolumeFromCopy provides same-pool volume copying functionality.
-func (d *mock) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, op *operations.Operation) error {
+func (d *mock) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, allowInconsistent bool, op *operations.Operation) error {
 	return nil
 }
 
@@ -90,7 +90,7 @@ func (d *mock) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, vo
 }
 
 // RefreshVolume provides same-pool volume and specific snapshots syncing functionality.
-func (d *mock) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, op *operations.Operation) error {
+func (d *mock) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, allowInconsistent bool, op *operations.Operation) error {
 	return nil
 }
 
@@ -116,7 +116,8 @@ func (d *mock) UpdateVolume(vol Volume, changedConfig map[string]string) error {
 		return ErrNotSupported
 	}
 
-	if _, changed := changedConfig["size"]; changed {
+	_, changed := changedConfig["size"]
+	if changed {
 		err := d.SetVolumeQuota(vol, changedConfig["size"], false, nil)
 		if err != nil {
 			return err
@@ -185,8 +186,8 @@ func (d *mock) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) er
 }
 
 // MountVolumeSnapshot sets up a read-only mount on top of the snapshot to avoid accidental modifications.
-func (d *mock) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
-	return true, nil
+func (d *mock) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
+	return nil
 }
 
 // UnmountVolumeSnapshot removes the read-only mount placed on top of a snapshot.

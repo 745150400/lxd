@@ -37,7 +37,7 @@ func Load(schema Schema, values map[string]string) (Map, error) {
 //
 // Return a map of key/value pairs that were actually changed. If some keys
 // fail to apply, details are included in the returned ErrorList.
-func (m *Map) Change(changes map[string]interface{}) (map[string]string, error) {
+func (m *Map) Change(changes map[string]any) (map[string]string, error) {
 	values := make(map[string]string, len(m.schema))
 
 	errors := ErrorList{}
@@ -84,6 +84,7 @@ func (m *Map) Change(changes map[string]interface{}) (map[string]string, error) 
 	for _, name := range names {
 		changed[name] = m.GetRaw(name)
 	}
+
 	return changed, err
 }
 
@@ -92,8 +93,8 @@ func (m *Map) Change(changes map[string]interface{}) (map[string]string, error) 
 // Keys that match their default value will not be included in the dump. Also,
 // if a Key has its Hidden attribute set to true, it will be rendered as
 // "true", for obfuscating the actual value.
-func (m *Map) Dump() map[string]interface{} {
-	values := map[string]interface{}{}
+func (m *Map) Dump() map[string]any {
+	values := map[string]any{}
 
 	for name, value := range m.values {
 		key, ok := m.schema[name]
@@ -128,6 +129,7 @@ func (m *Map) GetRaw(name string) string {
 	if !ok {
 		value = key.Default
 	}
+
 	return value
 }
 
@@ -153,6 +155,7 @@ func (m *Map) GetInt64(name string) int64 {
 	if err != nil {
 		panic(fmt.Sprintf("cannot convert to int64: %v", err))
 	}
+
 	return n
 }
 
@@ -178,6 +181,7 @@ func (m *Map) update(values map[string]string) ([]string, error) {
 			errors.add(name, value, err.Error())
 			continue
 		}
+
 		if changed {
 			names = append(names, name)
 		}
@@ -260,5 +264,6 @@ func normalizeBool(value string) string {
 	if shared.IsTrue(value) {
 		return "true"
 	}
+
 	return "false"
 }

@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/url"
 	"os"
 	"sort"
@@ -70,17 +70,21 @@ func (c *cmdStorage) Command() *cobra.Command {
 	storageUnsetCmd := cmdStorageUnset{global: c.global, storage: c, storageSet: &storageSetCmd}
 	cmd.AddCommand(storageUnsetCmd.Command())
 
+	// Bucket
+	storageBucketCmd := cmdStorageBucket{global: c.global}
+	cmd.AddCommand(storageBucketCmd.Command())
+
 	// Volume
 	storageVolumeCmd := cmdStorageVolume{global: c.global, storage: c}
 	cmd.AddCommand(storageVolumeCmd.Command())
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Create
+// Create.
 type cmdStorageCreate struct {
 	global  *cmdGlobal
 	storage *cmdStorage
@@ -153,7 +157,7 @@ func (c *cmdStorageCreate) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Delete
+// Delete.
 type cmdStorageDelete struct {
 	global  *cmdGlobal
 	storage *cmdStorage
@@ -204,7 +208,7 @@ func (c *cmdStorageDelete) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Edit
+// Edit.
 type cmdStorageEdit struct {
 	global  *cmdGlobal
 	storage *cmdStorage
@@ -263,7 +267,7 @@ func (c *cmdStorageEdit) Run(cmd *cobra.Command, args []string) error {
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -316,15 +320,17 @@ func (c *cmdStorageEdit) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			continue
 		}
+
 		break
 	}
 
 	return nil
 }
 
-// Get
+// Get.
 type cmdStorageGet struct {
 	global  *cmdGlobal
 	storage *cmdStorage
@@ -382,7 +388,7 @@ func (c *cmdStorageGet) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Info
+// Info.
 type cmdStorageInfo struct {
 	global  *cmdGlobal
 	storage *cmdStorage
@@ -460,17 +466,47 @@ func (c *cmdStorageInfo) Run(cmd *cobra.Command, args []string) error {
 	poolusedby[usedbystring] = map[string][]string{}
 
 	/* Build up the usedby map
-	/1.0/{instances,images,profiles}/storagepoolname
+	/1.0/{instances,images,profiles}/storagepoolname and
+	/1.0/storage-pools/<poolname>/<type>/<volname>
 	remove the /1.0/ and build the map based on the resources name as key
 	and resources details as value */
 	for _, v := range pool.UsedBy {
-		bytype := string(strings.Split(v[5:], "/")[0])
-		bywhat := string(strings.Split(v[5:], "/")[1])
+		u, err := url.Parse(v)
+		if err != nil {
+			continue
+		}
 
-		u, _ := url.Parse(v)
-		node, ok := u.Query()["target"]
-		if ok {
-			bywhat = fmt.Sprintf("%s (%s)", bywhat, node[0])
+		fields := strings.Split(u.Path[5:], "/")
+		bytype := fields[0]
+		bywhat := fields[1]
+
+		if bytype == "storage-pools" {
+			bytype = "volumes"
+			bywhat = fields[4]
+		}
+
+		var info string
+
+		// Show info regarding the project and target if present.
+		values := u.Query()
+
+		proj := values.Get("project")
+		target := values.Get("target")
+
+		if proj != "" {
+			info = fmt.Sprintf("project %q", proj)
+		}
+
+		if target != "" {
+			if info == "" {
+				info = fmt.Sprintf("target %q", target)
+			} else {
+				info = fmt.Sprintf("%s, target %q", info, target)
+			}
+		}
+
+		if info != "" {
+			bywhat = fmt.Sprintf("%s (%s)", bywhat, info)
 		}
 
 		poolusedby[usedbystring][bytype] = append(poolusedby[usedbystring][bytype], bywhat)
@@ -507,7 +543,7 @@ func (c *cmdStorageInfo) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// List
+// List.
 type cmdStorageList struct {
 	global  *cmdGlobal
 	storage *cmdStorage
@@ -568,12 +604,14 @@ func (c *cmdStorageList) Run(cmd *cobra.Command, args []string) error {
 		details = append(details, strings.ToUpper(pool.Status))
 		data = append(data, details)
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
 		i18n.G("NAME"),
 		i18n.G("DRIVER"),
 	}
+
 	if !resource.server.IsClustered() {
 		header = append(header, i18n.G("SOURCE"))
 	}
@@ -585,7 +623,7 @@ func (c *cmdStorageList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, pools)
 }
 
-// Set
+// Set.
 type cmdStorageSet struct {
 	global  *cmdGlobal
 	storage *cmdStorage
@@ -657,7 +695,7 @@ func (c *cmdStorageSet) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Show
+// Show.
 type cmdStorageShow struct {
 	global  *cmdGlobal
 	storage *cmdStorage
@@ -742,7 +780,7 @@ func (c *cmdStorageShow) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Unset
+// Unset.
 type cmdStorageUnset struct {
 	global     *cmdGlobal
 	storage    *cmdStorage

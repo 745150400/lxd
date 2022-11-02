@@ -1,10 +1,8 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package sys
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,7 +13,7 @@ import (
 
 // NewTestOS returns a new OS instance initialized with test values.
 func NewTestOS(t *testing.T) (*OS, func()) {
-	dir, err := ioutil.TempDir("", "lxd-sys-os-test-")
+	dir, err := os.MkdirTemp("", "lxd-sys-os-test-")
 	require.NoError(t, err)
 	require.NoError(t, SetupTestCerts(dir))
 

@@ -1,14 +1,15 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
 
+	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/shared/api"
 )
 
@@ -21,7 +22,7 @@ func (c *Cluster) CreateNetworkPeer(networkID int64, info *api.NetworkPeersPost)
 	var localPeerID int64
 	var targetPeerNetworkID int64 = int64(-1) // -1 means no mutual peering exists.
 
-	err = c.Transaction(func(tx *ClusterTx) error {
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Insert a new Network pending peer record.
 		result, err := tx.tx.Exec(`
 		INSERT INTO networks_peers
@@ -76,7 +77,7 @@ func (c *Cluster) CreateNetworkPeer(networkID int64, info *api.NetworkPeersPost)
 
 		var targetPeerID int64 = int64(-1)
 
-		err = tx.tx.QueryRow(q, info.TargetProject, info.TargetNetwork, networkID, localPeerID).Scan(&targetPeerID, &targetPeerNetworkID)
+		err = tx.tx.QueryRowContext(ctx, q, info.TargetProject, info.TargetNetwork, networkID, localPeerID).Scan(&targetPeerID, &targetPeerNetworkID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("Failed looking up mutual peering: %w", err)
 		} else if err == nil {
@@ -129,7 +130,8 @@ func networkPeerConfigAdd(tx *sql.Tx, peerID int64, config map[string]string) er
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+
+	defer func() { _ = stmt.Close() }()
 
 	for k, v := range config {
 		if v == "" {
@@ -180,8 +182,8 @@ func (c *Cluster) GetNetworkPeer(networkID int64, peerName string) (int64, *api.
 	var targetPeerNetworkName string
 	var targetPeerNetworkProject string
 
-	err = c.Transaction(func(tx *ClusterTx) error {
-		err = tx.tx.QueryRow(q, networkID, peerName).Scan(&peerID, &peer.Name, &peer.Description, &peer.TargetProject, &peer.TargetNetwork, &targetPeerNetworkName, &targetPeerNetworkProject)
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		err = tx.tx.QueryRowContext(ctx, q, networkID, peerName).Scan(&peerID, &peer.Name, &peer.Description, &peer.TargetProject, &peer.TargetNetwork, &targetPeerNetworkName, &targetPeerNetworkProject)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return api.StatusErrorf(http.StatusNotFound, "Network peer not found")
@@ -190,7 +192,7 @@ func (c *Cluster) GetNetworkPeer(networkID int64, peerName string) (int64, *api.
 			return err
 		}
 
-		err = networkPeerConfig(tx, peerID, &peer)
+		err = networkPeerConfig(ctx, tx, peerID, &peer)
 		if err != nil {
 			return err
 		}
@@ -237,7 +239,7 @@ func networkPeerPopulatePeerInfo(peer *api.NetworkPeer, targetPeerNetworkProject
 }
 
 // networkPeerConfig populates the config map of the Network Peer with the given ID.
-func networkPeerConfig(tx *ClusterTx, peerID int64, peer *api.NetworkPeer) error {
+func networkPeerConfig(ctx context.Context, tx *ClusterTx, peerID int64, peer *api.NetworkPeer) error {
 	q := `
 	SELECT
 		key,
@@ -247,7 +249,7 @@ func networkPeerConfig(tx *ClusterTx, peerID int64, peer *api.NetworkPeer) error
 	`
 
 	peer.Config = make(map[string]string)
-	return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 		var key, value string
 
 		err := scan(&key, &value)
@@ -297,8 +299,8 @@ func (c *Cluster) GetNetworkPeers(networkID int64) (map[int64]*api.NetworkPeer, 
 	var err error
 	peers := make(map[int64]*api.NetworkPeer)
 
-	err = c.Transaction(func(tx *ClusterTx) error {
-		err = tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		err = query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 			var peerID int64 = int64(-1)
 			var peer api.NetworkPeer
 			var targetPeerNetworkName string
@@ -321,7 +323,7 @@ func (c *Cluster) GetNetworkPeers(networkID int64) (map[int64]*api.NetworkPeer, 
 
 		// Populate config.
 		for peerID := range peers {
-			err = networkPeerConfig(tx, peerID, peers[peerID])
+			err = networkPeerConfig(ctx, tx, peerID, peers[peerID])
 			if err != nil {
 				return err
 			}
@@ -348,8 +350,8 @@ func (c *Cluster) GetNetworkPeerNames(networkID int64) (map[int64]string, error)
 
 	peers := make(map[int64]string)
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 			var peerID int64 = int64(-1)
 			var peerName string
 
@@ -372,9 +374,7 @@ func (c *Cluster) GetNetworkPeerNames(networkID int64) (map[int64]string, error)
 
 // UpdateNetworkPeer updates an existing Network Peer.
 func (c *Cluster) UpdateNetworkPeer(networkID int64, peerID int64, info *api.NetworkPeerPut) error {
-	var err error
-
-	err = c.Transaction(func(tx *ClusterTx) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Update existing Network peer record.
 		res, err := tx.tx.Exec(`
 		UPDATE networks_peers
@@ -416,7 +416,7 @@ func (c *Cluster) UpdateNetworkPeer(networkID int64, peerID int64, info *api.Net
 
 // DeleteNetworkPeer deletes an existing Network Peer.
 func (c *Cluster) DeleteNetworkPeer(networkID int64, peerID int64) error {
-	return c.Transaction(func(tx *ClusterTx) error {
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Delete existing Network peer record.
 		res, err := tx.tx.Exec(`
 			DELETE FROM networks_peers
@@ -461,8 +461,8 @@ func (c *Cluster) GetNetworkPeersTargetNetworkIDs(projectName string, networkTyp
 		AND p.target_network_id > 0
 	`
 
-	err = c.Transaction(func(tx *ClusterTx) error {
-		return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 			var peerName string
 			var networkName string
 			var targetNetworkID int64 = int64(-1)

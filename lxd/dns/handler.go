@@ -21,7 +21,11 @@ func (d dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	if d.server.zoneRetriever == nil {
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeServerFailure)
-		w.WriteMsg(m)
+		err := w.WriteMsg(m)
+		if err != nil {
+			logger.Error("Unable to write message", logger.Ctx{"err": err})
+		}
+
 		return
 	}
 
@@ -29,15 +33,23 @@ func (d dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	if len(r.Question) != 1 {
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeServerFailure)
-		w.WriteMsg(m)
+		err := w.WriteMsg(m)
+		if err != nil {
+			logger.Error("Unable to write message", logger.Ctx{"err": err})
+		}
+
 		return
 	}
 
-	// Check that it's AXFR.
-	if r.Question[0].Qtype != dns.TypeAXFR {
+	// Check that it's a supported request type.
+	if r.Question[0].Qtype != dns.TypeAXFR && r.Question[0].Qtype != dns.TypeIXFR && r.Question[0].Qtype != dns.TypeSOA {
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeNotImplemented)
-		w.WriteMsg(m)
+		err := w.WriteMsg(m)
+		if err != nil {
+			logger.Error("Unable to write message", logger.Ctx{"err": err})
+		}
+
 		return
 	}
 
@@ -47,7 +59,11 @@ func (d dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	if err != nil {
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeServerFailure)
-		w.WriteMsg(m)
+		err := w.WriteMsg(m)
+		if err != nil {
+			logger.Error("Unable to write message", logger.Ctx{"err": err})
+		}
+
 		return
 	}
 
@@ -57,12 +73,16 @@ func (d dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	m.Authoritative = true
 
 	// Load the zone.
-	zone, err := d.server.zoneRetriever(name)
+	zone, err := d.server.zoneRetriever(name, r.Question[0].Qtype != dns.TypeSOA)
 	if err != nil {
 		// On failure, return NXDOMAIN.
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeNameError)
-		w.WriteMsg(m)
+		err := w.WriteMsg(m)
+		if err != nil {
+			logger.Error("Unable to write message", logger.Ctx{"err": err})
+		}
+
 		return
 	}
 
@@ -71,7 +91,11 @@ func (d dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		// On auth failure, return NXDOMAIN to avoid information leaks.
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeNameError)
-		w.WriteMsg(m)
+		err := w.WriteMsg(m)
+		if err != nil {
+			logger.Error("Unable to write message", logger.Ctx{"err": err})
+		}
+
 		return
 	}
 
@@ -85,7 +109,11 @@ func (d dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 				m := new(dns.Msg)
 				m.SetRcode(r, dns.RcodeFormatError)
-				w.WriteMsg(m)
+				err := w.WriteMsg(m)
+				if err != nil {
+					logger.Error("Unable to write message", logger.Ctx{"err": err})
+				}
+
 				return
 			}
 
@@ -100,9 +128,10 @@ func (d dnsHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		m.SetTsig(tsig.Hdr.Name, tsig.Algorithm, 300, time.Now().Unix())
 	}
 
-	w.WriteMsg(m)
-
-	return
+	err = w.WriteMsg(m)
+	if err != nil {
+		logger.Error("Unable to write message", logger.Ctx{"err": err})
+	}
 }
 
 func (d *dnsHandler) isAllowed(zone api.NetworkZone, ip string, tsig *dns.TSIG, tsigStatus bool) bool {

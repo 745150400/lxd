@@ -5,7 +5,55 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/lxc/lxd/shared/api"
 )
+
+// CephGetRBDImageName returns the RBD image name as it is used in ceph.
+// Example:
+// A custom block volume named vol1 in project default will return custom_default_vol1.block.
+func CephGetRBDImageName(vol Volume, snapName string, zombie bool) string {
+	var out string
+	parentName, snapshotName, isSnapshot := api.GetParentAndSnapshotName(vol.name)
+
+	// Only use filesystem suffix on filesystem type image volumes (for all content types).
+	if vol.volType == VolumeTypeImage || vol.volType == cephVolumeTypeZombieImage {
+		parentName = fmt.Sprintf("%s_%s", parentName, vol.ConfigBlockFilesystem())
+	}
+
+	if vol.contentType == ContentTypeBlock {
+		parentName = fmt.Sprintf("%s%s", parentName, cephBlockVolSuffix)
+	}
+
+	// Use volume's type as storage volume prefix, unless there is an override in cephVolTypePrefixes.
+	volumeTypePrefix := string(vol.volType)
+	volumeTypePrefixOverride, foundOveride := cephVolTypePrefixes[vol.volType]
+	if foundOveride {
+		volumeTypePrefix = volumeTypePrefixOverride
+	}
+
+	if snapName != "" {
+		// Always use the provided snapshot name if specified.
+		out = fmt.Sprintf("%s_%s@%s", volumeTypePrefix, parentName, snapName)
+	} else {
+		if isSnapshot {
+			// If volumeName is a snapshot (<vol>/<snap>) and snapName is not set,
+			// assume that it's a normal snapshot (not a zombie) and prefix it with
+			// "snapshot_".
+			out = fmt.Sprintf("%s_%s@snapshot_%s", volumeTypePrefix, parentName, snapshotName)
+		} else {
+			out = fmt.Sprintf("%s_%s", volumeTypePrefix, parentName)
+		}
+	}
+
+	// If the volume is to be in zombie state (i.e. not tracked by the LXD database),
+	// prefix the output with "zombie_".
+	if zombie {
+		out = fmt.Sprintf("zombie_%s", out)
+	}
+
+	return out
+}
 
 // CephMonitors gets the mon-host field for the relevant cluster and extracts the list of addresses and ports.
 func CephMonitors(cluster string) ([]string, error) {
@@ -33,7 +81,7 @@ func CephMonitors(cluster string) ([]string, error) {
 			}
 
 			// Parsing mon_host is quite tricky.
-			// It supports a comma separated list of:
+			// It supports a space separate list of comma separated lists of:
 			//  - DNS names
 			//  - IPv4 addresses
 			//  - IPv6 addresses (square brackets)
@@ -46,34 +94,49 @@ func CephMonitors(cluster string) ([]string, error) {
 			// doesn't take the version indication, trailing bits or supports those
 			// tuples, all of those effectively get stripped away to get a clean
 			// address list (with ports).
-			servers := strings.Split(fields[1], ",")
-			for _, server := range servers {
-				// Trim leading/trailing spaces.
-				server = strings.TrimSpace(server)
+			entries := strings.Split(fields[1], " ")
+			for _, entry := range entries {
+				servers := strings.Split(entry, ",")
+				for _, server := range servers {
+					// Trim leading/trailing spaces.
+					server = strings.TrimSpace(server)
 
-				// Trim leading protocol version.
-				server = strings.TrimPrefix(server, "v1:")
-				server = strings.TrimPrefix(server, "v2:")
-				server = strings.TrimPrefix(server, "[v1:")
-				server = strings.TrimPrefix(server, "[v2:")
+					// Trim leading protocol version.
+					server = strings.TrimPrefix(server, "v1:")
+					server = strings.TrimPrefix(server, "v2:")
+					server = strings.TrimPrefix(server, "[v1:")
+					server = strings.TrimPrefix(server, "[v2:")
 
-				// Trim trailing divider.
-				server = strings.Split(server, "/")[0]
+					// Trim trailing divider.
+					server = strings.Split(server, "/")[0]
 
-				// Handle end of nested blocks.
-				server = strings.Replace(server, "]]", "]", 0)
-				if !strings.HasPrefix(server, "[") {
-					server = strings.TrimSuffix(server, "]")
+					// Handle end of nested blocks.
+					server = strings.ReplaceAll(server, "]]", "]")
+					if !strings.HasPrefix(server, "[") {
+						server = strings.TrimSuffix(server, "]")
+					}
+
+					// Trim any spaces.
+					server = strings.TrimSpace(server)
+
+					// If nothing left, skip.
+					if server == "" {
+						continue
+					}
+
+					// Append the default v1 port if none are present.
+					if !strings.HasSuffix(server, ":6789") && !strings.HasSuffix(server, ":3300") {
+						server += ":6789"
+					}
+
+					cephMon = append(cephMon, strings.TrimSpace(server))
 				}
-
-				cephMon = append(cephMon, strings.TrimSpace(server))
 			}
-			break
 		}
 	}
 
 	if len(cephMon) == 0 {
-		return nil, fmt.Errorf("Couldn't find a CPEH mon")
+		return nil, fmt.Errorf("Couldn't find a CEPH mon")
 	}
 
 	return cephMon, nil

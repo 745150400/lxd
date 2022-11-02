@@ -1,13 +1,13 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/db"
-	"github.com/lxc/lxd/lxd/node"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
@@ -31,29 +31,28 @@ const (
 // NewNotifier builds a Notifier that can be used to notify other peers using
 // the given policy.
 func NewNotifier(state *state.State, networkCert *shared.CertInfo, serverCert *shared.CertInfo, policy NotifierPolicy) (Notifier, error) {
-	address, err := node.ClusterAddress(state.Node)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch node address: %w", err)
-	}
+	localClusterAddress := state.LocalConfig.ClusterAddress()
 
 	// Fast-track the case where we're not clustered at all.
-	if address == "" {
+	if localClusterAddress == "" {
 		nullNotifier := func(func(lxd.InstanceServer) error) error { return nil }
 		return nullNotifier, nil
 	}
 
-	var nodes []db.NodeInfo
+	var err error
+	var members []db.NodeInfo
 	var offlineThreshold time.Duration
-	err = state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		offlineThreshold, err = tx.GetNodeOfflineThreshold()
+	err = state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		offlineThreshold, err = tx.GetNodeOfflineThreshold(ctx)
 		if err != nil {
 			return err
 		}
 
-		nodes, err = tx.GetNodes()
+		members, err = tx.GetNodes(ctx)
 		if err != nil {
-			return err
+			return fmt.Errorf("Failed getting cluster members: %w", err)
 		}
+
 		return nil
 	})
 	if err != nil {
@@ -61,27 +60,28 @@ func NewNotifier(state *state.State, networkCert *shared.CertInfo, serverCert *s
 	}
 
 	peers := []string{}
-	for _, node := range nodes {
-		if node.Address == address || node.Address == "0.0.0.0" {
+	for _, member := range members {
+		if member.Address == localClusterAddress || member.Address == "0.0.0.0" {
 			continue // Exclude ourselves
 		}
 
-		if node.IsOffline(offlineThreshold) {
+		if member.IsOffline(offlineThreshold) {
 			// Even if the heartbeat timestamp is not recent
 			// enough, let's try to connect to the node, just in
 			// case the heartbeat is lagging behind for some reason
 			// and the node is actually up.
-			if !HasConnectivity(networkCert, serverCert, node.Address) {
+			if !HasConnectivity(networkCert, serverCert, member.Address) {
 				switch policy {
 				case NotifyAll:
-					return nil, fmt.Errorf("peer node %s is down", node.Address)
+					return nil, fmt.Errorf("peer node %s is down", member.Address)
 				case NotifyAlive:
 					continue // Just skip this node
 				case NotifyTryAll:
 				}
 			}
 		}
-		peers = append(peers, node.Address)
+
+		peers = append(peers, member.Address)
 	}
 
 	notifier := func(hook func(lxd.InstanceServer) error) error {
@@ -97,12 +97,14 @@ func NewNotifier(state *state.State, networkCert *shared.CertInfo, serverCert *s
 					errs[i] = fmt.Errorf("failed to connect to peer %s: %w", address, err)
 					return
 				}
+
 				err = hook(client)
 				if err != nil {
 					errs[i] = fmt.Errorf("failed to notify peer %s: %w", address, err)
 				}
 			}(i, address)
 		}
+
 		wg.Wait()
 		// TODO: aggregate all errors?
 		for i, err := range errs {

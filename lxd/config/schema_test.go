@@ -3,8 +3,9 @@ package config_test
 import (
 	"testing"
 
-	"github.com/lxc/lxd/lxd/config"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/lxc/lxd/lxd/config"
 )
 
 func TestSchema_Defaults(t *testing.T) {
@@ -12,7 +13,8 @@ func TestSchema_Defaults(t *testing.T) {
 		"foo": {},
 		"bar": {Default: "x"},
 	}
-	values := map[string]interface{}{"foo": "", "bar": "x"}
+
+	values := map[string]any{"foo": "", "bar": "x"}
 	assert.Equal(t, values, schema.Defaults())
 }
 
@@ -21,6 +23,7 @@ func TestSchema_Keys(t *testing.T) {
 		"foo": {},
 		"bar": {Default: "x"},
 	}
+
 	keys := []string{"bar", "foo"}
 	assert.Equal(t, keys, schema.Keys())
 }

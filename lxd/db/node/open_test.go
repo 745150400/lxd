@@ -1,14 +1,13 @@
 package node_test
 
 import (
-	"database/sql"
-	"io/ioutil"
 	"os"
 	"testing"
 
-	"github.com/lxc/lxd/lxd/db/node"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lxc/lxd/lxd/db/node"
 )
 
 func TestOpen(t *testing.T) {
@@ -16,7 +15,7 @@ func TestOpen(t *testing.T) {
 	defer cleanup()
 
 	db, err := node.Open(dir)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	require.NoError(t, err)
 }
 
@@ -28,22 +27,16 @@ func TestEnsureSchema(t *testing.T) {
 
 	db, err := node.Open(dir)
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
-	hookHasRun := false
-	hook := func(int, *sql.Tx) error {
-		hookHasRun = true
-		return nil
-	}
-	initial, err := node.EnsureSchema(db, dir, hook)
+	initial, err := node.EnsureSchema(db, dir)
 	require.NoError(t, err)
 	assert.Equal(t, 0, initial)
-	assert.False(t, hookHasRun) // Because we use a schema.Fresh()
 }
 
 // Create a new temporary directory, along with a function to clean it up.
 func newDir(t *testing.T) (string, func()) {
-	dir, err := ioutil.TempDir("", "lxd-db-node-test-")
+	dir, err := os.MkdirTemp("", "lxd-db-node-test-")
 	require.NoError(t, err)
 
 	cleanup := func() {

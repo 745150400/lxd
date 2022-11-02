@@ -1,14 +1,16 @@
 package node_test
 
 import (
+	"context"
 	"database/sql"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/lxc/lxd/lxd/db/node"
 	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/shared"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestUpdateFromV38_RaftNodes(t *testing.T) {
@@ -19,8 +21,8 @@ func TestUpdateFromV38_RaftNodes(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = query.Transaction(db, func(tx *sql.Tx) error {
-		roles, err := query.SelectIntegers(tx, "SELECT role FROM raft_nodes")
+	err = query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
+		roles, err := query.SelectIntegers(ctx, tx, "SELECT role FROM raft_nodes")
 		require.NoError(t, err)
 		assert.Equal(t, roles, []int{0})
 		return nil
@@ -45,10 +47,10 @@ func TestUpdateFromV36_DropTables(t *testing.T) {
 	require.NoError(t, err)
 
 	var current []string
-	err = query.Transaction(db, func(tx *sql.Tx) error {
+	err = query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
 		var err error
 		stmt := "SELECT name FROM sqlite_master WHERE type='table'"
-		current, err = query.SelectStrings(tx, stmt)
+		current, err = query.SelectStrings(ctx, tx, stmt)
 		return err
 	})
 	require.NoError(t, err)
@@ -56,6 +58,7 @@ func TestUpdateFromV36_DropTables(t *testing.T) {
 		"networks",
 		"networks_config",
 	}
+
 	for _, name := range deleted {
 		assert.False(t, shared.StringInSlice(name, current))
 	}
@@ -75,7 +78,7 @@ func TestUpdateFromV37_CopyCoreHTTPSAddress(t *testing.T) {
 	require.NoError(t, err)
 
 	var clusterAddress string
-	err = query.Transaction(db, func(tx *sql.Tx) error {
+	err = query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
 		stmt := "SELECT value FROM config WHERE key='cluster.https_address'"
 		row := tx.QueryRow(stmt)
 		err := row.Scan(&clusterAddress)
@@ -96,7 +99,7 @@ func TestUpdateFromV37_NotClustered(t *testing.T) {
 	require.NoError(t, err)
 
 	var clusterAddress string
-	err = query.Transaction(db, func(tx *sql.Tx) error {
+	err = query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
 		stmt := "SELECT value FROM config WHERE key='cluster.https_address'"
 		row := tx.QueryRow(stmt)
 		err := row.Scan(&clusterAddress)

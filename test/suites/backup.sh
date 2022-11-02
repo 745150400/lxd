@@ -40,8 +40,8 @@ EOF
     lxc info c1
 
     lxc storage volume snapshot "${poolName}" vol1_test snap0
-    lxc storage volume ls "${poolName}" | grep vol1_test
-    lxc storage volume ls "${poolName}" | grep -c vol1_test | grep 2
+    lxc storage volume show "${poolName}" vol1_test
+    lxc storage volume show "${poolName}" vol1_test/snap0
 
     # Remove container DB records and symlink.
     lxd sql global "PRAGMA foreign_keys=ON; DELETE FROM instances WHERE name='c1'"
@@ -68,6 +68,8 @@ EOF
     # Check container appears removed.
     ! ls "${LXD_DIR}/containers/test_c1" || false
     ! lxc info c1 || false
+    ! lxc storage volume show "${poolName}" container/c1 || false
+    ! lxc storage volume show "${poolName}" container/c1/snap0 || false
 
     if [ "$poolDriver" != "dir" ] && [ "$poolDriver" != "btrfs" ] && [ "$poolDriver" != "cephfs" ]; then
       ! ls "${LXD_DIR}/storage-pools/${poolName}/containers/test_c1" || false
@@ -75,7 +77,8 @@ EOF
     fi
 
     # Check custom volume appears removed.
-    ! lxc storage volume ls "${poolName}" | grep vol1_test || false
+    ! lxc storage volume show "${poolName}" vol1_test || false
+    ! lxc storage volume show "${poolName}" vol1_test/snap0 || false
 
     # Shutdown LXD so pools are unmounted.
     shutdown_lxd "${LXD_DIR}"
@@ -104,11 +107,14 @@ EOF
     ls "${LXD_DIR}/storage-pools/${poolName}/custom-snapshots/test_vol1_test/snap0"
 
     # Check custom volume record exists with snapshot.
-    lxc storage volume ls "${poolName}" | grep vol1_test
-    lxc storage volume ls "${poolName}" | grep -c vol1_test | grep 2
+    lxc storage volume show "${poolName}" vol1_test
+    lxc storage volume show "${poolName}" vol1_test/snap0
 
     # Check snapshot exists and container can be started.
     lxc info c1 | grep snap0
+    lxc storage volume ls "${poolName}"
+    lxc storage volume show "${poolName}" container/c1
+    lxc storage volume show "${poolName}" container/c1/snap0
     lxc start c1
     lxc exec c1 --project test -- hostname
 
@@ -201,7 +207,7 @@ EOF
     lxc project delete test
   )
 
-  # shellcheck disable=SC2031
+  # shellcheck disable=SC2031,2269
   LXD_DIR=${LXD_DIR}
   kill_lxd "${LXD_IMPORT_DIR}"
 }
@@ -321,17 +327,26 @@ test_backup_import_with_project() {
     lxc delete --force c3
   fi
 
-  # Test hyphenated container and snapshot names
+  # Test exporting container and snapshot names that container hyphens.
+  # Also check that the container storage volume config is correctly captured and restored.
+  default_pool="$(lxc profile device get default root pool)"
+
   lxc launch testimage c1-foo
+  lxc storage volume set "${default_pool}" container/c1-foo user.foo=c1-foo-snap0
   lxc snapshot c1-foo c1-foo-snap0
+  lxc storage volume set "${default_pool}" container/c1-foo user.foo=c1-foo-snap1
+  lxc snapshot c1-foo c1-foo-snap1
+  lxc storage volume set "${default_pool}" container/c1-foo user.foo=post-c1-foo-snap1
 
   lxc export c1-foo "${LXD_DIR}/c1-foo.tar.gz"
   lxc delete --force c1-foo
 
   lxc import "${LXD_DIR}/c1-foo.tar.gz"
+  lxc storage volume ls "${default_pool}"
+  lxc storage volume get "${default_pool}" container/c1-foo user.foo | grep -Fx "post-c1-foo-snap1"
+  lxc storage volume get "${default_pool}" container/c1-foo/c1-foo-snap0 user.foo | grep -Fx "c1-foo-snap0"
+  lxc storage volume get "${default_pool}" container/c1-foo/c1-foo-snap1 user.foo | grep -Fx "c1-foo-snap1"
   lxc delete --force c1-foo
-
-  default_pool="$(lxc profile device get default root pool)"
 
   # Create new storage pools
   lxc storage create pool_1 dir
@@ -470,14 +485,14 @@ test_backup_rename() {
   ensure_import_testimage
   ensure_has_localhost_remote "${LXD_ADDR}"
 
-  if ! lxc query -X POST /1.0/containers/c1/backups/backupmissing -d '{\"name\": \"backupnewname\"}' --wait 2>&1 | grep -q "Error: Not Found" ; then
+  if ! lxc query -X POST /1.0/containers/c1/backups/backupmissing -d '{\"name\": \"backupnewname\"}' --wait 2>&1 | grep -q "Error: Instance not found" ; then
     echo "invalid rename response for missing container"
     false
   fi
 
   lxc init testimage c1
 
-  if ! lxc query -X POST /1.0/containers/c1/backups/backupmissing -d '{\"name\": \"backupnewname\"}' --wait 2>&1 | grep -q "Error:.*No such object" ; then
+  if ! lxc query -X POST /1.0/containers/c1/backups/backupmissing -d '{\"name\": \"backupnewname\"}' --wait 2>&1 | grep -q "Error: Load backup from database: Instance backup not found" ; then
     echo "invalid rename response for missing backup"
     false
   fi
@@ -559,10 +574,15 @@ test_backup_volume_export_with_project() {
   echo foo | lxc file push - c1/mnt/test
 
   # Snapshot the custom volume.
-  lxc storage volume snapshot "${custom_vol_pool}" testvol
+  lxc storage volume set "${custom_vol_pool}" testvol user.foo=test-snap0
+  lxc storage volume snapshot "${custom_vol_pool}" testvol test-snap0
 
   # Change the content (the snapshot will contain the old value).
   echo bar | lxc file push - c1/mnt/test
+
+  lxc storage volume set "${custom_vol_pool}" testvol user.foo=test-snap1
+  lxc storage volume snapshot "${custom_vol_pool}" testvol test-snap1
+  lxc storage volume set "${custom_vol_pool}" testvol user.foo=post-test-snap1
 
   if [ "$lxd_backend" = "btrfs" ] || [ "$lxd_backend" = "zfs" ]; then
     # Create optimized backup without snapshots.
@@ -592,7 +612,7 @@ test_backup_volume_export_with_project() {
   [ "$(cat "${LXD_DIR}/non-optimized/backup/volume/test")" = "bar" ]
   [ ! -d "${LXD_DIR}/non-optimized/backup/volume-snapshots" ]
 
-  ! grep -q -- '- snap0' "${LXD_DIR}/non-optimized/backup/index.yaml" || false
+  ! grep -q -- '- test-snap0' "${LXD_DIR}/non-optimized/backup/index.yaml" || false
 
   rm -rf "${LXD_DIR}/non-optimized/"*
   rm "${LXD_DIR}/testvol.tar.gz"
@@ -608,7 +628,7 @@ test_backup_volume_export_with_project() {
 
     [ -f "${LXD_DIR}/optimized/backup/index.yaml" ]
     [ -f "${LXD_DIR}/optimized/backup/volume.bin" ]
-    [ -f "${LXD_DIR}/optimized/backup/volume-snapshots/snap0.bin" ]
+    [ -f "${LXD_DIR}/optimized/backup/volume-snapshots/test-snap0.bin" ]
   fi
 
   # Create non-optimized backup with snapshots.
@@ -623,10 +643,10 @@ test_backup_volume_export_with_project() {
   [ -f "${LXD_DIR}/non-optimized/backup/index.yaml" ]
   [ -d "${LXD_DIR}/non-optimized/backup/volume" ]
   [ "$(cat "${LXD_DIR}/non-optimized/backup/volume/test")" = "bar" ]
-  [ -d "${LXD_DIR}/non-optimized/backup/volume-snapshots/snap0" ]
-  [  "$(cat "${LXD_DIR}/non-optimized/backup/volume-snapshots/snap0/test")" = "foo" ]
+  [ -d "${LXD_DIR}/non-optimized/backup/volume-snapshots/test-snap0" ]
+  [  "$(cat "${LXD_DIR}/non-optimized/backup/volume-snapshots/test-snap0/test")" = "foo" ]
 
-  grep -q -- '- snap0' "${LXD_DIR}/non-optimized/backup/index.yaml"
+  grep -q -- '- test-snap0' "${LXD_DIR}/non-optimized/backup/index.yaml"
 
   rm -rf "${LXD_DIR}/non-optimized/"*
 
@@ -635,6 +655,12 @@ test_backup_volume_export_with_project() {
   lxc storage volume detach "${custom_vol_pool}" testvol c1
   lxc storage volume delete "${custom_vol_pool}" testvol
   lxc storage volume import "${custom_vol_pool}" "${LXD_DIR}/testvol.tar.gz"
+  lxc storage volume ls "${custom_vol_pool}"
+  lxc storage volume get "${custom_vol_pool}" testvol user.foo | grep -Fx "post-test-snap1"
+  lxc storage volume show "${custom_vol_pool}" testvol/test-snap0
+  lxc storage volume get "${custom_vol_pool}" testvol/test-snap0 user.foo | grep -Fx "test-snap0"
+  lxc storage volume get "${custom_vol_pool}" testvol/test-snap1 user.foo | grep -Fx "test-snap1"
+
   lxc storage volume import "${custom_vol_pool}" "${LXD_DIR}/testvol.tar.gz" testvol2
   lxc storage volume attach "${custom_vol_pool}" testvol c1 /mnt
   lxc storage volume attach "${custom_vol_pool}" testvol2 c1 /mnt2
@@ -658,6 +684,11 @@ test_backup_volume_export_with_project() {
     lxc storage volume delete "${custom_vol_pool}" testvol
     lxc storage volume delete "${custom_vol_pool}" testvol2
     lxc storage volume import "${custom_vol_pool}" "${LXD_DIR}/testvol-optimized.tar.gz"
+    lxc storage volume ls "${custom_vol_pool}"
+    lxc storage volume get "${custom_vol_pool}" testvol user.foo | grep -Fx "post-test-snap1"
+    lxc storage volume get "${custom_vol_pool}" testvol/test-snap0 user.foo | grep -Fx "test-snap0"
+    lxc storage volume get "${custom_vol_pool}" testvol/test-snap1 user.foo | grep -Fx "test-snap1"
+
     lxc storage volume import "${custom_vol_pool}" "${LXD_DIR}/testvol-optimized.tar.gz" testvol2
     lxc storage volume attach "${custom_vol_pool}" testvol c1 /mnt
     lxc storage volume attach "${custom_vol_pool}" testvol2 c1 /mnt2
@@ -702,7 +733,7 @@ test_backup_volume_rename_delete() {
   # Create test volume.
   lxc storage volume create "${pool}" vol1
 
-  if ! lxc query -X POST /1.0/storage-pools/"${pool}"/volumes/custom/vol1/backups/backupmissing -d '{\"name\": \"backupnewname\"}' --wait 2>&1 | grep -q "Not Found" ; then
+  if ! lxc query -X POST /1.0/storage-pools/"${pool}"/volumes/custom/vol1/backups/backupmissing -d '{\"name\": \"backupnewname\"}' --wait 2>&1 | grep -q "Error: Storage volume backup not found" ; then
     echo "invalid rename response for missing storage volume"
     false
   fi

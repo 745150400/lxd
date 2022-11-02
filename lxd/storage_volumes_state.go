@@ -1,18 +1,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/gorilla/mux"
 
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/instance"
+	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/response"
 	storagePools "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/units"
 )
 
 var storagePoolVolumeTypeStateCmd = APIEndpoint{
@@ -68,13 +72,22 @@ var storagePoolVolumeTypeStateCmd = APIEndpoint{
 //     $ref: "#/responses/InternalServerError"
 func storagePoolVolumeTypeStateGet(d *Daemon, r *http.Request) response.Response {
 	// Get the name of the pool the storage volume is supposed to be attached to.
-	poolName := mux.Vars(r)["pool"]
+	poolName, err := url.PathUnescape(mux.Vars(r)["pool"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Get the name of the volume type.
-	volumeTypeName := mux.Vars(r)["type"]
+	volumeTypeName, err := url.PathUnescape(mux.Vars(r)["type"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Get the name of the volume type.
-	volumeName := mux.Vars(r)["name"]
+	volumeName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Convert the volume type name to our internal integer representation.
 	volumeType, err := storagePools.VolumeTypeNameToDBType(volumeTypeName)
@@ -88,13 +101,13 @@ func storagePoolVolumeTypeStateGet(d *Daemon, r *http.Request) response.Response
 	}
 
 	// Get the storage project name.
-	projectName, err := project.StorageVolumeProject(d.State().Cluster, projectParam(r), volumeType)
+	projectName, err := project.StorageVolumeProject(d.State().DB.Cluster, projectParam(r), volumeType)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Load the storage pool.
-	pool, err := storagePools.GetPoolByName(d.State(), poolName)
+	pool, err := storagePools.LoadByName(d.State(), poolName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -108,10 +121,19 @@ func storagePoolVolumeTypeStateGet(d *Daemon, r *http.Request) response.Response
 			return response.SmartError(err)
 		}
 	} else {
+		resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, volumeName, instancetype.Any)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		if resp != nil {
+			return resp
+		}
+
 		// Instance volumes.
 		inst, err := instance.LoadByProjectAndName(d.State(), projectName, volumeName)
 		if err != nil {
-			return response.NotFound(err)
+			return response.SmartError(err)
 		}
 
 		used, err = pool.GetInstanceUsage(inst)
@@ -122,12 +144,29 @@ func storagePoolVolumeTypeStateGet(d *Daemon, r *http.Request) response.Response
 
 	// Prepare the state struct.
 	state := api.StorageVolumeState{}
+	state.Usage = &api.StorageVolumeStateUsage{}
 
-	// Only fill usage struct if receiving a valid value.
+	// Only fill 'used' field if receiving a valid value.
 	if used >= 0 {
-		state.Usage = &api.StorageVolumeStateUsage{
-			Used: uint64(used),
-		}
+		state.Usage.Used = uint64(used)
+	}
+
+	var dbVolume *db.StorageVolume
+	err = d.db.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		dbVolume, err = tx.GetStoragePoolVolume(ctx, pool.ID(), projectName, volumeType, volumeName, true)
+		return err
+	})
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	total, err := units.ParseByteSizeString(dbVolume.Config["size"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if total >= 0 {
+		state.Usage.Total = total
 	}
 
 	return response.SyncResponse(true, state)

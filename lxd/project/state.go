@@ -1,6 +1,7 @@
 package project
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 
@@ -10,7 +11,7 @@ import (
 )
 
 // GetCurrentAllocations returns the current resource utilization for a given project.
-func GetCurrentAllocations(tx *db.ClusterTx, projectName string) (map[string]api.ProjectStateResource, error) {
+func GetCurrentAllocations(ctx context.Context, tx *db.ClusterTx, projectName string) (map[string]api.ProjectStateResource, error) {
 	result := map[string]api.ProjectStateResource{}
 
 	// Get the project.
@@ -45,6 +46,7 @@ func GetCurrentAllocations(tx *db.ClusterTx, projectName string) (map[string]api
 	if err != nil {
 		return nil, err
 	}
+
 	result["instances"] = api.ProjectStateResource{
 		Limit: int64(limit),
 		Usage: int64(count),
@@ -54,6 +56,7 @@ func GetCurrentAllocations(tx *db.ClusterTx, projectName string) (map[string]api
 	if err != nil {
 		return nil, err
 	}
+
 	result["containers"] = api.ProjectStateResource{
 		Limit: int64(limit),
 		Usage: int64(count),
@@ -63,6 +66,7 @@ func GetCurrentAllocations(tx *db.ClusterTx, projectName string) (map[string]api
 	if err != nil {
 		return nil, err
 	}
+
 	result["virtual-machines"] = api.ProjectStateResource{
 		Limit: int64(limit),
 		Usage: int64(count),
@@ -78,10 +82,11 @@ func GetCurrentAllocations(tx *db.ClusterTx, projectName string) (map[string]api
 		}
 	}
 
-	networks, err := tx.GetCreatedNetworks()
+	networks, err := tx.GetCreatedNetworks(ctx)
 	if err != nil {
 		return nil, err
 	}
+
 	result["networks"] = api.ProjectStateResource{
 		Limit: int64(limit),
 		Usage: int64(len(networks[projectName])),

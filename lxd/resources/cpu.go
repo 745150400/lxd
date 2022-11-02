@@ -3,7 +3,6 @@ package resources
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,7 +23,7 @@ func GetCPUIsolated() []int64 {
 
 	isolatedCpusInt := []int64{}
 	if sysfsExists(isolatedPath) {
-		buf, err := ioutil.ReadFile(isolatedPath)
+		buf, err := os.ReadFile(isolatedPath)
 		if err != nil {
 			return isolatedCpusInt
 		}
@@ -73,6 +72,7 @@ func ParseCpuset(cpu string) ([]int64, error) {
 			if err != nil {
 				return nil, fmt.Errorf("Invalid cpuset value: %s", cpu)
 			}
+
 			cpus = append(cpus, nr)
 		}
 	}
@@ -84,7 +84,7 @@ func getCPUCache(path string) ([]api.ResourcesCPUCache, error) {
 	caches := []api.ResourcesCPUCache{}
 
 	// List all the caches
-	entries, err := ioutil.ReadDir(path)
+	entries, err := os.ReadDir(path)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to list %q: %w", path, err)
 	}
@@ -107,10 +107,11 @@ func getCPUCache(path string) ([]api.ResourcesCPUCache, error) {
 		if err != nil {
 			return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "level"), err)
 		}
+
 		cache.Level = cacheLevel
 
 		// Get the cache size
-		content, err := ioutil.ReadFile(filepath.Join(entryPath, "size"))
+		content, err := os.ReadFile(filepath.Join(entryPath, "size"))
 		if err != nil {
 			if !os.IsNotExist(err) {
 				return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "size"), err)
@@ -134,7 +135,7 @@ func getCPUCache(path string) ([]api.ResourcesCPUCache, error) {
 		}
 
 		// Get the cache type
-		cacheType, err := ioutil.ReadFile(filepath.Join(entryPath, "type"))
+		cacheType, err := os.ReadFile(filepath.Join(entryPath, "type"))
 		if err != nil {
 			if !os.IsNotExist(err) {
 				return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "type"), err)
@@ -156,7 +157,8 @@ func getCPUdmi() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	defer stream.Close()
+
+	defer func() { _ = stream.Close() }()
 
 	// Decode SMBIOS structures.
 	d := smbios.NewDecoder(stream)
@@ -181,7 +183,7 @@ func getCPUdmi() (string, string, error) {
 	return "", "", fmt.Errorf("No DMI table found")
 }
 
-// GetCPU returns a filled api.ResourcesCPU struct ready for use by LXD
+// GetCPU returns a filled api.ResourcesCPU struct ready for use by LXD.
 func GetCPU() (*api.ResourcesCPU, error) {
 	cpu := api.ResourcesCPU{}
 
@@ -189,8 +191,8 @@ func GetCPU() (*api.ResourcesCPU, error) {
 	isolated := GetCPUIsolated()
 
 	// Temporary storage
-	cpuSockets := map[uint64]*api.ResourcesCPUSocket{}
-	cpuCores := map[uint64]map[string]*api.ResourcesCPUCore{}
+	cpuSockets := map[int64]*api.ResourcesCPUSocket{}
+	cpuCores := map[int64]map[string]*api.ResourcesCPUCore{}
 
 	// Get the DMI data
 	dmiVendor, dmiModel, _ := getCPUdmi()
@@ -200,11 +202,12 @@ func GetCPU() (*api.ResourcesCPU, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Failed to open /proc/cpuinfo: %w", err)
 	}
-	defer f.Close()
+
+	defer func() { _ = f.Close() }()
 	cpuInfo := bufio.NewScanner(f)
 
 	// List all the CPUs
-	entries, err := ioutil.ReadDir(sysDevicesCPU)
+	entries, err := os.ReadDir(sysDevicesCPU)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to list %q: %w", sysDevicesCPU, err)
 	}
@@ -221,12 +224,12 @@ func GetCPU() (*api.ResourcesCPU, error) {
 		}
 
 		// Get topology
-		cpuSocket, err := readUint(filepath.Join(entryPath, "topology", "physical_package_id"))
+		cpuSocket, err := readInt(filepath.Join(entryPath, "topology", "physical_package_id"))
 		if err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "topology", "physical_package_id"), err)
 		}
 
-		cpuCore, err := readUint(filepath.Join(entryPath, "topology", "core_id"))
+		cpuCore, err := readInt(filepath.Join(entryPath, "topology", "core_id"))
 		if err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "topology", "core_id"), err)
 		}
@@ -236,18 +239,26 @@ func GetCPU() (*api.ResourcesCPU, error) {
 			return nil, fmt.Errorf("Failed to read %q: %w", filepath.Join(entryPath, "topology", "die_id"), err)
 		}
 
+		// Handle missing architecture support.
+		if cpuSocket == -1 {
+			cpuSocket = 0
+		}
+
+		if cpuCore == -1 {
+			cpuCore = 0
+		}
+
 		if cpuDie == -1 {
-			// Architectures without support for die_id report -1, make that die 0 instead.
 			cpuDie = 0
 		}
 
 		// Grab socket data if needed
-		resSocket, ok := cpuSockets[cpuSocket]
+		_, ok := cpuSockets[cpuSocket]
 		if !ok {
-			resSocket = &api.ResourcesCPUSocket{}
+			resSocket := &api.ResourcesCPUSocket{}
 
 			// Socket number
-			resSocket.Socket = cpuSocket
+			resSocket.Socket = uint64(cpuSocket)
 
 			// CPU information
 			for cpuInfo.Scan() {
@@ -366,7 +377,7 @@ func GetCPU() (*api.ResourcesCPU, error) {
 			resCore = &api.ResourcesCPUCore{}
 
 			// Core number
-			resCore.Core = cpuCore
+			resCore.Core = uint64(cpuCore)
 
 			// Die number
 			resCore.Die = uint64(cpuDie)
@@ -432,11 +443,12 @@ func GetCPU() (*api.ResourcesCPU, error) {
 		// Add the cores
 		coreFrequency := uint64(0)
 		coreFrequencyCount := uint64(0)
-		for _, core := range cpuCores[socket.Socket] {
+		for _, core := range cpuCores[int64(socket.Socket)] {
 			if core.Frequency > 0 {
 				coreFrequency += core.Frequency
 				coreFrequencyCount++
 			}
+
 			socket.Cores = append(socket.Cores, *core)
 		}
 
@@ -445,10 +457,11 @@ func GetCPU() (*api.ResourcesCPU, error) {
 			socket.Frequency = coreFrequency / coreFrequencyCount
 		}
 
-		sort.Slice(socket.Cores, func(i int, j int) bool { return socket.Cores[i].Core < socket.Cores[j].Core })
+		sort.SliceStable(socket.Cores, func(i int, j int) bool { return socket.Cores[i].Core < socket.Cores[j].Core })
 		cpu.Sockets = append(cpu.Sockets, *socket)
 	}
-	sort.Slice(cpu.Sockets, func(i int, j int) bool { return cpu.Sockets[i].Socket < cpu.Sockets[j].Socket })
+
+	sort.SliceStable(cpu.Sockets, func(i int, j int) bool { return cpu.Sockets[i].Socket < cpu.Sockets[j].Socket })
 
 	// Set the architecture name
 	uname := unix.Utsname{}

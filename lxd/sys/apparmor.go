@@ -1,46 +1,44 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package sys
 
 import (
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 
-	log "gopkg.in/inconshreveable/log15.v2"
+	"github.com/syndtr/gocapability/capability"
 
-	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/db/warningtype"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/syndtr/gocapability/capability"
 )
 
 // Initialize AppArmor-specific attributes.
-func (s *OS) initAppArmor() []db.Warning {
-	var dbWarnings []db.Warning
+func (s *OS) initAppArmor() []cluster.Warning {
+	var dbWarnings []cluster.Warning
 
 	/* Detect AppArmor availability */
 	_, err := exec.LookPath("apparmor_parser")
 	if os.Getenv("LXD_SECURITY_APPARMOR") == "false" {
 		logger.Warnf("AppArmor support has been manually disabled")
-		dbWarnings = append(dbWarnings, db.Warning{
-			TypeCode:    db.WarningAppArmorNotAvailable,
+		dbWarnings = append(dbWarnings, cluster.Warning{
+			TypeCode:    warningtype.AppArmorNotAvailable,
 			LastMessage: "Manually disabled",
 		})
 	} else if !shared.IsDir("/sys/kernel/security/apparmor") {
 		logger.Warnf("AppArmor support has been disabled because of lack of kernel support")
-		dbWarnings = append(dbWarnings, db.Warning{
-			TypeCode:    db.WarningAppArmorNotAvailable,
+		dbWarnings = append(dbWarnings, cluster.Warning{
+			TypeCode:    warningtype.AppArmorNotAvailable,
 			LastMessage: "Disabled because of lack of kernel support",
 		})
 	} else if err != nil {
 		logger.Warnf("AppArmor support has been disabled because 'apparmor_parser' couldn't be found")
-		dbWarnings = append(dbWarnings, db.Warning{
-			TypeCode:    db.WarningAppArmorNotAvailable,
+		dbWarnings = append(dbWarnings, cluster.Warning{
+			TypeCode:    warningtype.AppArmorNotAvailable,
 			LastMessage: "Disabled because 'apparmor_parser' couldn't be found",
 		})
 	} else {
@@ -52,7 +50,7 @@ func (s *OS) initAppArmor() []db.Warning {
 
 	/* Detect existing AppArmor stack */
 	if shared.PathExists("/sys/kernel/security/apparmor/.ns_stacked") {
-		contentBytes, err := ioutil.ReadFile("/sys/kernel/security/apparmor/.ns_stacked")
+		contentBytes, err := os.ReadFile("/sys/kernel/security/apparmor/.ns_stacked")
 		if err == nil && string(contentBytes) == "yes\n" {
 			s.AppArmorStacked = true
 		}
@@ -77,6 +75,7 @@ func (s *OS) initAppArmor() []db.Warning {
 		if s.AppArmorAvailable {
 			logger.Warnf("Per-container AppArmor profiles are disabled because LXD is already protected by AppArmor")
 		}
+
 		s.AppArmorConfined = true
 	}
 
@@ -84,19 +83,26 @@ func (s *OS) initAppArmor() []db.Warning {
 }
 
 func haveMacAdmin() bool {
-	c, err := capability.NewPid(0)
+	c, err := capability.NewPid2(0)
 	if err != nil {
 		return false
 	}
+
+	err = c.Load()
+	if err != nil {
+		return false
+	}
+
 	if c.Get(capability.EFFECTIVE, capability.CAP_MAC_ADMIN) {
 		return true
 	}
+
 	return false
 }
 
 // Returns true if AppArmor stacking support is available.
 func appArmorCanStack() bool {
-	contentBytes, err := ioutil.ReadFile("/sys/kernel/security/apparmor/features/domain/stack")
+	contentBytes, err := os.ReadFile("/sys/kernel/security/apparmor/features/domain/stack")
 	if err != nil {
 		return false
 	}
@@ -105,7 +111,7 @@ func appArmorCanStack() bool {
 		return false
 	}
 
-	contentBytes, err = ioutil.ReadFile("/sys/kernel/security/apparmor/features/domain/version")
+	contentBytes, err = os.ReadFile("/sys/kernel/security/apparmor/features/domain/version")
 	if err != nil {
 		return false
 	}
@@ -115,13 +121,13 @@ func appArmorCanStack() bool {
 	parts := strings.Split(strings.TrimSpace(content), ".")
 
 	if len(parts) == 0 {
-		logger.Warn("Unknown apparmor domain version", log.Ctx{"version": content})
+		logger.Warn("Unknown apparmor domain version", logger.Ctx{"version": content})
 		return false
 	}
 
 	major, err := strconv.Atoi(parts[0])
 	if err != nil {
-		logger.Warn("Unknown apparmor domain version", log.Ctx{"version": content})
+		logger.Warn("Unknown apparmor domain version", logger.Ctx{"version": content})
 		return false
 	}
 
@@ -129,7 +135,7 @@ func appArmorCanStack() bool {
 	if len(parts) == 2 {
 		minor, err = strconv.Atoi(parts[1])
 		if err != nil {
-			logger.Warn("Unknown apparmor domain version", log.Ctx{"version": content})
+			logger.Warn("Unknown apparmor domain version", logger.Ctx{"version": content})
 			return false
 		}
 	}

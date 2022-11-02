@@ -6,11 +6,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 )
 
 var reLimitsArg = regexp.MustCompile(`^limit=(\w+):(\w+):(\w+)$`)
@@ -41,7 +39,7 @@ func (c *cmdForklimits) Run(cmd *cobra.Command, _ []string) error {
 	args := c.global.rawArgs(cmd)
 
 	if len(args) == 0 {
-		cmd.Help()
+		_ = cmd.Help()
 		return nil
 	}
 
@@ -72,17 +70,19 @@ func (c *cmdForklimits) Run(cmd *cobra.Command, _ []string) error {
 			fdParts := strings.SplitN(arg, "=", 2)
 			fdNum, err := strconv.Atoi(fdParts[1])
 			if err != nil {
-				cmd.Help()
+				_ = cmd.Help()
 				return fmt.Errorf("Invalid file descriptor number")
 			}
+
 			fds = append(fds, uintptr(fdNum))
 		} else if arg == "--" {
 			if len(args)-1 > i {
 				cmdParts = args[i+1:]
 			}
+
 			break // No more passing of arguments needed.
 		} else {
-			cmd.Help()
+			_ = cmd.Help()
 			return fmt.Errorf("Unrecognised argument")
 		}
 	}
@@ -105,6 +105,7 @@ func (c *cmdForklimits) Run(cmd *cobra.Command, _ []string) error {
 			if err != nil {
 				return fmt.Errorf("Invalid soft limit for %q", limit.name)
 			}
+
 			rLimit.Cur = softLimit
 		}
 
@@ -115,6 +116,7 @@ func (c *cmdForklimits) Run(cmd *cobra.Command, _ []string) error {
 			if err != nil {
 				return fmt.Errorf("Invalid hard limit for %q", limit.name)
 			}
+
 			rLimit.Max = hardLimit
 		}
 
@@ -125,13 +127,13 @@ func (c *cmdForklimits) Run(cmd *cobra.Command, _ []string) error {
 	}
 
 	if len(cmdParts) == 0 {
-		cmd.Help()
+		_ = cmd.Help()
 		return fmt.Errorf("Missing required command argument")
 	}
 
 	// Clear the cloexec flag on the file descriptors we are passing through.
 	for _, fd := range fds {
-		_, _, syscallErr := syscall.Syscall(unix.SYS_FCNTL, fd, syscall.F_SETFD, uintptr(0))
+		_, _, syscallErr := unix.Syscall(unix.SYS_FCNTL, fd, unix.F_SETFD, uintptr(0))
 		if syscallErr != 0 {
 			err := os.NewSyscallError(fmt.Sprintf("fcntl failed on FD %d", fd), syscallErr)
 			if err != nil {
@@ -140,5 +142,5 @@ func (c *cmdForklimits) Run(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	return syscall.Exec(cmdParts[0], cmdParts, os.Environ())
+	return unix.Exec(cmdParts[0], cmdParts, os.Environ())
 }

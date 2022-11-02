@@ -2,16 +2,17 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/canonical/go-dqlite/client"
+	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v2"
-
-	"github.com/canonical/go-dqlite/client"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxc/utils"
@@ -22,7 +23,6 @@ import (
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/termios"
-	"github.com/spf13/cobra"
 )
 
 type cmdCluster struct {
@@ -58,7 +58,7 @@ func (c *cmdCluster) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
@@ -91,13 +91,10 @@ func (c ClusterMember) ToRaftNode() (*db.RaftNode, error) {
 	switch c.Role {
 	case "voter":
 		role = db.RaftVoter
-		break
 	case "stand-by":
 		role = db.RaftStandBy
-		break
 	case "spare":
 		role = db.RaftSpare
-		break
 	default:
 		return nil, fmt.Errorf("unknown raft role: %q", c.Role)
 	}
@@ -129,14 +126,14 @@ func (c *cmdClusterEdit) Run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("The LXD daemon is running, please stop it first.")
 	}
 
-	database, _, err := db.OpenNode(filepath.Join(sys.DefaultOS().VarDir, "database"), nil, nil)
+	database, err := db.OpenNode(filepath.Join(sys.DefaultOS().VarDir, "database"), nil)
 	if err != nil {
 		return err
 	}
 
 	var nodes []db.RaftNode
-	err = database.Transaction(func(tx *db.NodeTx) error {
-		config, err := node.ConfigLoad(tx)
+	err = database.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		config, err := node.ConfigLoad(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -146,7 +143,7 @@ func (c *cmdClusterEdit) Run(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf(`Can't edit cluster configuration as server isn't clustered (missing "cluster.https_address" config)`)
 		}
 
-		nodes, err = tx.GetRaftNodes()
+		nodes, err = tx.GetRaftNodes(ctx)
 		return err
 	})
 	if err != nil {
@@ -172,7 +169,7 @@ func (c *cmdClusterEdit) Run(cmd *cobra.Command, args []string) error {
 
 	var content []byte
 	if !termios.IsTerminal(unix.Stdin) {
-		content, err = ioutil.ReadAll(os.Stdin)
+		content, err = io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -291,15 +288,15 @@ func (c *cmdClusterShow) Command() *cobra.Command {
 }
 
 func (c *cmdClusterShow) Run(cmd *cobra.Command, args []string) error {
-	database, _, err := db.OpenNode(filepath.Join(sys.DefaultOS().VarDir, "database"), nil, nil)
+	database, err := db.OpenNode(filepath.Join(sys.DefaultOS().VarDir, "database"), nil)
 	if err != nil {
 		return err
 	}
 
 	var nodes []db.RaftNode
-	err = database.Transaction(func(tx *db.NodeTx) error {
+	err = database.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		var err error
-		nodes, err = tx.GetRaftNodes()
+		nodes, err = tx.GetRaftNodes(ctx)
 		return err
 	})
 	if err != nil {
@@ -350,7 +347,7 @@ func (c *cmdClusterListDatabase) Command() *cobra.Command {
 func (c *cmdClusterListDatabase) Run(cmd *cobra.Command, args []string) error {
 	os := sys.DefaultOS()
 
-	db, _, err := db.OpenNode(filepath.Join(os.VarDir, "database"), nil, nil)
+	db, err := db.OpenNode(filepath.Join(os.VarDir, "database"), nil)
 	if err != nil {
 		return fmt.Errorf("Failed to open local database: %w", err)
 	}
@@ -365,7 +362,8 @@ func (c *cmdClusterListDatabase) Run(cmd *cobra.Command, args []string) error {
 	for i, address := range addresses {
 		data[i] = []string{address}
 	}
-	utils.RenderTable(utils.TableFormatTable, columns, data, nil)
+
+	_ = utils.RenderTable(utils.TableFormatTable, columns, data, nil)
 
 	return nil
 }
@@ -404,7 +402,7 @@ func (c *cmdClusterRecoverFromQuorumLoss) Run(cmd *cobra.Command, args []string)
 
 	os := sys.DefaultOS()
 
-	db, _, err := db.OpenNode(filepath.Join(os.VarDir, "database"), nil, nil)
+	db, err := db.OpenNode(filepath.Join(os.VarDir, "database"), nil)
 	if err != nil {
 		return fmt.Errorf("Failed to open local database: %w", err)
 	}
@@ -437,6 +435,7 @@ Do you want to proceed? (yes/no): `)
 	if !shared.StringInSlice(strings.ToLower(input), []string{"yes"}) {
 		return fmt.Errorf("Recover operation aborted")
 	}
+
 	return nil
 }
 
@@ -459,7 +458,7 @@ func (c *cmdClusterRemoveRaftNode) Command() *cobra.Command {
 
 func (c *cmdClusterRemoveRaftNode) Run(cmd *cobra.Command, args []string) error {
 	if len(args) != 1 {
-		cmd.Help()
+		_ = cmd.Help()
 		return fmt.Errorf("Missing required arguments")
 	}
 
@@ -500,5 +499,6 @@ Do you want to proceed? (yes/no): `)
 	if !shared.StringInSlice(strings.ToLower(input), []string{"yes"}) {
 		return fmt.Errorf("Remove raft node operation aborted")
 	}
+
 	return nil
 }

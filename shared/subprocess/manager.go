@@ -1,12 +1,10 @@
 //go:build !windows
-// +build !windows
 
 package subprocess
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 
 	"gopkg.in/yaml.v2"
@@ -33,17 +31,14 @@ func NewProcess(name string, args []string, stdoutPath string, stderrPath string
 		}
 	}
 
-	p, err := NewProcessWithFds(name, args, nil, stdout, stderr)
-	if err != nil {
-		return nil, fmt.Errorf("Error when creating process object: %w", err)
-	}
+	p := NewProcessWithFds(name, args, nil, stdout, stderr)
 	p.closeFds = true
 
 	return p, nil
 }
 
-// NewProcessWithFds is a constructor for a process object. Represents a process with argument config. Returns an address to process
-func NewProcessWithFds(name string, args []string, stdin io.ReadCloser, stdout io.WriteCloser, stderr io.WriteCloser) (*Process, error) {
+// NewProcessWithFds is a constructor for a process object. Represents a process with argument config. Returns an address to process.
+func NewProcessWithFds(name string, args []string, stdin io.ReadCloser, stdout io.WriteCloser, stderr io.WriteCloser) *Process {
 	proc := Process{
 		Name:   name,
 		Args:   args,
@@ -52,20 +47,20 @@ func NewProcessWithFds(name string, args []string, stdin io.ReadCloser, stdout i
 		Stderr: stderr,
 	}
 
-	return &proc, nil
+	return &proc
 }
 
 // ImportProcess imports a saved process into a subprocess object.
 func ImportProcess(path string) (*Process, error) {
-	dat, err := ioutil.ReadFile(path)
+	dat, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to read file '%s': %w", path, err)
+		return nil, fmt.Errorf("Unable to read PID file %q: %w", path, err)
 	}
 
 	proc := Process{}
 	err = yaml.Unmarshal(dat, &proc)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to parse Process YAML: %w", err)
+		return nil, fmt.Errorf("Unable to parse YAML in PID file %q: %w", path, err)
 	}
 
 	return &proc, nil

@@ -1,12 +1,14 @@
 package query_test
 
 import (
+	"context"
 	"database/sql"
 	"testing"
 
-	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lxc/lxd/lxd/db/query"
 )
 
 // Exercise possible failure modes.
@@ -17,11 +19,15 @@ func TestSelectObjects_Error(t *testing.T) {
 		error string
 	}{
 		{
-			func(int) []interface{} { return make([]interface{}, 1) },
+			func(scan func(dest ...any) error) error {
+				var row any
+				return scan(row)
+			},
 			"SELECT id, name FROM test",
 			"sql: expected 2 destination arguments in Scan, not 1",
 		},
 	}
+
 	for _, c := range cases {
 		t.Run(c.query, func(t *testing.T) {
 			tx := newTxForObjects(t)
@@ -29,7 +35,7 @@ func TestSelectObjects_Error(t *testing.T) {
 			stmt, err := tx.Prepare(c.query)
 			require.NoError(t, err)
 
-			err = query.SelectObjects(stmt, c.dest)
+			err = query.SelectObjects(context.TODO(), stmt, c.dest)
 			assert.EqualError(t, err, c.error)
 		})
 	}
@@ -44,15 +50,18 @@ func TestSelectObjects(t *testing.T) {
 	}, 1)
 	object := objects[0]
 
-	dest := func(i int) []interface{} {
-		require.Equal(t, 0, i, "expected at most one row to be yielded")
-		return []interface{}{&object.ID, &object.Name}
+	count := 0
+	dest := func(scan func(dest ...any) error) error {
+		require.Equal(t, 0, count, "expected at most one row to be yielded")
+		count++
+
+		return scan(&object.ID, &object.Name)
 	}
 
 	stmt, err := tx.Prepare("SELECT id, name FROM test WHERE name=?")
 	require.NoError(t, err)
 
-	err = query.SelectObjects(stmt, dest, "bar")
+	err = query.SelectObjects(context.TODO(), stmt, dest, "bar")
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, object.ID)
@@ -63,20 +72,21 @@ func TestSelectObjects(t *testing.T) {
 func TestUpsertObject_Error(t *testing.T) {
 	cases := []struct {
 		columns []string
-		values  []interface{}
+		values  []any
 		error   string
 	}{
 		{
 			[]string{},
-			[]interface{}{},
+			[]any{},
 			"columns length is zero",
 		},
 		{
 			[]string{"id"},
-			[]interface{}{2, "egg"},
+			[]any{2, "egg"},
 			"columns length does not match values length",
 		},
 	}
+
 	for _, c := range cases {
 		t.Run(c.error, func(t *testing.T) {
 			tx := newTxForObjects(t)
@@ -91,7 +101,7 @@ func TestUpsertObject_Error(t *testing.T) {
 func TestUpsertObject_Insert(t *testing.T) {
 	tx := newTxForObjects(t)
 
-	id, err := query.UpsertObject(tx, "test", []string{"name"}, []interface{}{"egg"})
+	id, err := query.UpsertObject(tx, "test", []string{"name"}, []any{"egg"})
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), id)
 
@@ -101,15 +111,16 @@ func TestUpsertObject_Insert(t *testing.T) {
 	}, 1)
 	object := objects[0]
 
-	dest := func(i int) []interface{} {
-		require.Equal(t, 0, i, "expected at most one row to be yielded")
-		return []interface{}{&object.ID, &object.Name}
+	count := 0
+	dest := func(scan func(dest ...any) error) error {
+		require.Equal(t, 0, count, "expected at most one row to be yielded")
+		count++
+
+		return scan(&object.ID, &object.Name)
 	}
 
-	stmt, err := tx.Prepare("SELECT id, name FROM test WHERE name=?")
-	require.NoError(t, err)
-
-	err = query.SelectObjects(stmt, dest, "egg")
+	sql := "SELECT id, name FROM test WHERE name=?"
+	err = query.Scan(context.TODO(), tx, sql, dest, "egg")
 	require.NoError(t, err)
 
 	assert.Equal(t, 2, object.ID)
@@ -120,7 +131,7 @@ func TestUpsertObject_Insert(t *testing.T) {
 func TestUpsertObject_Update(t *testing.T) {
 	tx := newTxForObjects(t)
 
-	id, err := query.UpsertObject(tx, "test", []string{"id", "name"}, []interface{}{1, "egg"})
+	id, err := query.UpsertObject(tx, "test", []string{"id", "name"}, []any{1, "egg"})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), id)
 
@@ -130,15 +141,18 @@ func TestUpsertObject_Update(t *testing.T) {
 	}, 1)
 	object := objects[0]
 
-	dest := func(i int) []interface{} {
-		require.Equal(t, 0, i, "expected at most one row to be yielded")
-		return []interface{}{&object.ID, &object.Name}
+	count := 0
+	dest := func(scan func(dest ...any) error) error {
+		require.Equal(t, 0, count, "expected at most one row to be yielded")
+		count++
+
+		return scan(&object.ID, &object.Name)
 	}
 
-	stmt, err := tx.Prepare("SELECT id, name FROM test WHERE name=?")
+	sql := "SELECT id, name FROM test WHERE name=?"
 	require.NoError(t, err)
 
-	err = query.SelectObjects(stmt, dest, "egg")
+	err = query.Scan(context.TODO(), tx, sql, dest, "egg")
 	require.NoError(t, err)
 
 	assert.Equal(t, 1, object.ID)

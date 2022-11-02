@@ -1,5 +1,5 @@
 test_basic_usage() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local lxd_backend
   lxd_backend=$(storage_backend "$LXD_DIR")
 
@@ -330,7 +330,7 @@ test_basic_usage() {
     lxc delete autostart --force --force-local
     lxc storage volume delete "${storage_pool}" vol --force-local
   )
-  # shellcheck disable=SC2031
+  # shellcheck disable=SC2031,2269
   LXD_DIR=${LXD_DIR}
   kill_lxd "${LXD_ACTIVATION_DIR}"
 
@@ -515,19 +515,20 @@ test_basic_usage() {
   lxc launch testimage foo -e
   OLD_INIT=$(lxc info foo | awk '/^PID:/ {print $2}')
 
-  # Wait for init to be ready and signal a reboot
-  sleep 3
-  lxc exec foo reboot || true
-
   REBOOTED="false"
 
   # shellcheck disable=SC2034
   for i in $(seq 60); do
     NEW_INIT=$(lxc info foo | awk '/^PID:/ {print $2}' || true)
 
-    if [ -n "${NEW_INIT}" ] && [ "${OLD_INIT}" != "${NEW_INIT}" ]; then
-      REBOOTED="true"
-      break
+    # If init process is running, check if is old or new process.
+    if [ -n "${NEW_INIT}" ]; then
+      if [ "${OLD_INIT}" != "${NEW_INIT}" ]; then
+        REBOOTED="true"
+        break
+      else
+        lxc exec foo reboot || true  # Signal to running old init processs to reboot if not rebooted yet.
+      fi
     fi
 
     sleep 0.5
@@ -538,10 +539,44 @@ test_basic_usage() {
   lxc publish foo --alias foo --force
   lxc image delete foo
 
+  lxc restart -f foo
   lxc stop foo --force
   ! lxc list | grep -q foo || false
 
   # Test renaming/deletion of the default profile
   ! lxc profile rename default foobar || false
   ! lxc profile delete default || false
+
+  lxc init testimage c1
+  result="$(! lxc config device override c1 root pool=bla 2>&1)"
+  if ! echo "${result}" | grep "Error: Cannot update root disk device pool name"; then
+    echo "Should fail device override because root disk device storage pool cannot be changed."
+    false
+  fi
+
+  lxc rm -f c1
+
+  # Should fail to override root device storage pool when the new pool does not exist.
+  ! lxc init testimage c1 -d root,pool=bla || false
+
+  # Should succeed in overriding root device storage pool when the pool does exist and the override occurs at create time.
+  lxc storage create bla dir
+  lxc init testimage c1 -d root,pool=bla
+  lxc config show c1 --expanded | grep -Pz '  root:\n    path: /\n    pool: bla\n    type: disk\n'
+
+  lxc storage volume create bla vol1
+  lxc storage volume create bla vol2
+  lxc config device add c1 dev disk source=vol1 pool=bla path=/vol
+
+  # Should not be able to override a device that is not part of a profile (i.e. has been specifically added).
+  result="$(! lxc config device override c1 dev source=vol2 2>&1)"
+  if ! echo "${result}" | grep "Error: The device already exists"; then
+    echo "Should fail because device is defined against the instance not the profile."
+    false
+  fi
+
+  lxc rm -f c1
+  lxc storage volume delete bla vol1
+  lxc storage volume delete bla vol2
+  lxc storage delete bla
 }

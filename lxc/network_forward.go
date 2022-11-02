@@ -2,12 +2,11 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"sort"
 	"strings"
 
-	"github.com/lxc/lxd/shared/termios"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v2"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/lxc/lxd/shared/api"
 	cli "github.com/lxc/lxd/shared/cmd"
 	"github.com/lxc/lxd/shared/i18n"
+	"github.com/lxc/lxd/shared/termios"
 )
 
 type cmdNetworkForward struct {
@@ -67,7 +67,7 @@ func (c *cmdNetworkForward) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
@@ -138,6 +138,7 @@ func (c *cmdNetworkForwardList) Run(cmd *cobra.Command, args []string) error {
 
 		data = append(data, details)
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -262,7 +263,7 @@ func (c *cmdNetworkForwardCreate) Run(cmd *cobra.Command, args []string) error {
 	// If stdin isn't a terminal, read yaml from it.
 	var forwardPut api.NetworkForwardPut
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -314,7 +315,7 @@ func (c *cmdNetworkForwardCreate) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Get
+// Get.
 type cmdNetworkForwardGet struct {
 	global         *cmdGlobal
 	networkForward *cmdNetworkForward
@@ -501,7 +502,8 @@ func (c *cmdNetworkForwardEdit) helpTemplate() string {
 ###
 ### An example would look like:
 ### listen_address: 192.0.2.1
-### target_address: 198.51.100.2
+### config:
+###   target_address: 198.51.100.2
 ### description: test desc
 ### port:
 ### - description: port forward
@@ -546,7 +548,7 @@ func (c *cmdNetworkForwardEdit) Run(cmd *cobra.Command, args []string) error {
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}

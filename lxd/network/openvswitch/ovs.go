@@ -47,7 +47,7 @@ func (o *OVS) BridgeExists(bridgeName string) (bool, error) {
 	if err != nil {
 		runErr, ok := err.(shared.RunError)
 		if ok {
-			exitError, ok := runErr.Err.(*exec.ExitError)
+			exitError, ok := runErr.Unwrap().(*exec.ExitError)
 
 			// ovs-vsctl manpage says that br-exists exits with code 2 if bridge doesn't exist.
 			if ok && exitError.ExitCode() == 2 {
@@ -148,7 +148,7 @@ func (o *OVS) InterfaceAssociateOVNSwitchPort(interfaceName string, ovnSwitchPor
 			// the OVS association has been successfully removed, so the new port being added next
 			// won't fail to work properly.
 			link := &ip.Link{Name: port}
-			link.Delete()
+			_ = link.Delete()
 		}
 	}
 

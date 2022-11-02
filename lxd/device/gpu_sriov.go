@@ -2,7 +2,7 @@ package device
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -196,7 +196,7 @@ func (d *gpuSRIOV) setupSriovParent(parentPCIAddress string, vfID int, volatile 
 		return vfPCIDev, err
 	}
 
-	revert.Add(func() { pcidev.DeviceProbe(vfPCIDev) })
+	revert.Add(func() { _ = pcidev.DeviceProbe(vfPCIDev) })
 
 	// Register VF device with vfio-pci driver so it can be passed to VM.
 	err = pcidev.DeviceDriverOverride(vfPCIDev, "vfio-pci")
@@ -227,10 +227,11 @@ func (d *gpuSRIOV) findFreeVirtualFunction(parentDev pcidev.Device) (int, error)
 	// Get number of currently enabled VFs.
 	sriovNumVFs := fmt.Sprintf("/sys/bus/pci/devices/%s/sriov_numvfs", parentDev.SlotName)
 
-	sriovNumVfsBuf, err := ioutil.ReadFile(sriovNumVFs)
+	sriovNumVfsBuf, err := os.ReadFile(sriovNumVFs)
 	if err != nil {
 		return 0, err
 	}
+
 	sriovNumVfsStr := strings.TrimSpace(string(sriovNumVfsBuf))
 	sriovNum, err := strconv.Atoi(sriovNumVfsStr)
 	if err != nil {
@@ -266,12 +267,14 @@ func (d *gpuSRIOV) Stop() (*deviceConfig.RunConfig, error) {
 
 // postStop is run after the device is removed from the instance.
 func (d *gpuSRIOV) postStop() error {
-	defer d.volatileSet(map[string]string{
-		"last_state.created":    "",
-		"last_state.vf.id":      "",
-		"last_state.pci.driver": "",
-		"last_state.pci.parent": "",
-	})
+	defer func() {
+		_ = d.volatileSet(map[string]string{
+			"last_state.created":    "",
+			"last_state.vf.id":      "",
+			"last_state.pci.driver": "",
+			"last_state.pci.parent": "",
+		})
+	}()
 
 	v := d.volatileGet()
 
@@ -317,7 +320,7 @@ func (d *gpuSRIOV) restoreSriovParent(volatile map[string]string) error {
 
 	// However we return from this function, we must try to rebind the VF so its not orphaned.
 	// The OS won't let an already bound device be bound again so is safe to call twice.
-	revert.Add(func() { pcidev.DeviceProbe(vfPCIDev) })
+	revert.Add(func() { _ = pcidev.DeviceProbe(vfPCIDev) })
 
 	// Bind VF device onto the host so that the settings will take effect.
 	err = pcidev.DeviceProbe(vfPCIDev)

@@ -2,6 +2,7 @@ package drivers
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,12 +10,11 @@ import (
 	"strings"
 	"time"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/units"
 	"github.com/lxc/lxd/shared/validate"
 )
@@ -33,12 +33,8 @@ type lvm struct {
 func (d *lvm) load() error {
 	// Register the patches.
 	d.patches = map[string]func() error{
-		"storage_create_vm":                        nil,
-		"storage_zfs_mount":                        nil,
-		"storage_create_vm_again":                  nil,
-		"storage_zfs_volmode":                      nil,
-		"storage_rename_custom_volume_add_project": nil,
-		"storage_lvm_skipactivation":               d.patchStorageSkipActivation,
+		"storage_lvm_skipactivation":       d.patchStorageSkipActivation,
+		"storage_missing_snapshot_records": nil,
 	}
 
 	// Done if previously loaded.
@@ -92,11 +88,12 @@ func (d *lvm) Info() Info {
 		OptimizedImages:   d.usesThinpool(), // Only thinpool pools support optimized images.
 		PreservesInodes:   false,
 		Remote:            d.isRemote(),
-		VolumeTypes:       []VolumeType{VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		VolumeTypes:       []VolumeType{VolumeTypeBucket, VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
 		BlockBacking:      true,
 		RunningCopyFreeze: true,
 		DirectIO:          true,
 		MountedRoot:       false,
+		Buckets:           true,
 	}
 }
 
@@ -113,11 +110,26 @@ func (d *lvm) Create() error {
 	revert := revert.New()
 	defer revert.Fail()
 
+	// Set default thin pool name if not specified.
+	if d.usesThinpool() && d.config["lvm.thinpool_name"] == "" {
+		d.config["lvm.thinpool_name"] = lvmThinpoolDefaultName
+	}
+
 	if d.config["source"] == "" || d.config["source"] == defaultSource {
 		// We are using a LXD internal loopback file.
 		d.config["source"] = defaultSource
 		if d.config["lvm.vg_name"] == "" {
 			d.config["lvm.vg_name"] = d.name
+		}
+
+		// Pick a default size of the loop file if not specified.
+		if d.config["size"] == "" {
+			defaultSize, err := loopFileSizeDefault()
+			if err != nil {
+				return err
+			}
+
+			d.config["size"] = fmt.Sprintf("%dGiB", defaultSize)
 		}
 
 		size, err := units.ParseByteSizeString(d.config["size"])
@@ -134,17 +146,18 @@ func (d *lvm) Create() error {
 			return fmt.Errorf("Failed to create sparse file %q: %w", d.config["source"], err)
 		}
 
-		revert.Add(func() { os.Remove(d.config["source"]) })
+		revert.Add(func() { _ = os.Remove(d.config["source"]) })
 
 		// Open the loop file.
-		loopFile, err := d.openLoopFile(d.config["source"])
+		loopDevPath, err := d.openLoopFile(d.config["source"])
 		if err != nil {
 			return err
 		}
-		defer loopFile.Close()
+
+		defer func() { _ = loopDeviceAutoDetach(loopDevPath) }()
 
 		// Check if the physical volume already exists.
-		pvName = loopFile.Name()
+		pvName = loopDevPath
 		pvExists, err = d.pysicalVolumeExists(pvName)
 		if err != nil {
 			return err
@@ -165,6 +178,7 @@ func (d *lvm) Create() error {
 		if d.config["lvm.vg_name"] == "" {
 			d.config["lvm.vg_name"] = d.name
 		}
+
 		d.config["source"] = d.config["lvm.vg_name"]
 
 		if !shared.IsBlockdevPath(srcPath) {
@@ -276,7 +290,8 @@ func (d *lvm) Create() error {
 			if err != nil {
 				return err
 			}
-			revert.Add(func() { shared.TryRunCommand("pvremove", pvName) })
+
+			revert.Add(func() { _, _ = shared.TryRunCommand("pvremove", pvName) })
 		}
 
 		// Create volume group.
@@ -284,20 +299,22 @@ func (d *lvm) Create() error {
 		if err != nil {
 			return err
 		}
-		d.logger.Debug("Volume group created", log.Ctx{"pv_name": pvName, "vg_name": d.config["lvm.vg_name"]})
-		revert.Add(func() { shared.TryRunCommand("vgremove", d.config["lvm.vg_name"]) })
+
+		d.logger.Debug("Volume group created", logger.Ctx{"pv_name": pvName, "vg_name": d.config["lvm.vg_name"]})
+		revert.Add(func() { _, _ = shared.TryRunCommand("vgremove", d.config["lvm.vg_name"]) })
 	}
 
 	// Create thin pool if needed.
 	if d.usesThinpool() && !thinPoolExists {
-		err = d.createDefaultThinPool(d.Info().Version, d.config["lvm.vg_name"], d.thinpoolName())
+		err = d.createDefaultThinPool(d.Info().Version, d.config["lvm.vg_name"], d.thinpoolName(), d.config["lvm.thinpool_metadata_size"])
 		if err != nil {
 			return err
 		}
-		d.logger.Debug("Thin pool created", log.Ctx{"vg_name": d.config["lvm.vg_name"], "thinpool_name": d.thinpoolName()})
+
+		d.logger.Debug("Thin pool created", logger.Ctx{"vg_name": d.config["lvm.vg_name"], "thinpool_name": d.thinpoolName()})
 
 		revert.Add(func() {
-			d.removeLogicalVolume(d.lvmDevPath(d.config["lvm.vg_name"], "", "", d.thinpoolName()))
+			_ = d.removeLogicalVolume(d.lvmDevPath(d.config["lvm.vg_name"], "", "", d.thinpoolName()))
 		})
 	}
 
@@ -306,7 +323,8 @@ func (d *lvm) Create() error {
 	if err != nil {
 		return err
 	}
-	d.logger.Debug("LXD marker tag added to volume group", log.Ctx{"vg_name": d.config["lvm.vg_name"]})
+
+	d.logger.Debug("LXD marker tag added to volume group", logger.Ctx{"vg_name": d.config["lvm.vg_name"]})
 
 	revert.Success()
 	return nil
@@ -315,15 +333,16 @@ func (d *lvm) Create() error {
 // Delete removes the storage pool from the storage device.
 func (d *lvm) Delete(op *operations.Operation) error {
 	var err error
-	var loopFile *os.File
+	var loopDevPath string
 
 	// Open the loop file if needed.
 	if filepath.IsAbs(d.config["source"]) && !shared.IsBlockdevPath(d.config["source"]) {
-		loopFile, err = d.openLoopFile(d.config["source"])
+		loopDevPath, err = d.openLoopFile(d.config["source"])
 		if err != nil {
 			return err
 		}
-		defer loopFile.Close()
+
+		defer func() { _ = loopDeviceAutoDetach(loopDevPath) }()
 	}
 
 	vgExists, vgTags, err := d.volumeGroupExists(d.config["lvm.vg_name"])
@@ -335,8 +354,10 @@ func (d *lvm) Delete(op *operations.Operation) error {
 	if vgExists && shared.IsFalseOrEmpty(d.config["lvm.vg.force_reuse"]) {
 		// Count normal and thin volumes.
 		lvCount, err := d.countLogicalVolumes(d.config["lvm.vg_name"])
-		if err != nil && err != errLVMNotFound {
-			return err
+		if err != nil {
+			if !api.StatusErrorCheck(err, http.StatusNotFound) {
+				return err
+			}
 		}
 
 		// Check that volume group is not in use. If it is we need to assume that other users are using
@@ -349,8 +370,10 @@ func (d *lvm) Delete(op *operations.Operation) error {
 				// Lets see if the lv count is just our thin pool, or whether we can only remove
 				// the thin pool itself and not the volume group.
 				thinVolCount, err := d.countThinVolumes(d.config["lvm.vg_name"], d.thinpoolName())
-				if err != nil && err != errLVMNotFound {
-					return err
+				if err != nil {
+					if !api.StatusErrorCheck(err, http.StatusNotFound) {
+						return err
+					}
 				}
 
 				// Thin pool exists.
@@ -366,7 +389,8 @@ func (d *lvm) Delete(op *operations.Operation) error {
 						if err != nil {
 							return fmt.Errorf("Failed to delete thin pool %q from volume group %q: %w", d.thinpoolName(), d.config["lvm.vg_name"], err)
 						}
-						d.logger.Debug("Thin pool removed", log.Ctx{"vg_name": d.config["lvm.vg_name"], "thinpool_name": d.thinpoolName()})
+
+						d.logger.Debug("Thin pool removed", logger.Ctx{"vg_name": d.config["lvm.vg_name"], "thinpool_name": d.thinpoolName()})
 					}
 				}
 			}
@@ -378,7 +402,8 @@ func (d *lvm) Delete(op *operations.Operation) error {
 			if err != nil {
 				return fmt.Errorf("Failed to delete the volume group for the lvm storage pool: %w", err)
 			}
-			d.logger.Debug("Volume group removed", log.Ctx{"vg_name": d.config["lvm.vg_name"]})
+
+			d.logger.Debug("Volume group removed", logger.Ctx{"vg_name": d.config["lvm.vg_name"]})
 		} else {
 			// Otherwise just remove the lvmVgPoolMarker tag to indicate LXD no longer uses this VG.
 			if shared.StringInSlice(lvmVgPoolMarker, vgTags) {
@@ -386,27 +411,24 @@ func (d *lvm) Delete(op *operations.Operation) error {
 				if err != nil {
 					return fmt.Errorf("Failed to remove marker tag on volume group for the lvm storage pool: %w", err)
 				}
-				d.logger.Debug("LXD marker tag removed from volume group", log.Ctx{"vg_name": d.config["lvm.vg_name"]})
+
+				d.logger.Debug("LXD marker tag removed from volume group", logger.Ctx{"vg_name": d.config["lvm.vg_name"]})
 			}
 		}
 	}
 
 	// If we have removed the volume group and this is a loop file, lets clean up the physical volume too.
-	if removeVg && loopFile != nil {
-		err = SetAutoclearOnLoopDev(int(loopFile.Fd()))
+	if removeVg && loopDevPath != "" {
+		_, err := shared.TryRunCommand("pvremove", "-f", loopDevPath)
 		if err != nil {
-			d.logger.Warn("Failed to set LO_FLAGS_AUTOCLEAR on loop device, manual cleanup needed", log.Ctx{"dev": loopFile.Name(), "err": err})
+			d.logger.Warn("Failed to destroy the physical volume for the lvm storage pool", logger.Ctx{"err": err})
 		}
 
-		_, err := shared.TryRunCommand("pvremove", "-f", loopFile.Name())
-		if err != nil {
-			d.logger.Warn("Failed to destroy the physical volume for the lvm storage pool", log.Ctx{"err": err})
-		}
-		d.logger.Debug("Physical volume removed", log.Ctx{"pv_name": loopFile.Name()})
+		d.logger.Debug("Physical volume removed", logger.Ctx{"pv_name": loopDevPath})
 
-		err = loopFile.Close()
+		err = loopDeviceAutoDetach(loopDevPath)
 		if err != nil {
-			return err
+			d.logger.Warn("Failed to set LO_FLAGS_AUTOCLEAR on loop device, manual cleanup needed", logger.Ctx{"dev": loopDevPath, "err": err})
 		}
 
 		// This is a loop file so deconfigure the associated loop device.
@@ -414,7 +436,8 @@ func (d *lvm) Delete(op *operations.Operation) error {
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("Error removing LVM pool loop file %q: %w", d.config["source"], err)
 		}
-		d.logger.Debug("Physical loop file removed", log.Ctx{"file_name": d.config["source"]})
+
+		d.logger.Debug("Physical loop file removed", logger.Ctx{"file_name": d.config["source"]})
 	}
 
 	// Wipe everything in the storage pool directory.
@@ -428,23 +451,27 @@ func (d *lvm) Delete(op *operations.Operation) error {
 
 func (d *lvm) Validate(config map[string]string) error {
 	rules := map[string]func(value string) error{
+		"size":                       validate.Optional(validate.IsSize),
 		"lvm.vg_name":                validate.IsAny,
 		"lvm.thinpool_name":          validate.IsAny,
+		"lvm.thinpool_metadata_size": validate.Optional(validate.IsSize),
 		"lvm.use_thinpool":           validate.Optional(validate.IsBool),
-		"volume.block.mount_options": validate.IsAny,
-		"volume.block.filesystem":    validate.Optional(validate.IsOneOf(lvmAllowedFilesystems...)),
-		"volume.lvm.stripes":         validate.Optional(validate.IsUint32),
-		"volume.lvm.stripes.size":    validate.Optional(validate.IsSize),
 		"lvm.vg.force_reuse":         validate.Optional(validate.IsBool),
 	}
 
-	err := d.validatePool(config, rules)
+	err := d.validatePool(config, rules, d.commonVolumeRules())
 	if err != nil {
 		return err
 	}
 
-	if shared.IsFalse(config["lvm.use_thinpool"]) && config["lvm.thinpool_name"] != "" {
-		return fmt.Errorf("The key lvm.use_thinpool cannot be set to false when lvm.thinpool_name is set")
+	if shared.IsFalse(config["lvm.use_thinpool"]) {
+		if config["lvm.thinpool_name"] != "" {
+			return fmt.Errorf("The key lvm.use_thinpool cannot be set to false when lvm.thinpool_name is set")
+		}
+
+		if config["lvm.thinpool_metadata_size"] != "" {
+			return fmt.Errorf("The key lvm.use_thinpool cannot be set to false when lvm.thinpool_metadata_size is set")
+		}
 	}
 
 	return nil
@@ -452,15 +479,23 @@ func (d *lvm) Validate(config map[string]string) error {
 
 // Update updates the storage pool settings.
 func (d *lvm) Update(changedConfig map[string]string) error {
-	if _, changed := changedConfig["lvm.use_thinpool"]; changed {
+	_, changed := changedConfig["lvm.use_thinpool"]
+	if changed {
 		return fmt.Errorf("lvm.use_thinpool cannot be changed")
 	}
 
-	if _, changed := changedConfig["volume.lvm.stripes"]; changed && d.usesThinpool() {
+	_, changed = changedConfig["lvm.thinpool_metadata_size"]
+	if changed {
+		return fmt.Errorf("lvm.thinpool_metadata_size cannot be changed")
+	}
+
+	_, changed = changedConfig["volume.lvm.stripes"]
+	if changed && d.usesThinpool() {
 		return fmt.Errorf("volume.lvm.stripes cannot be changed when using thin pool")
 	}
 
-	if _, changed := changedConfig["volume.lvm.stripes.size"]; changed && d.usesThinpool() {
+	_, changed = changedConfig["volume.lvm.stripes.size"]
+	if changed && d.usesThinpool() {
 		return fmt.Errorf("volume.lvm.stripes.size cannot be changed when using thin pool")
 	}
 
@@ -469,7 +504,8 @@ func (d *lvm) Update(changedConfig map[string]string) error {
 		if err != nil {
 			return fmt.Errorf("Error renaming LVM volume group from %q to %q: %w", d.config["lvm.vg_name"], changedConfig["lvm.vg_name"], err)
 		}
-		d.logger.Debug("Volume group renamed", log.Ctx{"vg_name": d.config["lvm.vg_name"], "new_vg_name": changedConfig["lvm.vg_name"]})
+
+		d.logger.Debug("Volume group renamed", logger.Ctx{"vg_name": d.config["lvm.vg_name"], "new_vg_name": changedConfig["lvm.vg_name"]})
 	}
 
 	if changedConfig["lvm.thinpool_name"] != "" {
@@ -477,7 +513,8 @@ func (d *lvm) Update(changedConfig map[string]string) error {
 		if err != nil {
 			return fmt.Errorf("Error renaming LVM thin pool from %q to %q: %w", d.thinpoolName(), changedConfig["lvm.thinpool_name"], err)
 		}
-		d.logger.Debug("Thin pool volume renamed", log.Ctx{"vg_name": d.config["lvm.vg_name"], "thinpool": d.thinpoolName(), "new_thinpool": changedConfig["lvm.thinpool_name"]})
+
+		d.logger.Debug("Thin pool volume renamed", logger.Ctx{"vg_name": d.config["lvm.vg_name"], "thinpool": d.thinpoolName(), "new_thinpool": changedConfig["lvm.thinpool_name"]})
 	}
 
 	return nil
@@ -496,18 +533,18 @@ func (d *lvm) Mount() (bool, error) {
 
 	waitDuration := time.Second * time.Duration(5)
 
+	revert := revert.New()
+	defer revert.Fail()
+
 	// Open the loop file if the source points to a non-block device file.
 	// This ensures that auto clear isn't enabled on the loop file.
 	if filepath.IsAbs(d.config["source"]) && !shared.IsBlockdevPath(d.config["source"]) {
-		loopFile, err := d.openLoopFile(d.config["source"])
+		loopDevPath, err := d.openLoopFile(d.config["source"])
 		if err != nil {
 			return false, err
 		}
 
-		err = loopFile.Close()
-		if err != nil {
-			return false, err
-		}
+		revert.Add(func() { _ = loopDeviceAutoDetach(loopDevPath) })
 
 		// Wait for volume group to be detected if wasn't detected before.
 		if !vgExists {
@@ -546,6 +583,7 @@ func (d *lvm) Mount() (bool, error) {
 		}
 	}
 
+	revert.Success()
 	return ourMount, nil
 }
 
@@ -602,6 +640,7 @@ func (d *lvm) GetResources() (*api.ResourcesStoragePool, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		res.Space.Used = total - free
 	}
 

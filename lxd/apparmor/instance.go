@@ -2,7 +2,6 @@ package apparmor
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,24 +12,24 @@ import (
 	"github.com/lxc/lxd/lxd/sys"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 )
 
 // Internal copy of the instance interface.
 type instance interface {
-	Project() string
+	Project() api.Project
 	Name() string
 	ExpandedConfig() map[string]string
 	Type() instancetype.Type
 	LogPath() string
 	Path() string
-	DevPaths() []string
 	DevicesPath() string
 }
 
 // InstanceProfileName returns the instance's AppArmor profile name.
 func InstanceProfileName(inst instance) string {
 	path := shared.VarPath("")
-	name := fmt.Sprintf("%s_<%s>", project.Instance(inst.Project(), inst.Name()), path)
+	name := fmt.Sprintf("%s_<%s>", project.Instance(inst.Project().Name, inst.Name()), path)
 	return profileName("", name)
 }
 
@@ -38,13 +37,13 @@ func InstanceProfileName(inst instance) string {
 func InstanceNamespaceName(inst instance) string {
 	// Unlike in profile names, / isn't an allowed character so replace with a -.
 	path := strings.Replace(strings.Trim(shared.VarPath(""), "/"), "/", "-", -1)
-	name := fmt.Sprintf("%s_<%s>", project.Instance(inst.Project(), inst.Name()), path)
+	name := fmt.Sprintf("%s_<%s>", project.Instance(inst.Project().Name, inst.Name()), path)
 	return profileName("", name)
 }
 
 // instanceProfileFilename returns the name of the on-disk profile name.
 func instanceProfileFilename(inst instance) string {
-	name := project.Instance(inst.Project(), inst.Name())
+	name := project.Instance(inst.Project().Name, inst.Name())
 	return profileName("", name)
 }
 
@@ -117,7 +116,7 @@ func instanceProfileGenerate(sysOS *sys.OS, inst instance) error {
 	 * force a recompile.
 	 */
 	profile := filepath.Join(aaPath, "profiles", instanceProfileFilename(inst))
-	content, err := ioutil.ReadFile(profile)
+	content, err := os.ReadFile(profile)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -128,7 +127,7 @@ func instanceProfileGenerate(sysOS *sys.OS, inst instance) error {
 	}
 
 	if string(content) != string(updated) {
-		err = ioutil.WriteFile(profile, []byte(updated), 0600)
+		err = os.WriteFile(profile, []byte(updated), 0600)
 		if err != nil {
 			return err
 		}
@@ -157,7 +156,7 @@ func instanceProfile(sysOS *sys.OS, inst instance) (string, error) {
 	// Render the profile.
 	var sb *strings.Builder = &strings.Builder{}
 	if inst.Type() == instancetype.Container {
-		err = lxcProfileTpl.Execute(sb, map[string]interface{}{
+		err = lxcProfileTpl.Execute(sb, map[string]any{
 			"feature_cgns":     sysOS.CGInfo.Namespacing,
 			"feature_cgroup2":  sysOS.CGInfo.Layout == cgroup.CgroupsUnified || sysOS.CGInfo.Layout == cgroup.CgroupsHybrid,
 			"feature_stacking": sysOS.AppArmorStacking && !sysOS.AppArmorStacked,
@@ -183,14 +182,6 @@ func instanceProfile(sysOS *sys.OS, inst instance) (string, error) {
 			return "", err
 		}
 
-		externalDevPaths := inst.DevPaths()
-		for i := range externalDevPaths {
-			externalDevPaths[i], err = filepath.EvalSymlinks(externalDevPaths[i])
-			if err != nil {
-				return "", err
-			}
-		}
-
 		ovmfPath := "/usr/share/OVMF"
 		if os.Getenv("LXD_OVMF_PATH") != "" {
 			ovmfPath = os.Getenv("LXD_OVMF_PATH")
@@ -207,18 +198,18 @@ func instanceProfile(sysOS *sys.OS, inst instance) (string, error) {
 			execPath = execPathFull
 		}
 
-		err = qemuProfileTpl.Execute(sb, map[string]interface{}{
-			"externalDevPaths": externalDevPaths,
-			"devicesPath":      inst.DevicesPath(),
-			"exePath":          execPath,
-			"libraryPath":      strings.Split(os.Getenv("LD_LIBRARY_PATH"), ":"),
-			"logPath":          inst.LogPath(),
-			"name":             InstanceProfileName(inst),
-			"path":             path,
-			"raw":              rawContent,
-			"rootPath":         rootPath,
-			"snap":             shared.InSnap(),
-			"ovmfPath":         ovmfPath,
+		err = qemuProfileTpl.Execute(sb, map[string]any{
+			"devicesPath": inst.DevicesPath(),
+			"exePath":     execPath,
+			"libraryPath": strings.Split(os.Getenv("LD_LIBRARY_PATH"), ":"),
+			"logPath":     inst.LogPath(),
+			"name":        InstanceProfileName(inst),
+			"path":        path,
+			"raw":         rawContent,
+			"rootPath":    rootPath,
+			"snap":        shared.InSnap(),
+			"userns":      sysOS.RunningInUserNS,
+			"ovmfPath":    ovmfPath,
 		})
 		if err != nil {
 			return "", err

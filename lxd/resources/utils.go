@@ -3,7 +3,6 @@ package resources
 import (
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,8 +11,17 @@ import (
 
 var sysBusPci = "/sys/bus/pci/devices"
 
+func isDir(name string) bool {
+	stat, err := os.Stat(name)
+	if err != nil {
+		return false
+	}
+
+	return stat.IsDir()
+}
+
 func readUint(path string) (uint64, error) {
-	content, err := ioutil.ReadFile(path)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
@@ -27,7 +35,7 @@ func readUint(path string) (uint64, error) {
 }
 
 func readInt(path string) (int64, error) {
-	content, err := ioutil.ReadFile(path)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		return -1, err
 	}
@@ -60,16 +68,12 @@ func int64InSlice(key int64, list []int64) bool {
 
 func sysfsExists(path string) bool {
 	_, err := os.Lstat(path)
-	if err == nil {
-		return true
-	}
-
-	return false
+	return err == nil
 }
 
 func sysfsNumaNode(path string) (uint64, error) {
 	// List all the directory entries
-	entries, err := ioutil.ReadDir(path)
+	entries, err := os.ReadDir(path)
 	if err != nil {
 		return 0, err
 	}
@@ -143,6 +147,7 @@ func pciAddress(devicePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("Failed to find %q: %w", filepath.Join(devicePath, "subsystem"), err)
 	}
+
 	subsystem := filepath.Base(subsystemTarget)
 
 	if subsystem == "virtio" {

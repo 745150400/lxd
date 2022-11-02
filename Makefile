@@ -108,12 +108,12 @@ update-schema:
 .PHONY: update-api
 update-api:
 ifeq "$(LXD_OFFLINE)" ""
-	(cd / ; GO111MODULE=on go get -v -x github.com/go-swagger/go-swagger/cmd/swagger)
+	(cd / ; go install -v -x github.com/go-swagger/go-swagger/cmd/swagger@latest)
 endif
 	swagger generate spec -o doc/rest-api.yaml -w ./lxd -m
 
-.PHONY: doc
-doc:
+.PHONY: doc-setup
+doc-setup:
 	@echo "Setting up documentation build environment"
 	python3 -m venv .sphinx/venv
 	. $(SPHINXENV) ; pip install --upgrade -r .sphinx/requirements.txt
@@ -123,7 +123,9 @@ doc:
 	ln -sf ../../deps/swagger-ui/dist/swagger-ui-bundle.js ../../deps/swagger-ui/dist/swagger-ui-standalone-preset.js ../../deps/swagger-ui/dist/swagger-ui.css .sphinx/_static/swagger-ui/
 	wget -N -P .sphinx/_static/download https://linuxcontainers.org/static/img/favicon.ico https://linuxcontainers.org/static/img/containers.png https://linuxcontainers.org/static/img/containers.small.png
 	rm -Rf doc/html
-	make doc-incremental
+
+.PHONY: doc
+doc: doc-setup doc-incremental
 
 .PHONY: doc-incremental
 doc-incremental:
@@ -133,6 +135,18 @@ doc-incremental:
 .PHONY: doc-serve
 doc-serve:
 	cd doc/html; python3 -m http.server 8001
+
+.PHONY: doc-spellcheck
+doc-spellcheck: doc
+	. $(SPHINXENV) ; python3 -m pyspelling -c .sphinx/.spellcheck.yaml
+
+.PHONY: doc-linkcheck
+doc-linkcheck: doc-setup
+	. $(SPHINXENV) ; sphinx-build -c .sphinx/ -b linkcheck doc/ doc/html/
+
+.PHONY: doc-lint
+doc-lint:
+	.sphinx/.markdownlint/doc-lint.sh
 
 .PHONY: debug
 debug:
@@ -172,9 +186,9 @@ endif
 .PHONY: check
 check: default
 ifeq "$(LXD_OFFLINE)" ""
-	(cd / ; go get -v -x github.com/rogpeppe/godeps)
-	(cd / ; go get -v -x github.com/tsenart/deadcode)
-	(cd / ; go get -v -x golang.org/x/lint/golint)
+	(cd / ; go install -v -x github.com/rogpeppe/godeps@latest)
+	(cd / ; go install -v -x github.com/tsenart/deadcode@latest)
+	(cd / ; go install -v -x golang.org/x/lint/golint@latest)
 endif
 	CGO_LDFLAGS_ALLOW="$(CGO_LDFLAGS_ALLOW)" go test -v -tags "$(TAG_SQLITE3)" $(DEBUG) ./...
 	cd test && ./main.sh
@@ -227,7 +241,7 @@ update-po:
 .PHONY: update-pot
 update-pot:
 ifeq "$(LXD_OFFLINE)" ""
-	(cd / ; go get -v -x github.com/snapcore/snapd/i18n/xgettext-go)
+	(cd / ; go install -v -x github.com/snapcore/snapd/i18n/xgettext-go@2.57.1)
 endif
 	xgettext-go -o po/$(DOMAIN).pot --add-comments-tag=TRANSLATORS: --sort-output --package-name=$(DOMAIN) --msgid-bugs-address=lxc-devel@lists.linuxcontainers.org --keyword=i18n.G --keyword-plural=i18n.NG lxc/*.go lxc/*/*.go
 
@@ -236,7 +250,24 @@ build-mo: $(MOFILES)
 
 .PHONY: static-analysis
 static-analysis:
-	(cd test; sh -c ". suites/static_analysis.sh; test_static_analysis")
+ifeq ($(shell command -v golangci-lint 2> /dev/null),)
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.46.2
+endif
+ifeq ($(shell command -v shellcheck 2> /dev/null),)
+	echo "Please install shellcheck"
+	exit 1
+endif
+ifneq "$(shell shellcheck --version | grep version: | cut -d ' ' -f2)" "0.8.0"
+	@echo "WARN: shellcheck version is not 0.8.0"
+endif
+ifeq ($(shell command -v flake8 2> /dev/null),)
+	echo "Please install flake8"
+	exit 1
+endif
+	golangci-lint run --timeout 5m
+	flake8 test/deps/import-busybox
+	shellcheck --shell sh test/*.sh test/includes/*.sh test/suites/*.sh test/backends/*.sh test/lint/*.sh
+	run-parts --regex '.sh' test/lint
 
 .PHONY: tags
 tags: *.go lxd/*.go shared/*.go lxc/*.go

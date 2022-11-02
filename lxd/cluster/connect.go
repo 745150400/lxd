@@ -3,8 +3,6 @@ package cluster
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
-	"encoding/pem"
 	"fmt"
 	"net"
 	"net/http"
@@ -22,9 +20,6 @@ import (
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/version"
 )
-
-// ErrCertificateExists indicates that a certificate already exists.
-var ErrCertificateExists error = fmt.Errorf("Certificate already in trust store")
 
 // Connect is a convenience around lxd.ConnectLXD that configures the client
 // with the correct parameters for node-to-node communication.
@@ -81,43 +76,49 @@ func Connect(address string, networkCert *shared.CertInfo, serverCert *shared.Ce
 	return lxd.ConnectLXD(url, args)
 }
 
-// ConnectIfInstanceIsRemote figures out the address of the node which is
-// running the container with the given name. If it's not the local node will
-// connect to it and return the connected client, otherwise it will just return
-// nil.
-func ConnectIfInstanceIsRemote(cluster *db.Cluster, projectName string, name string, networkCert *shared.CertInfo, serverCert *shared.CertInfo, r *http.Request, instanceType instancetype.Type) (lxd.InstanceServer, error) {
-	var address string // Node address
-	err := cluster.Transaction(func(tx *db.ClusterTx) error {
+// ConnectIfInstanceIsRemote figures out the address of the cluster member which is running the instance with the
+// given name in the specified project. If it's not the local member will connect to it and return the connected
+// client (configured with the specified project), otherwise it will just return nil.
+func ConnectIfInstanceIsRemote(cluster *db.Cluster, projectName string, instName string, networkCert *shared.CertInfo, serverCert *shared.CertInfo, r *http.Request, instanceType instancetype.Type) (lxd.InstanceServer, error) {
+	var address string // Cluster member address.
+	err := cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
-		address, err = tx.GetNodeAddressOfInstance(projectName, name, db.InstanceTypeFilter(instanceType))
+		address, err = tx.GetNodeAddressOfInstance(ctx, projectName, instName, instanceType)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
+
 	if address == "" {
-		// The instance is running right on this node, no need to connect.
-		return nil, nil
+		return nil, nil // The instance is running on this local member, no need to connect.
 	}
 
-	return Connect(address, networkCert, serverCert, r, false)
+	client, err := Connect(address, networkCert, serverCert, r, false)
+	if err != nil {
+		return nil, err
+	}
+
+	client = client.UseProject(projectName)
+
+	return client, nil
 }
 
 // ConnectIfVolumeIsRemote figures out the address of the cluster member on which the volume with the given name is
 // defined. If it's not the local cluster member it will connect to it and return the connected client, otherwise
 // it just returns nil. If there is more than one cluster member with a matching volume name, an error is returned.
 func ConnectIfVolumeIsRemote(s *state.State, poolName string, projectName string, volumeName string, volumeType int, networkCert *shared.CertInfo, serverCert *shared.CertInfo, r *http.Request) (lxd.InstanceServer, error) {
-	localNodeID := s.Cluster.GetNodeID()
+	localNodeID := s.DB.Cluster.GetNodeID()
 	var err error
 	var nodes []db.NodeInfo
 	var poolID int64
-	err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		poolID, err = tx.GetStoragePoolID(poolName)
+	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		poolID, err = tx.GetStoragePoolID(ctx, poolName)
 		if err != nil {
 			return err
 		}
 
-		nodes, err = tx.GetStorageVolumeNodes(poolID, projectName, volumeName, volumeType)
+		nodes, err = tx.GetStorageVolumeNodes(ctx, poolID, projectName, volumeName, volumeType)
 		if err != nil {
 			return err
 		}
@@ -132,21 +133,25 @@ func ConnectIfVolumeIsRemote(s *state.State, poolName string, projectName string
 	// whether it is exclusively attached to remote instance, and if so then we need to forward the request to
 	// the node whereit is currently used. This avoids conflicting with another member when using it locally.
 	if err == db.ErrNoClusterMember {
-		// GetLocalStoragePoolVolume returns a volume with an empty Location field for remote drivers.
-		_, vol, err := s.Cluster.GetLocalStoragePoolVolume(projectName, volumeName, volumeType, poolID)
+		// GetStoragePoolVolume returns a volume with an empty Location field for remote drivers.
+		var dbVolume *db.StorageVolume
+		err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			dbVolume, err = tx.GetStoragePoolVolume(ctx, poolID, projectName, volumeType, volumeName, true)
+			return err
+		})
 		if err != nil {
 			return nil, err
 		}
 
-		remoteInstance, err := storagePools.VolumeUsedByExclusiveRemoteInstancesWithProfiles(s, poolName, projectName, vol)
+		remoteInstance, err := storagePools.VolumeUsedByExclusiveRemoteInstancesWithProfiles(s, poolName, projectName, &dbVolume.StorageVolume)
 		if err != nil {
 			return nil, fmt.Errorf("Failed checking if volume %q is available: %w", volumeName, err)
 		}
 
 		if remoteInstance != nil {
 			var instNode db.NodeInfo
-			err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-				instNode, err = tx.GetNodeByName(remoteInstance.Node)
+			err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+				instNode, err = tx.GetNodeByName(ctx, remoteInstance.Node)
 				return err
 			})
 			if err != nil {
@@ -171,7 +176,7 @@ func ConnectIfVolumeIsRemote(s *state.State, poolName string, projectName string
 
 	node := nodes[0]
 	if node.ID == localNodeID {
-		// Use local cluster member if volume belongs to this local node.
+		// Use local cluster member if volume belongs to this local member.
 		return nil, nil
 	}
 
@@ -195,7 +200,7 @@ func SetupTrust(serverCert *shared.CertInfo, serverName string, targetAddress st
 		return fmt.Errorf("Failed to connect to target cluster node %q: %w", targetAddress, err)
 	}
 
-	cert, err := generateTrustCertificate(serverCert, serverName)
+	cert, err := shared.GenerateTrustCertificate(serverCert, serverName)
 	if err != nil {
 		return fmt.Errorf("Failed generating trust certificate: %w", err)
 	}
@@ -206,7 +211,7 @@ func SetupTrust(serverCert *shared.CertInfo, serverName string, targetAddress st
 	}
 
 	err = target.CreateCertificate(post)
-	if err != nil && err.Error() != ErrCertificateExists.Error() {
+	if err != nil && !api.StatusErrorCheck(err, http.StatusConflict) {
 		return fmt.Errorf("Failed to add server cert to cluster: %w", err)
 	}
 
@@ -232,7 +237,7 @@ func UpdateTrust(serverCert *shared.CertInfo, serverName string, targetAddress s
 		return fmt.Errorf("Failed to connect to target cluster node %q: %w", targetAddress, err)
 	}
 
-	cert, err := generateTrustCertificate(serverCert, serverName)
+	cert, err := shared.GenerateTrustCertificate(serverCert, serverName)
 	if err != nil {
 		return fmt.Errorf("Failed generating trust certificate: %w", err)
 	}
@@ -259,32 +264,6 @@ func UpdateTrust(serverCert *shared.CertInfo, serverName string, targetAddress s
 	return nil
 }
 
-// generateTrustCertificate converts the specified serverCert and serverName into an api.Certificate suitable for
-// use as a trusted cluster server certificate.
-func generateTrustCertificate(serverCert *shared.CertInfo, serverName string) (*api.Certificate, error) {
-	block, _ := pem.Decode(serverCert.PublicKey())
-	if block == nil {
-		return nil, fmt.Errorf("Failed to decode certificate")
-	}
-
-	fingerprint, err := shared.CertFingerprintStr(string(serverCert.PublicKey()))
-	if err != nil {
-		return nil, fmt.Errorf("Failed to calculate fingerprint: %w", err)
-	}
-
-	certificate := base64.StdEncoding.EncodeToString(block.Bytes)
-	cert := api.Certificate{
-		CertificatePut: api.CertificatePut{
-			Certificate: certificate,
-			Name:        serverName,
-			Type:        api.CertificateTypeServer, // Server type for intra-member communication.
-		},
-		Fingerprint: fingerprint,
-	}
-
-	return &cert, nil
-}
-
 // HasConnectivity probes the member with the given address for connectivity.
 func HasConnectivity(networkCert *shared.CertInfo, serverCert *shared.CertInfo, address string) bool {
 	config, err := tlsClientConfig(networkCert, serverCert)
@@ -296,8 +275,9 @@ func HasConnectivity(networkCert *shared.CertInfo, serverCert *shared.CertInfo, 
 	dialer := &net.Dialer{Timeout: time.Second}
 	conn, err = tls.DialWithDialer(dialer, "tcp", address, config)
 	if err == nil {
-		conn.Close()
+		_ = conn.Close()
 		return true
 	}
+
 	return false
 }

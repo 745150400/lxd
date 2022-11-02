@@ -1,9 +1,9 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/shared/api"
 )
 
@@ -20,7 +21,7 @@ import (
 func (c *Cluster) CreateNetworkForward(networkID int64, memberSpecific bool, info *api.NetworkForwardsPost) (int64, error) {
 	var err error
 	var forwardID int64
-	var nodeID interface{}
+	var nodeID any
 
 	if memberSpecific {
 		nodeID = c.nodeID
@@ -35,7 +36,7 @@ func (c *Cluster) CreateNetworkForward(networkID int64, memberSpecific bool, inf
 		}
 	}
 
-	err = c.Transaction(func(tx *ClusterTx) error {
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Insert a new Network forward record.
 		result, err := tx.tx.Exec(`
 		INSERT INTO networks_forwards
@@ -76,7 +77,8 @@ func networkForwardConfigAdd(tx *sql.Tx, forwardID int64, config map[string]stri
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+
+	defer func() { _ = stmt.Close() }()
 
 	for k, v := range config {
 		if v == "" {
@@ -104,7 +106,7 @@ func (c *Cluster) UpdateNetworkForward(networkID int64, forwardID int64, info *a
 		}
 	}
 
-	err = c.Transaction(func(tx *ClusterTx) error {
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Update existing Network forward record.
 		res, err := tx.tx.Exec(`
 		UPDATE networks_forwards
@@ -146,7 +148,7 @@ func (c *Cluster) UpdateNetworkForward(networkID int64, forwardID int64, info *a
 
 // DeleteNetworkForward deletes an existing Network Forward.
 func (c *Cluster) DeleteNetworkForward(networkID int64, forwardID int64) error {
-	return c.Transaction(func(tx *ClusterTx) error {
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Delete existing Network forward record.
 		res, err := tx.tx.Exec(`
 			DELETE FROM networks_forwards
@@ -172,69 +174,25 @@ func (c *Cluster) DeleteNetworkForward(networkID int64, forwardID int64) error {
 // GetNetworkForward returns the Network Forward ID and info for the given network ID and listen address.
 // If memberSpecific is true, then the search is restricted to forwards that belong to this member or belong to
 // all members.
-func (c *Cluster) GetNetworkForward(networkID int64, memberSpecific bool, listenAddress string) (int64, *api.NetworkForward, error) {
-	var q *strings.Builder = &strings.Builder{}
-	args := []interface{}{networkID, listenAddress}
-
-	q.WriteString(`
-	SELECT
-		IFNULL(networks_forwards.id, -1) ,
-		IFNULL(networks_forwards.listen_address, ""),
-		IFNULL(networks_forwards.description, ""),
-		IFNULL(nodes.name, "") as location,
-		IFNULL(networks_forwards.ports, ""),
-		COUNT(networks_forwards.id) as rowCount
-	FROM networks_forwards
-	LEFT JOIN nodes ON nodes.id = networks_forwards.node_id
-	WHERE networks_forwards.network_id = ? AND networks_forwards.listen_address = ?
-	`)
-
-	if memberSpecific {
-		q.WriteString("AND (networks_forwards.node_id = ? OR networks_forwards.node_id IS NULL) ")
-		args = append(args, c.nodeID)
-	}
-
-	var err error
-	var forwardID int64 = int64(-1)
-	var forward api.NetworkForward
-	var portsJSON string
-
-	err = c.Transaction(func(tx *ClusterTx) error {
-		var rowCount int
-
-		err = tx.tx.QueryRow(q.String(), args...).Scan(&forwardID, &forward.ListenAddress, &forward.Description, &forward.Location, &portsJSON, &rowCount)
-		if rowCount <= 0 || errors.Is(err, sql.ErrNoRows) {
-			return api.StatusErrorf(http.StatusNotFound, "Network forward not found")
-		} else if rowCount > 1 {
-			return api.StatusErrorf(http.StatusConflict, "Network forward found on more than one cluster member. Please target a specific member")
-		} else if err != nil {
-			return err
-		}
-
-		err = networkForwardConfig(tx, forwardID, &forward)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-	if err != nil {
+func (c *Cluster) GetNetworkForward(ctx context.Context, networkID int64, memberSpecific bool, listenAddress string) (int64, *api.NetworkForward, error) {
+	forwards, err := c.GetNetworkForwards(ctx, networkID, memberSpecific, listenAddress)
+	if (err == nil && len(forwards) <= 0) || errors.Is(err, sql.ErrNoRows) {
+		return -1, nil, api.StatusErrorf(http.StatusNotFound, "Network forward not found")
+	} else if err == nil && len(forwards) > 1 {
+		return -1, nil, api.StatusErrorf(http.StatusConflict, "Network forward found on more than one cluster member. Please target a specific member")
+	} else if err != nil {
 		return -1, nil, err
 	}
 
-	forward.Ports = []api.NetworkForwardPort{}
-	if portsJSON != "" {
-		err = json.Unmarshal([]byte(portsJSON), &forward.Ports)
-		if err != nil {
-			return -1, nil, fmt.Errorf("Failed unmarshalling ports: %w", err)
-		}
+	for forwardID, forward := range forwards {
+		return forwardID, forward, nil // Only single forward in map.
 	}
 
-	return forwardID, &forward, nil
+	return -1, nil, fmt.Errorf("Unexpected forward list size")
 }
 
 // networkForwardConfig populates the config map of the Network Forward with the given ID.
-func networkForwardConfig(tx *ClusterTx, forwardID int64, forward *api.NetworkForward) error {
+func networkForwardConfig(ctx context.Context, tx *ClusterTx, forwardID int64, forward *api.NetworkForward) error {
 	q := `
 	SELECT
 		key,
@@ -244,7 +202,7 @@ func networkForwardConfig(tx *ClusterTx, forwardID int64, forward *api.NetworkFo
 	`
 
 	forward.Config = make(map[string]string)
-	return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 		var key, value string
 
 		err := scan(&key, &value)
@@ -269,7 +227,7 @@ func networkForwardConfig(tx *ClusterTx, forwardID int64, forward *api.NetworkFo
 // all members.
 func (c *Cluster) GetNetworkForwardListenAddresses(networkID int64, memberSpecific bool) (map[int64]string, error) {
 	var q *strings.Builder = &strings.Builder{}
-	args := []interface{}{networkID}
+	args := []any{networkID}
 
 	q.WriteString(`
 	SELECT
@@ -286,8 +244,8 @@ func (c *Cluster) GetNetworkForwardListenAddresses(networkID int64, memberSpecif
 
 	forwards := make(map[int64]string)
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.QueryScan(q.String(), func(scan func(dest ...interface{}) error) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return query.Scan(ctx, tx.Tx(), q.String(), func(scan func(dest ...any) error) error {
 			var forwardID int64 = int64(-1)
 			var listenAddress string
 
@@ -311,7 +269,7 @@ func (c *Cluster) GetNetworkForwardListenAddresses(networkID int64, memberSpecif
 // GetProjectNetworkForwardListenAddressesByUplink returns map of Network Forward Listen Addresses that belong to
 // networks connected to the specified uplinkNetworkName.
 // Returns a map keyed on project name and network ID containing a slice of listen addresses.
-func (c *ClusterTx) GetProjectNetworkForwardListenAddressesByUplink(uplinkNetworkName string) (map[string]map[int64][]string, error) {
+func (c *ClusterTx) GetProjectNetworkForwardListenAddressesByUplink(ctx context.Context, uplinkNetworkName string) (map[string]map[int64][]string, error) {
 	// As uplink networks can only be in default project, it is safe to look for networks that reference the
 	// specified uplinkNetworkName in their "network" config property.
 	q := `
@@ -328,7 +286,7 @@ func (c *ClusterTx) GetProjectNetworkForwardListenAddressesByUplink(uplinkNetwor
 	`
 	forwards := make(map[string]map[int64][]string)
 
-	err := c.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err := query.Scan(ctx, c.Tx(), q, func(scan func(dest ...any) error) error {
 		var projectName string
 		var networkID int64 = int64(-1)
 		var listenAddress string
@@ -360,7 +318,7 @@ func (c *ClusterTx) GetProjectNetworkForwardListenAddressesByUplink(uplinkNetwor
 // GetProjectNetworkForwardListenAddressesOnMember returns map of Network Forward Listen Addresses that belong to
 // to this specific cluster member. Will not include forwards that do not have a specific member.
 // Returns a map keyed on project name and network ID containing a slice of listen addresses.
-func (c *ClusterTx) GetProjectNetworkForwardListenAddressesOnMember() (map[string]map[int64][]string, error) {
+func (c *ClusterTx) GetProjectNetworkForwardListenAddressesOnMember(ctx context.Context) (map[string]map[int64][]string, error) {
 	q := `
 	SELECT
 		projects.name,
@@ -373,7 +331,7 @@ func (c *ClusterTx) GetProjectNetworkForwardListenAddressesOnMember() (map[strin
 	`
 	forwards := make(map[string]map[int64][]string)
 
-	err := c.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err := query.Scan(ctx, c.Tx(), q, func(scan func(dest ...any) error) error {
 		var projectName string
 		var networkID int64 = int64(-1)
 		var listenAddress string
@@ -404,10 +362,10 @@ func (c *ClusterTx) GetProjectNetworkForwardListenAddressesOnMember() (map[strin
 
 // GetNetworkForwards returns map of Network Forwards for the given network ID keyed on Forward ID.
 // If memberSpecific is true, then the search is restricted to forwards that belong to this member or belong to
-// all members.
-func (c *Cluster) GetNetworkForwards(networkID int64, memberSpecific bool) (map[int64]*api.NetworkForward, error) {
+// all members. Can optionally retrieve only specific network forwards by listen address.
+func (c *Cluster) GetNetworkForwards(ctx context.Context, networkID int64, memberSpecific bool, listenAddresses ...string) (map[int64]*api.NetworkForward, error) {
 	var q *strings.Builder = &strings.Builder{}
-	args := []interface{}{networkID}
+	args := []any{networkID}
 
 	q.WriteString(`
 	SELECT
@@ -426,11 +384,18 @@ func (c *Cluster) GetNetworkForwards(networkID int64, memberSpecific bool) (map[
 		args = append(args, c.nodeID)
 	}
 
+	if len(listenAddresses) > 0 {
+		q.WriteString(fmt.Sprintf("AND networks_forwards.listen_address IN %s ", query.Params(len(listenAddresses))))
+		for _, listenAddress := range listenAddresses {
+			args = append(args, listenAddress)
+		}
+	}
+
 	var err error
 	forwards := make(map[int64]*api.NetworkForward)
 
-	err = c.Transaction(func(tx *ClusterTx) error {
-		err = tx.QueryScan(q.String(), func(scan func(dest ...interface{}) error) error {
+	err = c.Transaction(ctx, func(ctx context.Context, tx *ClusterTx) error {
+		err = query.Scan(ctx, tx.Tx(), q.String(), func(scan func(dest ...any) error) error {
 			var forwardID int64 = int64(-1)
 			var portsJSON string
 			var forward api.NetworkForward
@@ -458,7 +423,7 @@ func (c *Cluster) GetNetworkForwards(networkID int64, memberSpecific bool) (map[
 
 		// Populate config.
 		for forwardID := range forwards {
-			err = networkForwardConfig(tx, forwardID, forwards[forwardID])
+			err = networkForwardConfig(ctx, tx, forwardID, forwards[forwardID])
 			if err != nil {
 				return err
 			}

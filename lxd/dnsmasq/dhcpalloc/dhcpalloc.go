@@ -11,12 +11,10 @@ import (
 	"os"
 
 	"github.com/mdlayher/netx/eui64"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/lxd/dnsmasq"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 )
 
 // ErrDHCPNotSupported indicates network doesn't support DHCP for this IP protocol.
@@ -191,7 +189,7 @@ func (t *Transaction) getDHCPFreeIPv4(usedIPs map[[4]byte]dnsmasq.DHCPAllocation
 	// Lets see if there is already an allocation for our device and that it sits within subnet.
 	// If there are custom DHCP ranges defined, check also that the IP falls within one of the ranges.
 	for _, DHCP := range usedIPs {
-		if (deviceStaticFileName == DHCP.StaticFileName || bytes.Compare(mac, DHCP.MAC) == 0) && DHCPValidIP(subnet, dhcpRanges, DHCP.IP) {
+		if (deviceStaticFileName == DHCP.StaticFileName || bytes.Equal(mac, DHCP.MAC)) && DHCPValidIP(subnet, dhcpRanges, DHCP.IP) {
 			return DHCP.IP, nil
 		}
 	}
@@ -335,7 +333,7 @@ func (t *Transaction) getDHCPFreeIPv6(usedIPs map[[16]byte]dnsmasq.DHCPAllocatio
 // AllocateTask initialises a new locked Transaction for a specific host and executes the supplied function on it.
 // The lock on the dnsmasq config is released when the function returns.
 func AllocateTask(opts *Options, f func(*Transaction) error) error {
-	logger := logging.AddContext(logger.Log, log.Ctx{"driver": opts.Network.Type(), "network": opts.Network.Name(), "project": opts.ProjectName, "host": opts.HostName})
+	l := logger.AddContext(logger.Log, logger.Ctx{"driver": opts.Network.Type(), "network": opts.Network.Name(), "project": opts.ProjectName, "host": opts.HostName})
 
 	dnsmasq.ConfigMutex.Lock()
 	defer dnsmasq.ConfigMutex.Unlock()
@@ -378,9 +376,9 @@ func AllocateTask(opts *Options, f func(*Transaction) error) error {
 	}
 
 	// If MAC or either IPv4 or IPv6 assigned is different than what is in dnsmasq config, rebuild config.
-	macChanged := bytes.Compare(opts.HostMAC, t.currentDHCPMAC) != 0
-	ipv4Changed := (t.allocatedIPv4 != nil && bytes.Compare(t.currentDHCPv4.IP, t.allocatedIPv4.To4()) != 0)
-	ipv6Changed := (t.allocatedIPv6 != nil && bytes.Compare(t.currentDHCPv6.IP, t.allocatedIPv6.To16()) != 0)
+	macChanged := !bytes.Equal(opts.HostMAC, t.currentDHCPMAC)
+	ipv4Changed := t.allocatedIPv4 != nil && !t.currentDHCPv4.IP.Equal(t.allocatedIPv4.To4())
+	ipv6Changed := t.allocatedIPv6 != nil && !t.currentDHCPv6.IP.Equal(t.allocatedIPv6.To16())
 
 	if macChanged || ipv4Changed || ipv6Changed {
 		var IPv4Str, IPv6Str string
@@ -398,7 +396,8 @@ func AllocateTask(opts *Options, f func(*Transaction) error) error {
 		if err != nil {
 			return err
 		}
-		logger.Debug("Updated static DHCP entry", log.Ctx{"mac": opts.HostMAC.String(), "IPv4": IPv4Str, "IPv6": IPv6Str})
+
+		l.Debug("Updated static DHCP entry", logger.Ctx{"mac": opts.HostMAC.String(), "IPv4": IPv4Str, "IPv6": IPv6Str})
 
 		// Reload dnsmasq.
 		err = dnsmasq.Kill(opts.Network.Name(), true)

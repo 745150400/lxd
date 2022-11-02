@@ -1,11 +1,8 @@
 package lifecycle
 
 import (
-	"fmt"
-	"net/url"
-
-	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/version"
 )
 
 // Internal copy of the network zone interface.
@@ -22,44 +19,34 @@ type NetworkZoneRecordAction string
 
 // All supported lifecycle events for network zones.
 const (
-	NetworkZoneCreated = NetworkZoneAction("created")
-	NetworkZoneDeleted = NetworkZoneAction("deleted")
-	NetworkZoneUpdated = NetworkZoneAction("updated")
+	NetworkZoneCreated = NetworkZoneAction(api.EventLifecycleNetworkZoneCreated)
+	NetworkZoneDeleted = NetworkZoneAction(api.EventLifecycleNetworkZoneDeleted)
+	NetworkZoneUpdated = NetworkZoneAction(api.EventLifecycleNetworkZoneUpdated)
 
-	NetworkZoneRecordCreated = NetworkZoneRecordAction("created")
-	NetworkZoneRecordDeleted = NetworkZoneRecordAction("deleted")
-	NetworkZoneRecordUpdated = NetworkZoneRecordAction("updated")
+	NetworkZoneRecordCreated = NetworkZoneRecordAction(api.EventLifecycleNetworkZoneRecordCreated)
+	NetworkZoneRecordDeleted = NetworkZoneRecordAction(api.EventLifecycleNetworkZoneRecordDeleted)
+	NetworkZoneRecordUpdated = NetworkZoneRecordAction(api.EventLifecycleNetworkZoneRecordUpdated)
 )
 
 // Event creates the lifecycle event for an action on a network zone.
-func (a NetworkZoneAction) Event(n networkZone, requestor *api.EventLifecycleRequestor, ctx map[string]interface{}) api.EventLifecycle {
-	eventType := fmt.Sprintf("network-zone-%s", a)
-
-	u := fmt.Sprintf("/1.0/network-zones/%s", url.PathEscape(n.Info().Name))
-	if n.Project() != project.Default {
-		u = fmt.Sprintf("%s?project=%s", u, url.QueryEscape(n.Project()))
-	}
+func (a NetworkZoneAction) Event(n networkZone, requestor *api.EventLifecycleRequestor, ctx map[string]any) api.EventLifecycle {
+	u := api.NewURL().Path(version.APIVersion, "network-zones", n.Info().Name).Project(n.Project())
 
 	return api.EventLifecycle{
-		Action:    eventType,
-		Source:    u,
+		Action:    string(a),
+		Source:    u.String(),
 		Context:   ctx,
 		Requestor: requestor,
 	}
 }
 
 // Event creates the lifecycle event for an action on a network zone record.
-func (a NetworkZoneRecordAction) Event(n networkZone, name string, requestor *api.EventLifecycleRequestor, ctx map[string]interface{}) api.EventLifecycle {
-	eventType := fmt.Sprintf("network-zone-record-%s", a)
-
-	u := fmt.Sprintf("/1.0/network-zones/%s/records/%s", url.PathEscape(n.Info().Name), url.PathEscape(name))
-	if n.Project() != project.Default {
-		u = fmt.Sprintf("%s?project=%s", u, url.QueryEscape(n.Project()))
-	}
+func (a NetworkZoneRecordAction) Event(n networkZone, name string, requestor *api.EventLifecycleRequestor, ctx map[string]any) api.EventLifecycle {
+	u := api.NewURL().Path(version.APIVersion, "network-zones", n.Info().Name, "records", name).Project(n.Project())
 
 	return api.EventLifecycle{
-		Action:    eventType,
-		Source:    u,
+		Action:    string(a),
+		Source:    u.String(),
 		Context:   ctx,
 		Requestor: requestor,
 	}

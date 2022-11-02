@@ -10,13 +10,10 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
-	log "gopkg.in/inconshreveable/log15.v2"
-
-	// Used by cgo
-	_ "github.com/lxc/lxd/lxd/include"
 
 	"github.com/lxc/lxd/lxd/cgroup"
 	"github.com/lxc/lxd/lxd/device"
+	_ "github.com/lxc/lxd/lxd/include" // Used by cgo
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/resources"
@@ -62,6 +59,7 @@ type deviceTaskCPU struct {
 	strId string
 	count *int
 }
+
 type deviceTaskCPUs []deviceTaskCPU
 
 func (c deviceTaskCPUs) Len() int           { return len(c) }
@@ -92,7 +90,7 @@ func deviceNetlinkListener() (chan []string, chan []string, chan device.USBEvent
 	}
 
 	chCPU := make(chan []string, 1)
-	chNetwork := make(chan []string, 0)
+	chNetwork := make(chan []string)
 	chUSB := make(chan device.USBEvent)
 	chUnix := make(chan device.UnixHotplugEvent)
 
@@ -113,6 +111,7 @@ func deviceNetlinkListener() (chan []string, chan []string, chan device.USBEvent
 				// Skip the header that libudev prepends
 				ueventBuf = ueventBuf[40 : len(ueventBuf)-1]
 			}
+
 			ueventLen := 0
 			ueventParts := strings.Split(string(ueventBuf), "\x00")
 			for i, part := range ueventParts {
@@ -231,7 +230,7 @@ func deviceNetlinkListener() (chan []string, chan []string, chan device.USBEvent
 					ueventLen,
 				)
 				if err != nil {
-					logger.Error("Error reading usb device", log.Ctx{"err": err, "path": props["PHYSDEVPATH"]})
+					logger.Error("Error reading usb device", logger.Ctx{"err": err, "path": props["PHYSDEVPATH"]})
 					continue
 				}
 
@@ -303,13 +302,12 @@ func deviceNetlinkListener() (chan []string, chan []string, chan device.USBEvent
 					ueventLen,
 				)
 				if err != nil {
-					logger.Error("Error reading unix device", log.Ctx{"err": err, "path": props["PHYSDEVPATH"]})
+					logger.Error("Error reading unix device", logger.Ctx{"err": err, "path": props["PHYSDEVPATH"]})
 					continue
 				}
 
 				chUnix <- unix
 			}
-
 		}
 	}(chCPU, chNetwork, chUSB, chUnix)
 
@@ -321,6 +319,7 @@ func deviceTaskBalance(s *state.State) {
 		if x < y {
 			return x
 		}
+
 		return y
 	}
 
@@ -365,14 +364,14 @@ func deviceTaskBalance(s *state.State) {
 	effectiveCpus = strings.Join(effectiveCpusSlice, ",")
 	cpus, err := resources.ParseCpuset(effectiveCpus)
 	if err != nil {
-		logger.Error("Error parsing host's cpu set", log.Ctx{"cpuset": effectiveCpus, "err": err})
+		logger.Error("Error parsing host's cpu set", logger.Ctx{"cpuset": effectiveCpus, "err": err})
 		return
 	}
 
 	// Iterate through the instances
 	instances, err := instance.LoadNodeAll(s, instancetype.Container)
 	if err != nil {
-		logger.Error("Problem loading instances list", log.Ctx{"err": err})
+		logger.Error("Problem loading instances list", logger.Ctx{"err": err})
 		return
 	}
 
@@ -400,6 +399,7 @@ func deviceTaskBalance(s *state.State) {
 			if err != nil {
 				return
 			}
+
 			for _, nr := range containerCpus {
 				if !shared.Int64InSlice(nr, cpus) {
 					continue
@@ -435,6 +435,7 @@ func deviceTaskBalance(s *state.State) {
 			logger.Errorf("Internal error: container using unavailable cpu")
 			continue
 		}
+
 		id := c.strId
 		for _, ctn := range ctns {
 			_, ok := pinning[ctn]
@@ -458,6 +459,7 @@ func deviceTaskBalance(s *state.State) {
 			if count == 0 {
 				break
 			}
+
 			count -= 1
 
 			id := cpu.strId
@@ -481,13 +483,13 @@ func deviceTaskBalance(s *state.State) {
 		sort.Strings(set)
 		cg, err := ctn.CGroup()
 		if err != nil {
-			logger.Error("balance: Unable to get cgroup struct", log.Ctx{"name": ctn.Name(), "err": err, "value": strings.Join(set, ",")})
+			logger.Error("balance: Unable to get cgroup struct", logger.Ctx{"name": ctn.Name(), "err": err, "value": strings.Join(set, ",")})
 			continue
 		}
 
 		err = cg.SetCpuset(strings.Join(set, ","))
 		if err != nil {
-			logger.Error("balance: Unable to set cpuset", log.Ctx{"name": ctn.Name(), "err": err, "value": strings.Join(set, ",")})
+			logger.Error("balance: Unable to set cpuset", logger.Ctx{"name": ctn.Name(), "err": err, "value": strings.Join(set, ",")})
 		}
 	}
 }
@@ -521,10 +523,8 @@ func deviceNetworkPriority(s *state.State, netif string) {
 			continue
 		}
 
-		cg.SetNetIfPrio(fmt.Sprintf("%s %d", netif, networkInt))
+		_ = cg.SetNetIfPrio(fmt.Sprintf("%s %d", netif, networkInt))
 	}
-
-	return
 }
 
 func deviceEventListener(s *state.State) {
@@ -560,7 +560,11 @@ func deviceEventListener(s *state.State) {
 
 			logger.Debugf("Scheduler: network: %s has been added: updating network priorities", e[0])
 			deviceNetworkPriority(s, e[0])
-			networkAutoAttach(s.Cluster, e[0])
+			err = networkAutoAttach(s.DB.Cluster, e[0])
+			if err != nil {
+				logger.Warn("Failed to auto-attach network", logger.Ctx{"err": err})
+			}
+
 		case e := <-chUSB:
 			device.USBRunHandlers(s, &e)
 		case e := <-chUnix:
@@ -583,17 +587,11 @@ func deviceEventListener(s *state.State) {
 
 // devicesRegister calls the Register() function on all supported devices so they receive events.
 // This also has the effect of actively reconnecting to any running VM monitor sockets.
-func devicesRegister(s *state.State) {
+func devicesRegister(instances []instance.Instance) {
 	logger.Debug("Registering running instances")
 
-	instances, err := instance.LoadNodeAll(s, instancetype.Any)
-	if err != nil {
-		logger.Error("Problem loading instances list", log.Ctx{"err": err})
-		return
-	}
-
 	for _, inst := range instances {
-		if !inst.IsRunning() {
+		if !inst.IsRunning() { // For VMs this will also trigger a connection to the QMP socket if running.
 			continue
 		}
 
@@ -632,7 +630,7 @@ func ueventParseVendorProduct(props map[string]string, subsystem string, devname
 		return "", "", false
 	}
 
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	vendor, product, err = getHidrawDevInfo(int(file.Fd()))
 	if err != nil {

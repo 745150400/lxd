@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -93,14 +93,17 @@ func (c *cmdCluster) Command() *cobra.Command {
 	clusterGroupCmd := cmdClusterGroup{global: c.global, cluster: c}
 	cmd.AddCommand(clusterGroupCmd.Command())
 
+	clusterRoleCmd := cmdClusterRole{global: c.global, cluster: c}
+	cmd.AddCommand(clusterRoleCmd.Command())
+
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 
 	return cmd
 }
 
-// List
+// List.
 type cmdClusterList struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -166,9 +169,11 @@ func (c *cmdClusterList) Run(cmd *cobra.Command, args []string) error {
 		if c.flagFormat == "csv" {
 			rolesDelimiter = ","
 		}
+
 		line := []string{member.ServerName, member.URL, strings.Join(roles, rolesDelimiter), member.Architecture, member.FailureDomain, member.Description, strings.ToUpper(member.Status), member.Message}
 		data = append(data, line)
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -185,7 +190,7 @@ func (c *cmdClusterList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, members)
 }
 
-// Show
+// Show.
 type cmdClusterShow struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -234,7 +239,7 @@ func (c *cmdClusterShow) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Get
+// Get.
 type cmdClusterGet struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -281,7 +286,7 @@ func (c *cmdClusterGet) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Set
+// Set.
 type cmdClusterSet struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -332,7 +337,7 @@ func (c *cmdClusterSet) Run(cmd *cobra.Command, args []string) error {
 	return resource.server.UpdateClusterMember(resource.name, member.Writable(), "")
 }
 
-// Unset
+// Unset.
 type cmdClusterUnset struct {
 	global     *cmdGlobal
 	cluster    *cmdCluster
@@ -361,7 +366,7 @@ func (c *cmdClusterUnset) Run(cmd *cobra.Command, args []string) error {
 	return c.clusterSet.Run(cmd, args)
 }
 
-// Rename
+// Rename.
 type cmdClusterRename struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -408,7 +413,7 @@ func (c *cmdClusterRename) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Remove
+// Remove.
 type cmdClusterRemove struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -474,7 +479,7 @@ func (c *cmdClusterRemove) Run(cmd *cobra.Command, args []string) error {
 
 	resource := resources[0]
 
-	// Prompt for confiromation if --force is used.
+	// Prompt for confirmation if --force is used.
 	if !c.flagNonInteractive && c.flagForce {
 		err := c.promptConfirmation(resource.name)
 		if err != nil {
@@ -495,7 +500,7 @@ func (c *cmdClusterRemove) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Enable
+// Enable.
 type cmdClusterEnable struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -580,7 +585,7 @@ func (c *cmdClusterEnable) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Edit
+// Edit.
 type cmdClusterEdit struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -628,7 +633,7 @@ func (c *cmdClusterEdit) Run(cmd *cobra.Command, args []string) error {
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -683,15 +688,17 @@ func (c *cmdClusterEdit) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			continue
 		}
+
 		break
 	}
 
 	return nil
 }
 
-// Add
+// Add.
 type cmdClusterAdd struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -747,16 +754,17 @@ func (c *cmdClusterAdd) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if !c.global.flagQuiet {
-		opAPI := op.Get()
-		joinToken, err := opAPI.ToClusterJoinToken()
-		if err != nil {
-			return fmt.Errorf("Failed converting token operation to join token: %w", err)
-		}
-
-		fmt.Printf(i18n.G("Member %s join token:")+"\n", resource.name)
-		fmt.Println(joinToken.String())
+	opAPI := op.Get()
+	joinToken, err := opAPI.ToClusterJoinToken()
+	if err != nil {
+		return fmt.Errorf("Failed converting token operation to join token: %w", err)
 	}
+
+	if !c.global.flagQuiet {
+		fmt.Printf(i18n.G("Member %s join token:")+"\n", resource.name)
+	}
+
+	fmt.Println(joinToken.String())
 
 	return nil
 }
@@ -821,6 +829,7 @@ func (c *cmdClusterListTokens) Run(cmd *cobra.Command, args []string) error {
 	type displayToken struct {
 		ServerName string
 		Token      string
+		ExpiresAt  string
 	}
 
 	displayTokens := make([]displayToken, 0)
@@ -842,20 +851,23 @@ func (c *cmdClusterListTokens) Run(cmd *cobra.Command, args []string) error {
 		displayTokens = append(displayTokens, displayToken{
 			ServerName: joinToken.ServerName,
 			Token:      joinToken.String(),
+			ExpiresAt:  joinToken.ExpiresAt.Format("2006/01/02 15:04 MST"),
 		})
 	}
 
 	// Render the table.
 	data := [][]string{}
 	for _, token := range displayTokens {
-		line := []string{token.ServerName, token.Token}
+		line := []string{token.ServerName, token.Token, token.ExpiresAt}
 		data = append(data, line)
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
 		i18n.G("NAME"),
 		i18n.G("TOKEN"),
+		i18n.G("EXPIRES AT"),
 	}
 
 	return utils.RenderTable(c.flagFormat, header, data, displayTokens)
@@ -939,7 +951,7 @@ func (c *cmdClusterRevokeToken) Run(cmd *cobra.Command, args []string) error {
 	return fmt.Errorf(i18n.G("No cluster join token for member %s on remote: %s"), resource.name, resource.remote)
 }
 
-// Update Certificatess
+// Update Certificates.
 type cmdClusterUpdateCertificate struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -1000,12 +1012,12 @@ func (c *cmdClusterUpdateCertificate) Run(cmd *cobra.Command, args []string) err
 		return fmt.Errorf(i18n.G("Could not find certificate key file path: %s"), keyFile)
 	}
 
-	cert, err := ioutil.ReadFile(certFile)
+	cert, err := os.ReadFile(certFile)
 	if err != nil {
 		return fmt.Errorf(i18n.G("Could not read certificate file: %s with error: %v"), certFile, err)
 	}
 
-	key, err := ioutil.ReadFile(keyFile)
+	key, err := os.ReadFile(keyFile)
 	if err != nil {
 		return fmt.Errorf(i18n.G("Could not read certificate key file: %s with error: %v"), keyFile, err)
 	}
@@ -1022,7 +1034,7 @@ func (c *cmdClusterUpdateCertificate) Run(cmd *cobra.Command, args []string) err
 
 	certf := conf.ServerCertPath(resource.remote)
 	if shared.PathExists(certf) {
-		err = ioutil.WriteFile(certf, cert, 0644)
+		err = os.WriteFile(certf, cert, 0644)
 		if err != nil {
 			return fmt.Errorf(i18n.G("Could not write new remote certificate for remote '%s' with error: %v"), resource.remote, err)
 		}
@@ -1038,10 +1050,11 @@ func (c *cmdClusterUpdateCertificate) Run(cmd *cobra.Command, args []string) err
 type cmdClusterEvacuateAction struct {
 	global *cmdGlobal
 
-	flagForce bool
+	flagAction string
+	flagForce  bool
 }
 
-// Cluster member evacuation
+// Cluster member evacuation.
 type cmdClusterEvacuate struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -1058,10 +1071,12 @@ func (c *cmdClusterEvacuate) Command() *cobra.Command {
 	cmd.Short = i18n.G("Evacuate cluster member")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(`Evacuate cluster member`))
 
+	cmd.Flags().StringVar(&c.action.flagAction, "action", "", i18n.G(`Force a particular evacuation action`)+"``")
+
 	return cmd
 }
 
-// Cluster member restore
+// Cluster member restore.
 type cmdClusterRestore struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -1120,6 +1135,7 @@ func (c *cmdClusterEvacuateAction) Run(cmd *cobra.Command, args []string) error 
 
 	state := api.ClusterMemberStatePost{
 		Action: cmd.Name(),
+		Mode:   c.flagAction,
 	}
 
 	op, err := resource.server.UpdateClusterMemberState(resource.name, state)

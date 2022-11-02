@@ -1,7 +1,7 @@
 package benchmark
 
 import (
-	"io/ioutil"
+	"os"
 	"sync"
 	"time"
 )
@@ -10,7 +10,7 @@ func getBatchSize(parallel int) (int, error) {
 	batchSize := parallel
 	if batchSize < 1 {
 		// Detect the number of parallel actions
-		cpus, err := ioutil.ReadDir("/sys/bus/cpu/devices")
+		cpus, err := os.ReadDir("/sys/bus/cpu/devices")
 		if err != nil {
 			return -1, err
 		}
@@ -37,6 +37,7 @@ func processBatch(count int, batchSize int, process func(index int, wg *sync.Wai
 			go process(processed, &wg)
 			processed++
 		}
+
 		wg.Wait()
 
 		if processed >= nextStat {
@@ -44,7 +45,6 @@ func processBatch(count int, batchSize int, process func(index int, wg *sync.Wai
 			logf("Processed %d containers in %.3fs (%.3f/s)", processed, interval, float64(processed)/interval)
 			nextStat = nextStat * 2
 		}
-
 	}
 
 	for k := 0; k < remainder; k++ {
@@ -52,6 +52,7 @@ func processBatch(count int, batchSize int, process func(index int, wg *sync.Wai
 		go process(processed, &wg)
 		processed++
 	}
+
 	wg.Wait()
 
 	timeEnd := time.Now()

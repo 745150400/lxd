@@ -3,7 +3,7 @@ package drivers
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -12,6 +12,7 @@ import (
 
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/ioprogress"
 	"github.com/lxc/lxd/shared/units"
 )
@@ -31,7 +32,7 @@ const (
 )
 
 func (d *zfs) dataset(vol Volume, deleted bool) string {
-	name, snapName, _ := shared.InstanceGetParentAndSnapshotName(vol.name)
+	name, snapName, _ := api.GetParentAndSnapshotName(vol.name)
 	if (vol.volType == VolumeTypeVM || vol.volType == VolumeTypeImage) && vol.contentType == ContentTypeBlock {
 		name = fmt.Sprintf("%s%s", name, zfsBlockVolSuffix)
 	}
@@ -59,6 +60,7 @@ func (d *zfs) createDataset(dataset string, options ...string) error {
 		args = append(args, "-o")
 		args = append(args, option)
 	}
+
 	args = append(args, dataset)
 
 	_, err := shared.RunCommand("zfs", args...)
@@ -77,6 +79,7 @@ func (d *zfs) createVolume(dataset string, size int64, options ...string) error 
 		args = append(args, "-o")
 		args = append(args, option)
 	}
+
 	args = append(args, dataset)
 
 	_, err := shared.RunCommand("zfs", args...)
@@ -255,7 +258,7 @@ func (d *zfs) version() (string, error) {
 
 	// Loaded kernel module version
 	if shared.PathExists("/sys/module/zfs/version") {
-		out, err := ioutil.ReadFile("/sys/module/zfs/version")
+		out, err := os.ReadFile("/sys/module/zfs/version")
 		if err == nil {
 			return strings.TrimSpace(string(out)), nil
 		}
@@ -290,9 +293,11 @@ func (d *zfs) sendDataset(dataset string, parent string, volSrcArgs *migration.V
 		args = append(args, "-c")
 		args = append(args, "-L")
 	}
+
 	if parent != "" {
 		args = append(args, "-i", parent)
 	}
+
 	args = append(args, dataset)
 	cmd := exec.Command("zfs", args...)
 
@@ -321,7 +326,8 @@ func (d *zfs) sendDataset(dataset string, parent string, volSrcArgs *migration.V
 	go func() {
 		_, err := io.Copy(conn, stdoutPipe)
 		chStdoutPipe <- err
-		conn.Close()
+		_ = conn.Close()
+		_ = stderr.Close()
 	}()
 
 	// Run the command.
@@ -331,7 +337,7 @@ func (d *zfs) sendDataset(dataset string, parent string, volSrcArgs *migration.V
 	}
 
 	// Read any error.
-	output, _ := ioutil.ReadAll(stderr)
+	output, _ := io.ReadAll(stderr)
 
 	// Handle errors.
 	errs := []error{}
@@ -375,7 +381,7 @@ func (d *zfs) receiveDataset(vol Volume, conn io.ReadWriteCloser, writeWrapper f
 	chCopyConn := make(chan error, 1)
 	go func() {
 		_, err = io.Copy(stdin, conn)
-		stdin.Close()
+		_ = stdin.Close()
 		chCopyConn <- err
 	}()
 
@@ -386,7 +392,7 @@ func (d *zfs) receiveDataset(vol Volume, conn io.ReadWriteCloser, writeWrapper f
 	}
 
 	// Read any error.
-	output, _ := ioutil.ReadAll(stderr)
+	output, _ := io.ReadAll(stderr)
 
 	// Handle errors.
 	errs := []error{}
@@ -423,13 +429,33 @@ func ValidateZfsBlocksize(value string) error {
 	return nil
 }
 
-// ValidateZfsVolBlocksize validates blocksize property value on the volume.
-func ValidateZfsVolBlocksize(vol Volume) func(value string) error {
-	return func(value string) error {
-		if vol.contentType != ContentTypeFS {
-			return fmt.Errorf("Blocksize can be change only for filesystem type")
+// ZFSDataset is the structure used to store information about a dataset.
+type ZFSDataset struct {
+	Name string `json:"name" yaml:"name"`
+	GUID string `json:"guid" yaml:"guid"`
+}
+
+// ZFSMetaDataHeader is the meta data header about the datasets being sent/stored.
+type ZFSMetaDataHeader struct {
+	SnapshotDatasets []ZFSDataset `json:"snapshot_datasets" yaml:"snapshot_datasets"`
+}
+
+func (d *zfs) datasetHeader(vol Volume, snapshots []string) (*ZFSMetaDataHeader, error) {
+	migrationHeader := ZFSMetaDataHeader{
+		SnapshotDatasets: make([]ZFSDataset, len(snapshots)),
+	}
+
+	for i, snapName := range snapshots {
+		snapVol, _ := vol.NewSnapshot(snapName)
+
+		guid, err := d.getDatasetProperty(d.dataset(snapVol, false), "guid")
+		if err != nil {
+			return nil, err
 		}
 
-		return ValidateZfsBlocksize(value)
+		migrationHeader.SnapshotDatasets[i].Name = snapName
+		migrationHeader.SnapshotDatasets[i].GUID = guid
 	}
+
+	return &migrationHeader, nil
 }

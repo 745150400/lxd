@@ -6,7 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/db/warningtype"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
 )
@@ -14,23 +15,23 @@ import (
 var cgControllers = map[string]Backend{}
 var cgNamespace bool
 
-// Layout determines the cgroup layout on this system
+// Layout determines the cgroup layout on this system.
 type Layout int
 
 const (
-	// CgroupsDisabled indicates that cgroups are not supported
+	// CgroupsDisabled indicates that cgroups are not supported.
 	CgroupsDisabled Layout = iota
-	// CgroupsUnified indicates that this is a pure cgroup2 layout
+	// CgroupsUnified indicates that this is a pure cgroup2 layout.
 	CgroupsUnified
-	// CgroupsHybrid indicates that this is a mixed cgroup1 and cgroup2 layout
+	// CgroupsHybrid indicates that this is a mixed cgroup1 and cgroup2 layout.
 	CgroupsHybrid
-	// CgroupsLegacy indicates that this is a pure cgroup1 layout
+	// CgroupsLegacy indicates that this is a pure cgroup1 layout.
 	CgroupsLegacy
 )
 
 var cgLayout Layout
 
-// Info contains system cgroup information
+// Info contains system cgroup information.
 type Info struct {
 	// Layout is one of CgroupsDisabled, CgroupsUnified, CgroupsHybrid, CgroupsLegacy
 	Layout Layout
@@ -39,7 +40,7 @@ type Info struct {
 	Namespacing bool
 }
 
-// GetInfo returns basic system cgroup information
+// GetInfo returns basic system cgroup information.
 func GetInfo() Info {
 	info := Info{}
 	info.Namespacing = cgNamespace
@@ -48,7 +49,7 @@ func GetInfo() Info {
 	return info
 }
 
-// Mode returns the cgroup layout name
+// Mode returns the cgroup layout name.
 func (info *Info) Mode() string {
 	switch info.Layout {
 	case CgroupsDisabled:
@@ -69,52 +70,52 @@ func (info *Info) Mode() string {
 type Resource int
 
 const (
-	// Blkio resource control
+	// Blkio resource control.
 	Blkio Resource = iota
 
-	// BlkioWeight resource control
+	// BlkioWeight resource control.
 	BlkioWeight
 
-	// CPU resource control
+	// CPU resource control.
 	CPU
 
-	// CPUAcct resource control
+	// CPUAcct resource control.
 	CPUAcct
 
-	// CPUSet resource control
+	// CPUSet resource control.
 	CPUSet
 
-	// Devices resource control
+	// Devices resource control.
 	Devices
 
-	// Freezer resource control
+	// Freezer resource control.
 	Freezer
 
-	// Hugetlb resource control
+	// Hugetlb resource control.
 	Hugetlb
 
-	// Memory resource control
+	// Memory resource control.
 	Memory
 
-	// MemoryMaxUsage resource control
+	// MemoryMaxUsage resource control.
 	MemoryMaxUsage
 
-	// MemorySwap resource control
+	// MemorySwap resource control.
 	MemorySwap
 
-	// MemorySwapMaxUsage resource control
+	// MemorySwapMaxUsage resource control.
 	MemorySwapMaxUsage
 
-	// MemorySwapUsage resource control
+	// MemorySwapUsage resource control.
 	MemorySwapUsage
 
-	// MemorySwappiness resource control
+	// MemorySwappiness resource control.
 	MemorySwappiness
 
-	// NetPrio resource control
+	// NetPrio resource control.
 	NetPrio
 
-	// Pids resource control
+	// Pids resource control.
 	Pids
 )
 
@@ -243,89 +244,89 @@ func (info *Info) Supports(resource Resource, cgroup *CGroup) bool {
 }
 
 // Warnings returns a list of CGroup warnings.
-func (info *Info) Warnings() []db.Warning {
-	warnings := []db.Warning{}
+func (info *Info) Warnings() []cluster.Warning {
+	warnings := []cluster.Warning{}
 
 	if !info.Supports(Blkio, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupBlkio,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupBlkio,
 			LastMessage: "disk I/O limits will be ignored",
 		})
 	}
 
 	if !info.Supports(BlkioWeight, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupBlkioWeight,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupBlkioWeight,
 			LastMessage: "disk priority will be ignored",
 		})
 	}
 
 	if !info.Supports(CPU, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupCPUController,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupCPUController,
 			LastMessage: "CPU time limits will be ignored",
 		})
 	}
 
 	if !info.Supports(CPUAcct, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupCPUacctController,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupCPUacctController,
 			LastMessage: "CPU accounting will not be available",
 		})
 	}
 
 	if !info.Supports(CPUSet, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupCPUController,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupCPUController,
 			LastMessage: "CPU pinning will be ignored",
 		})
 	}
 
 	if !info.Supports(Devices, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupDevicesController,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupDevicesController,
 			LastMessage: "device access control won't work",
 		})
 	}
 
 	if !info.Supports(Freezer, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupFreezerController,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupFreezerController,
 			LastMessage: "pausing/resuming containers won't work",
 		})
 	}
 
 	if !info.Supports(Hugetlb, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupHugetlbController,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupHugetlbController,
 			LastMessage: "hugepage limits will be ignored",
 		})
 	}
 
 	if !info.Supports(Memory, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupMemoryController,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupMemoryController,
 			LastMessage: "memory limits will be ignored",
 		})
 	}
 
 	if !info.Supports(NetPrio, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupNetworkPriorityController,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupNetworkPriorityController,
 			LastMessage: "network priority will be ignored",
 		})
 	}
 
 	if !info.Supports(Pids, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupPidsController,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupPidsController,
 			LastMessage: "process limits will be ignored",
 		})
 	}
 
 	if !info.Supports(MemorySwap, nil) {
-		warnings = append(warnings, db.Warning{
-			TypeCode:    db.WarningMissingCGroupMemorySwapAccounting,
+		warnings = append(warnings, cluster.Warning{
+			TypeCode:    warningtype.MissingCGroupMemorySwapAccounting,
 			LastMessage: "swap limits will be ignored",
 		})
 	}
@@ -352,10 +353,13 @@ func Init() {
 		cgLayout = CgroupsDisabled
 		return
 	}
-	defer selfCg.Close()
+
+	defer func() { _ = selfCg.Close() }()
 
 	hasV1 := false
 	hasV2 := false
+	hasV2Root := false
+
 	// Go through the file line by line.
 	scanSelfCg := bufio.NewScanner(selfCg)
 	for scanSelfCg.Scan() {
@@ -410,6 +414,7 @@ func Init() {
 
 			if dedicatedPath != "" {
 				cgControllers = unifiedControllers
+				hasV2Root = true
 				break
 			} else {
 				for k, v := range unifiedControllers {
@@ -417,7 +422,14 @@ func Init() {
 				}
 			}
 		}
-		controllers.Close()
+
+		_ = controllers.Close()
+	}
+
+	// Discard weird setups that apply CGroupV1 trees on top of a CGroupV2 root.
+	if hasV2Root && hasV1 {
+		logger.Warn("Unsupported CGroup setup detected, V1 controllers on top of V2 root")
+		hasV1 = false
 	}
 
 	// Check for additional legacy cgroup features

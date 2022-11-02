@@ -1,10 +1,8 @@
 package lifecycle
 
 import (
-	"fmt"
-	"net/url"
-
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/version"
 )
 
 // Internal copy of the operation interface.
@@ -17,17 +15,16 @@ type OperationAction string
 
 // All supported lifecycle events for operations.
 const (
-	OperationCancelled = OperationAction("cancelled")
+	OperationCancelled = OperationAction(api.EventLifecycleOperationCancelled)
 )
 
 // Event creates the lifecycle event for an action on an operation.
-func (a OperationAction) Event(op operation, requestor *api.EventLifecycleRequestor, ctx map[string]interface{}) api.EventLifecycle {
-	eventType := fmt.Sprintf("operation-%s", a)
-	u := fmt.Sprintf("/1.0/operations/%s", url.PathEscape(op.ID()))
+func (a OperationAction) Event(op operation, requestor *api.EventLifecycleRequestor, ctx map[string]any) api.EventLifecycle {
+	u := api.NewURL().Path(version.APIVersion, "operations", op.ID())
 
 	return api.EventLifecycle{
-		Action:    eventType,
-		Source:    u,
+		Action:    string(a),
+		Source:    u.String(),
 		Context:   ctx,
 		Requestor: requestor,
 	}

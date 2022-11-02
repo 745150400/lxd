@@ -16,7 +16,7 @@ func TestKey_validate(t *testing.T) {
 	}
 }
 
-// Test cases for TestKey_validate
+// Test cases for TestKey_validate.
 var validateCases = []struct {
 	node  Key
 	value string
@@ -35,6 +35,7 @@ func isNotEmptyString(value string) error {
 	if value == "" {
 		return fmt.Errorf("empty value not valid")
 	}
+
 	return nil
 }
 
@@ -48,7 +49,7 @@ func TestKey_validateError(t *testing.T) {
 	}
 }
 
-// Test cases for TestKey_validateError
+// Test cases for TestKey_validateError.
 var validateErrorCases = []struct {
 	node    Key
 	value   string
@@ -63,6 +64,6 @@ var validateErrorCases = []struct {
 // If a value has an expected kind code, a panic is thrown.
 func TestKey_UnexpectedKind(t *testing.T) {
 	value := Key{Type: 999}
-	f := func() { value.validate("foo") }
+	f := func() { _ = value.validate("foo") }
 	assert.PanicsWithValue(t, "unexpected value type: 999", f)
 }

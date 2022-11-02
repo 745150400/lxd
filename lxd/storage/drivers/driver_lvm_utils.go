@@ -2,18 +2,21 @@ package drivers
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	log "gopkg.in/inconshreveable/log15.v2"
+	"time"
 
 	"github.com/lxc/lxd/lxd/locking"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/revert"
+	"github.com/lxc/lxd/lxd/storage/filesystem"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/units"
 	"github.com/lxc/lxd/shared/version"
 )
@@ -27,7 +30,8 @@ const lvmSnapshotSeparator = "-"
 // lvmEscapedHyphen used to escape hyphens in volume names to avoid conflicts with lvmSnapshotSeparator.
 const lvmEscapedHyphen = "--"
 
-var errLVMNotFound = fmt.Errorf("Not found")
+// lvmThinpoolDefaultName is the default name for the thinpool volume.
+const lvmThinpoolDefaultName = "LXDThinPool"
 
 // usesThinpool indicates whether the config specifies to use a thin pool or not.
 func (d *lvm) usesThinpool() bool {
@@ -41,36 +45,28 @@ func (d *lvm) thinpoolName() string {
 		return d.config["lvm.thinpool_name"]
 	}
 
-	return "LXDThinPool"
+	return lvmThinpoolDefaultName
 }
 
-// openLoopFile opens a loopback file and disable auto detach.
-func (d *lvm) openLoopFile(source string) (*os.File, error) {
+// openLoopFile opens a loop device and returns the the device path.
+func (d *lvm) openLoopFile(source string) (string, error) {
 	if source == "" {
-		return nil, fmt.Errorf("No source property found for the storage pool")
+		return "", fmt.Errorf("No source property found for the storage pool")
 	}
 
 	if filepath.IsAbs(source) && !shared.IsBlockdevPath(source) {
 		unlock := locking.Lock(OperationLockName("openLoopFile", d.name, "", "", ""))
 		defer unlock()
 
-		// Try to prepare new loop device.
-		loopF, err := PrepareLoopDev(source, LoFlagsDirectIO)
+		loopDeviceName, err := loopDeviceSetup(source)
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 
-		// Make sure that LO_FLAGS_AUTOCLEAR is unset, so that the loopback device will not
-		// autodestruct on last close.
-		err = UnsetAutoclearOnLoopDev(int(loopF.Fd()))
-		if err != nil {
-			return nil, err
-		}
-
-		return loopF, nil
+		return loopDeviceName, nil
 	}
 
-	return nil, fmt.Errorf("Source is not loop file")
+	return "", fmt.Errorf("Source is not loop file")
 }
 
 // isLVMNotFoundExitError checks whether the supplied error is an exit error from an LVM command
@@ -78,7 +74,7 @@ func (d *lvm) openLoopFile(source string) (*os.File, error) {
 func (d *lvm) isLVMNotFoundExitError(err error) bool {
 	runErr, ok := err.(shared.RunError)
 	if ok {
-		exitError, ok := runErr.Err.(*exec.ExitError)
+		exitError, ok := runErr.Unwrap().(*exec.ExitError)
 		if ok {
 			if exitError.ExitCode() == 5 {
 				return true
@@ -125,7 +121,7 @@ func (d *lvm) volumeGroupExtentSize(vgName string) (int64, error) {
 	output, err := shared.RunCommand("vgs", "--noheadings", "--nosuffix", "--units", "b", "-o", "vg_extent_size", vgName)
 	if err != nil {
 		if d.isLVMNotFoundExitError(err) {
-			return -1, errLVMNotFound
+			return -1, api.StatusErrorf(http.StatusNotFound, "LVM volume group not found")
 		}
 
 		return -1, err
@@ -140,7 +136,7 @@ func (d *lvm) countLogicalVolumes(vgName string) (int, error) {
 	output, err := shared.RunCommand("vgs", "--noheadings", "-o", "lv_count", vgName)
 	if err != nil {
 		if d.isLVMNotFoundExitError(err) {
-			return -1, errLVMNotFound
+			return -1, api.StatusErrorf(http.StatusNotFound, "LVM volume group not found")
 		}
 
 		return -1, fmt.Errorf("Error counting logical volumes in LVM volume group %q: %w", vgName, err)
@@ -155,7 +151,7 @@ func (d *lvm) countThinVolumes(vgName, poolName string) (int, error) {
 	output, err := shared.RunCommand("lvs", "--noheadings", "-o", "thin_count", fmt.Sprintf("%s/%s", vgName, poolName))
 	if err != nil {
 		if d.isLVMNotFoundExitError(err) {
-			return -1, errLVMNotFound
+			return -1, api.StatusErrorf(http.StatusNotFound, "LVM volume group not found")
 		}
 
 		return -1, fmt.Errorf("Error counting thin volumes in LVM volume group %q: %w", vgName, err)
@@ -199,9 +195,10 @@ func (d *lvm) logicalVolumeExists(volDevPath string) (bool, error) {
 	return true, nil
 }
 
-// createDefaultThinPool creates the default thinpool as 100% the size of the volume group with a 1G
-// meta data volume.
-func (d *lvm) createDefaultThinPool(lvmVersion, vgName, thinPoolName string) error {
+// createDefaultThinPool creates the default thinpool as 100% the free size of the volume group.
+// Accepts thinpoolMetadataSize argument, which if >0 will manually set metadata size for the thinpool, otherwise
+// LVM will pick an appropriate size.
+func (d *lvm) createDefaultThinPool(lvmVersion, vgName, thinPoolName string, thinpoolMetadataSize string) error {
 	isRecent, err := d.lvmVersionIsAtLeast(lvmVersion, "2.02.99")
 	if err != nil {
 		return fmt.Errorf("Error checking LVM version: %w", err)
@@ -212,8 +209,16 @@ func (d *lvm) createDefaultThinPool(lvmVersion, vgName, thinPoolName string) err
 	args := []string{
 		"--yes",
 		"--wipesignatures", "y",
-		"--poolmetadatasize", "1G",
 		"--thinpool", lvmThinPool,
+	}
+
+	thinpoolMetadataSizeBytes, err := d.roundedSizeBytesString(thinpoolMetadataSize)
+	if err != nil {
+		return fmt.Errorf("Invalid thinpool metadata size %q: %w", thinpoolMetadataSize, err)
+	}
+
+	if thinpoolMetadataSizeBytes > 0 {
+		args = append(args, "--poolmetadatasize", fmt.Sprintf("%db", thinpoolMetadataSizeBytes))
 	}
 
 	if isRecent {
@@ -280,6 +285,10 @@ func (d *lvm) roundedSizeBytesString(size string) (int64, error) {
 	sizeBytes, err := units.ParseByteSizeString(size)
 	if err != nil {
 		return 0, err
+	}
+
+	if sizeBytes <= 0 {
+		return 0, nil
 	}
 
 	// LVM tools require sizes in multiples of 512 bytes.
@@ -369,7 +378,7 @@ func (d *lvm) createLogicalVolume(vgName, thinPoolName string, vol Volume, makeT
 		}
 	}
 
-	d.logger.Debug("Logical volume created", log.Ctx{"vg_name": vgName, "lv_name": lvFullName, "size": fmt.Sprintf("%db", lvSizeBytes), "fs": vol.ConfigBlockFilesystem()})
+	d.logger.Debug("Logical volume created", logger.Ctx{"vg_name": vgName, "lv_name": lvFullName, "size": fmt.Sprintf("%db", lvSizeBytes), "fs": vol.ConfigBlockFilesystem()})
 	return nil
 }
 
@@ -382,7 +391,7 @@ func (d *lvm) createLogicalVolumeSnapshot(vgName string, srcVol Volume, snapVol 
 	}
 
 	snapLvName := d.lvmFullVolumeName(snapVol.volType, snapVol.contentType, snapVol.name)
-	logCtx := log.Ctx{"vg_name": vgName, "lv_name": snapLvName, "src_dev": srcVolDevPath, "thin": makeThinLv}
+	logCtx := logger.Ctx{"vg_name": vgName, "lv_name": snapLvName, "src_dev": srcVolDevPath, "thin": makeThinLv}
 	args := []string{"-n", snapLvName, "-s", srcVolDevPath}
 
 	if isRecent {
@@ -390,16 +399,10 @@ func (d *lvm) createLogicalVolumeSnapshot(vgName string, srcVol Volume, snapVol 
 	}
 
 	// If the source is not a thin volume the size needs to be specified.
-	// According to LVM tools 15-20% of the original volume should be sufficient.
-	// However, let's not be stingy at first otherwise we might force users to fiddle around with lvextend.
+	// Create snapshot at 100% the size of the origin to allow restoring it to the origin volume without
+	// filling up the CoW snapshot volume and causing it to become invalid.
 	if !makeThinLv {
-		lvSizeBytes, err := d.roundedSizeBytesString(snapVol.ConfigSize())
-		if err != nil {
-			return "", err
-		}
-
-		args = append(args, "--size", fmt.Sprintf("%db", lvSizeBytes))
-		logCtx["size"] = fmt.Sprintf("%db", lvSizeBytes)
+		args = append(args, "-l", "100%ORIGIN")
 	}
 
 	if readonly {
@@ -415,10 +418,11 @@ func (d *lvm) createLogicalVolumeSnapshot(vgName string, srcVol Volume, snapVol 
 	if err != nil {
 		return "", err
 	}
+
 	d.logger.Debug("Logical volume snapshot created", logCtx)
 
 	revert.Add(func() {
-		d.removeLogicalVolume(d.lvmDevPath(vgName, snapVol.volType, snapVol.contentType, snapVol.name))
+		_ = d.removeLogicalVolume(d.lvmDevPath(vgName, snapVol.volType, snapVol.contentType, snapVol.name))
 	})
 
 	targetVolDevPath := d.lvmDevPath(vgName, snapVol.volType, snapVol.contentType, snapVol.name)
@@ -433,7 +437,8 @@ func (d *lvm) removeLogicalVolume(volDevPath string) error {
 	if err != nil {
 		return err
 	}
-	d.logger.Debug("Logical volume removed", log.Ctx{"dev": volDevPath})
+
+	d.logger.Debug("Logical volume removed", logger.Ctx{"dev": volDevPath})
 
 	return nil
 }
@@ -444,7 +449,8 @@ func (d *lvm) renameLogicalVolume(volDevPath string, newVolDevPath string) error
 	if err != nil {
 		return err
 	}
-	d.logger.Debug("Logical volume renamed", log.Ctx{"dev": volDevPath, "new_dev": newVolDevPath})
+
+	d.logger.Debug("Logical volume renamed", logger.Ctx{"dev": volDevPath, "new_dev": newVolDevPath})
 
 	return nil
 }
@@ -486,7 +492,7 @@ func (d *lvm) resizeLogicalVolume(lvPath string, sizeBytes int64) error {
 		return err
 	}
 
-	d.logger.Debug("Logical volume resized", log.Ctx{"dev": lvPath, "size": fmt.Sprintf("%db", sizeBytes)})
+	d.logger.Debug("Logical volume resized", logger.Ctx{"dev": lvPath, "size": fmt.Sprintf("%db", sizeBytes)})
 	return nil
 }
 
@@ -506,7 +512,7 @@ func (d *lvm) copyThinpoolVolume(vol, srcVol Volume, srcSnapshots []Volume, refr
 		}
 
 		for _, srcSnapshot := range srcSnapshots {
-			_, snapName, _ := shared.InstanceGetParentAndSnapshotName(srcSnapshot.name)
+			_, snapName, _ := api.GetParentAndSnapshotName(srcSnapshot.name)
 			newFullSnapName := GetSnapshotVolumeName(vol.name, snapName)
 			newSnapVol := NewVolume(d, d.Name(), vol.volType, vol.contentType, newFullSnapName, vol.config, vol.poolConfig)
 
@@ -520,7 +526,7 @@ func (d *lvm) copyThinpoolVolume(vol, srcVol Volume, srcSnapshots []Volume, refr
 				return err
 			}
 
-			revert.Add(func() { os.RemoveAll(newSnapVolPath) })
+			revert.Add(func() { _ = os.RemoveAll(newSnapVolPath) })
 
 			// We do not modify the original snapshot so as to avoid damaging if it is corrupted for
 			// some reason. If the filesystem needs to have a unique UUID generated in order to mount
@@ -531,7 +537,7 @@ func (d *lvm) copyThinpoolVolume(vol, srcVol Volume, srcSnapshots []Volume, refr
 			}
 
 			revert.Add(func() {
-				d.removeLogicalVolume(d.lvmDevPath(d.config["lvm.vg_name"], newSnapVol.volType, newSnapVol.contentType, newSnapVol.name))
+				_ = d.removeLogicalVolume(d.lvmDevPath(d.config["lvm.vg_name"], newSnapVol.volType, newSnapVol.contentType, newSnapVol.name))
 			})
 		}
 	}
@@ -554,7 +560,7 @@ func (d *lvm) copyThinpoolVolume(vol, srcVol Volume, srcSnapshots []Volume, refr
 
 			revert.Add(func() {
 				// Rename the original volume back to the original name.
-				d.renameLogicalVolume(tmpVolDevPath, newVolDevPath)
+				_ = d.renameLogicalVolume(tmpVolDevPath, newVolDevPath)
 			})
 		} else {
 			return fmt.Errorf("LVM volume already exists %q", vol.name)
@@ -566,7 +572,7 @@ func (d *lvm) copyThinpoolVolume(vol, srcVol Volume, srcSnapshots []Volume, refr
 			return err
 		}
 
-		revert.Add(func() { os.RemoveAll(volPath) })
+		revert.Add(func() { _ = os.RemoveAll(volPath) })
 	}
 
 	// Create snapshot of source volume as new volume.
@@ -578,7 +584,7 @@ func (d *lvm) copyThinpoolVolume(vol, srcVol Volume, srcSnapshots []Volume, refr
 	volDevPath := d.lvmDevPath(d.config["lvm.vg_name"], vol.volType, vol.contentType, vol.name)
 
 	revert.Add(func() {
-		d.removeLogicalVolume(volDevPath)
+		_ = d.removeLogicalVolume(volDevPath)
 	})
 
 	if vol.contentType == ContentTypeFS {
@@ -586,12 +592,12 @@ func (d *lvm) copyThinpoolVolume(vol, srcVol Volume, srcSnapshots []Volume, refr
 		// volumes with the same UUID to be mounted at the same time). This should be done before volume
 		// resize as some filesystems will need to mount the filesystem to resize.
 		if renegerateFilesystemUUIDNeeded(vol.ConfigBlockFilesystem()) {
-			_, err = d.activateVolume(volDevPath)
+			_, err = d.activateVolume(vol)
 			if err != nil {
 				return err
 			}
 
-			d.logger.Debug("Regenerating filesystem UUID", log.Ctx{"dev": volDevPath, "fs": vol.ConfigBlockFilesystem()})
+			d.logger.Debug("Regenerating filesystem UUID", logger.Ctx{"dev": volDevPath, "fs": vol.ConfigBlockFilesystem()})
 			err = regenerateFilesystemUUID(vol.ConfigBlockFilesystem(), volDevPath)
 			if err != nil {
 				return err
@@ -631,7 +637,7 @@ func (d *lvm) logicalVolumeSize(volDevPath string) (int64, error) {
 	output, err := shared.RunCommand("lvs", "--noheadings", "--nosuffix", "--units", "b", "-o", "lv_size", volDevPath)
 	if err != nil {
 		if d.isLVMNotFoundExitError(err) {
-			return -1, errLVMNotFound
+			return -1, api.StatusErrorf(http.StatusNotFound, "LVM volume not found")
 		}
 
 		return -1, fmt.Errorf("Error getting size of LVM volume %q: %w", volDevPath, err)
@@ -656,21 +662,26 @@ func (d *lvm) thinPoolVolumeUsage(volDevPath string) (uint64, uint64, error) {
 		return 0, 0, err
 	}
 
-	parts := strings.Split(strings.TrimSpace(out), ",")
+	parts := shared.SplitNTrimSpace(out, ",", -1, true)
 	if len(parts) < 3 {
 		return 0, 0, fmt.Errorf("Unexpected output from lvs command")
 	}
 
 	total, err := strconv.ParseUint(parts[0], 10, 64)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("Failed parsing thin volume total size (%q): %w", parts[0], err)
 	}
 
 	totalSize := total
 
+	// Used percentage is not available if thin volume isn't activated.
+	if parts[1] == "" {
+		return 0, 0, ErrNotSupported
+	}
+
 	dataPerc, err := strconv.ParseFloat(parts[1], 64)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("Failed parsing thin volume used percentage (%q): %w", parts[1], err)
 	}
 
 	metaPerc := float64(0)
@@ -679,7 +690,7 @@ func (d *lvm) thinPoolVolumeUsage(volDevPath string) (uint64, uint64, error) {
 	if parts[2] != "" {
 		metaPerc, err = strconv.ParseFloat(parts[2], 64)
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, fmt.Errorf("Failed parsing thin pool meta used percentage (%q): %w", parts[2], err)
 		}
 	}
 
@@ -697,7 +708,7 @@ func (d *lvm) parseLogicalVolumeSnapshot(parent Volume, lvmVolName string) strin
 	fullVolName := d.lvmFullVolumeName(parent.volType, parent.contentType, parent.name)
 
 	// If block volume, remove the block suffix ready for comparison with LV list.
-	if parent.IsVMBlock() || parent.volType == VolumeTypeCustom && parent.contentType == ContentTypeBlock {
+	if parent.IsVMBlock() || (parent.volType == VolumeTypeCustom && parent.contentType == ContentTypeBlock) {
 		if !strings.HasSuffix(lvmVolName, lvmBlockVolSuffix) {
 			return ""
 		}
@@ -724,13 +735,25 @@ func (d *lvm) parseLogicalVolumeSnapshot(parent Volume, lvmVolName string) strin
 }
 
 // activateVolume activates an LVM logical volume if not already present. Returns true if activated, false if not.
-func (d *lvm) activateVolume(volDevPath string) (bool, error) {
+func (d *lvm) activateVolume(vol Volume) (bool, error) {
+	var volDevPath string
+
+	if d.usesThinpool() {
+		volDevPath = d.lvmDevPath(d.config["lvm.vg_name"], vol.volType, vol.contentType, vol.name)
+	} else {
+		// Use parent for non-thinpool vols as activating the parent volume also activates its snapshots.
+		parent, _, _ := api.GetParentAndSnapshotName(vol.Name())
+		volDevPath = d.lvmDevPath(d.config["lvm.vg_name"], vol.volType, vol.contentType, parent)
+	}
+
 	if !shared.PathExists(volDevPath) {
 		_, err := shared.RunCommand("lvchange", "--activate", "y", "--ignoreactivationskip", volDevPath)
 		if err != nil {
 			return false, fmt.Errorf("Failed to activate LVM logical volume %q: %w", volDevPath, err)
 		}
-		d.logger.Debug("Activated logical volume", log.Ctx{"dev": volDevPath})
+
+		d.logger.Debug("Activated logical volume", logger.Ctx{"volName": vol.Name(), "dev": volDevPath})
+
 		return true, nil
 	}
 
@@ -738,13 +761,44 @@ func (d *lvm) activateVolume(volDevPath string) (bool, error) {
 }
 
 // deactivateVolume deactivates an LVM logical volume if present. Returns true if deactivated, false if not.
-func (d *lvm) deactivateVolume(volDevPath string) (bool, error) {
+func (d *lvm) deactivateVolume(vol Volume) (bool, error) {
+	var volDevPath string
+
+	if d.usesThinpool() {
+		volDevPath = d.lvmDevPath(d.config["lvm.vg_name"], vol.volType, vol.contentType, vol.name)
+	} else {
+		// Use parent for non-thinpool vols as deactivating the parent volume also activates its snapshots.
+		parent, _, _ := api.GetParentAndSnapshotName(vol.Name())
+		volDevPath = d.lvmDevPath(d.config["lvm.vg_name"], vol.volType, vol.contentType, parent)
+
+		if vol.IsSnapshot() {
+			parentVol := NewVolume(d, d.name, vol.volType, vol.contentType, parent, nil, d.config)
+
+			// If parent is in use then skip deactivating non-thinpool snapshot volume as it will fail.
+			if parentVol.MountInUse() || (parentVol.contentType == ContentTypeFS && filesystem.IsMountPoint(parentVol.MountPath())) {
+				return false, nil
+			}
+		}
+	}
+
 	if shared.PathExists(volDevPath) {
-		_, err := shared.RunCommand("lvchange", "--activate", "n", "--ignoreactivationskip", volDevPath)
+		// Keep trying to deactivate a few times in case the device is still being flushed.
+		var err error
+		for i := 0; i < 20; i++ {
+			_, err = shared.RunCommand("lvchange", "--activate", "n", "--ignoreactivationskip", volDevPath)
+			if err == nil {
+				break
+			}
+
+			logger.Debug("Failed to deactivate LVM logical volume", logger.Ctx{"path": volDevPath, "attempt": i, "err": err})
+			time.Sleep(500 * time.Millisecond)
+		}
+
 		if err != nil {
 			return false, fmt.Errorf("Failed to deactivate LVM logical volume %q: %w", volDevPath, err)
 		}
-		d.logger.Debug("Deactivated logical volume", log.Ctx{"dev": volDevPath})
+
+		d.logger.Debug("Deactivated logical volume", logger.Ctx{"volName": vol.Name(), "dev": volDevPath})
 		return true, nil
 	}
 

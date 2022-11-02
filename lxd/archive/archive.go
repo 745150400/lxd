@@ -2,16 +2,15 @@ package archive
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
 
 	"golang.org/x/sys/unix"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/lxd/apparmor"
 	"github.com/lxc/lxd/lxd/sys"
@@ -20,6 +19,14 @@ import (
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/subprocess"
 )
+
+type nullWriteCloser struct {
+	*bytes.Buffer
+}
+
+func (nwc *nullWriteCloser) Close() error {
+	return nil
+}
 
 // ExtractWithFds runs extractor process under specifc AppArmor profile.
 // The allowedCmds argument specify commands which are allowed to run by apparmor.
@@ -34,6 +41,7 @@ func ExtractWithFds(cmd string, args []string, allowedCmds []string, stdin io.Re
 		if err != nil {
 			return fmt.Errorf("Failed to start extract: Failed to find executable: %w", err)
 		}
+
 		allowedCmdPaths = append(allowedCmdPaths, cmdPath)
 	}
 
@@ -41,22 +49,24 @@ func ExtractWithFds(cmd string, args []string, allowedCmds []string, stdin io.Re
 	if err != nil {
 		return fmt.Errorf("Failed to start extract: Failed to load profile: %w", err)
 	}
-	defer apparmor.ArchiveDelete(sysOS, outputPath)
-	defer apparmor.ArchiveUnload(sysOS, outputPath)
 
-	p, err := subprocess.NewProcessWithFds(cmd, args, stdin, output, nil)
-	if err != nil {
-		return fmt.Errorf("Failed to start extract: Failed to creating subprocess: %w", err)
-	}
+	defer func() { _ = apparmor.ArchiveDelete(sysOS, outputPath) }()
+	defer func() { _ = apparmor.ArchiveUnload(sysOS, outputPath) }()
 
+	var buffer bytes.Buffer
+	p := subprocess.NewProcessWithFds(cmd, args, stdin, output, &nullWriteCloser{&buffer})
 	p.SetApparmor(apparmor.ArchiveProfileName(outputPath))
 
-	err = p.Start()
+	err = p.Start(context.TODO())
 	if err != nil {
 		return fmt.Errorf("Failed to start extract: Failed running: tar: %w", err)
 	}
 
-	p.Wait(context.Background())
+	_, err = p.Wait(context.Background())
+	if err != nil {
+		return shared.NewRunError(cmd, args, err, nil, &buffer)
+	}
+
 	return nil
 }
 
@@ -67,7 +77,11 @@ func ExtractWithFds(cmd string, args []string, allowedCmds []string, stdin io.Re
 func CompressedTarReader(ctx context.Context, r io.ReadSeeker, unpacker []string, sysOS *sys.OS, outputPath string) (*tar.Reader, context.CancelFunc, error) {
 	ctx, cancelFunc := context.WithCancel(ctx)
 
-	r.Seek(0, 0)
+	_, err := r.Seek(0, 0)
+	if err != nil {
+		return nil, cancelFunc, err
+	}
+
 	var tr *tar.Reader
 
 	if len(unpacker) > 0 {
@@ -82,13 +96,9 @@ func CompressedTarReader(ctx context.Context, r io.ReadSeeker, unpacker []string
 		}
 
 		pipeReader, pipeWriter := io.Pipe()
-		p, err := subprocess.NewProcessWithFds(unpacker[0], unpacker[1:], ioutil.NopCloser(r), pipeWriter, nil)
-		if err != nil {
-			return nil, cancelFunc, fmt.Errorf("Failed to start unpack: Failed to creating subprocess: %w", err)
-		}
-
+		p := subprocess.NewProcessWithFds(unpacker[0], unpacker[1:], io.NopCloser(r), pipeWriter, nil)
 		p.SetApparmor(apparmor.ArchiveProfileName(outputPath))
-		err = p.Start()
+		err = p.Start(ctx)
 		if err != nil {
 			return nil, cancelFunc, fmt.Errorf("Failed to start unpack: Failed running: %s: %w", unpacker[0], err)
 		}
@@ -99,10 +109,10 @@ func CompressedTarReader(ctx context.Context, r io.ReadSeeker, unpacker []string
 		// the unpacker process to complete.
 		cancelFunc = func() {
 			ctxCancelFunc()
-			pipeWriter.Close()
-			p.Wait(ctx)
-			apparmor.ArchiveUnload(sysOS, outputPath)
-			apparmor.ArchiveDelete(sysOS, outputPath)
+			_ = pipeWriter.Close()
+			_, _ = p.Wait(ctx)
+			_ = apparmor.ArchiveUnload(sysOS, outputPath)
+			_ = apparmor.ArchiveDelete(sysOS, outputPath)
 		}
 
 		tr = tar.NewReader(pipeReader)
@@ -134,6 +144,7 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 			args = append(args, "--exclude=rootfs/dev/*")
 			args = append(args, "--exclude=rootfs/./dev/*")
 		}
+
 		args = append(args, "--restrict", "--force-local")
 		args = append(args, "-C", path, "--numeric-owner", "--xattrs-include=*")
 		args = append(args, extractArgs...)
@@ -143,7 +154,8 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+
+		defer func() { _ = f.Close() }()
 
 		reader = f
 
@@ -188,11 +200,12 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 	if err != nil {
 		return fmt.Errorf("Error opening directory: %w", err)
 	}
-	defer outputDir.Close()
+
+	defer func() { _ = outputDir.Close() }()
 
 	var readCloser io.ReadCloser
 	if reader != nil {
-		readCloser = ioutil.NopCloser(reader)
+		readCloser = io.NopCloser(reader)
 	}
 
 	err = ExtractWithFds(command, args, allowedCmds, readCloser, sysOS, outputDir)
@@ -200,13 +213,18 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 		// We can't create char/block devices in unpriv containers so ignore related errors.
 		if sysOS.RunningInUserNS && command == "unsquashfs" {
 			runError, ok := err.(shared.RunError)
-			if !ok || runError.Stderr == "" {
+			if !ok {
+				return err
+			}
+
+			stdErr := runError.StdErr().String()
+			if stdErr == "" {
 				return err
 			}
 
 			// Confirm that all errors are related to character or block devices.
 			found := false
-			for _, line := range strings.Split(runError.Stderr, "\n") {
+			for _, line := range strings.Split(stdErr, "\n") {
 				line = strings.TrimSpace(line)
 				if line == "" {
 					continue
@@ -247,7 +265,7 @@ func Unpack(file string, path string, blockBackend bool, sysOS *sys.OS, tracker 
 			return fmt.Errorf("Unable to unpack image, run out of disk space")
 		}
 
-		logger.Warn("Unpack failed", log.Ctx{"file": file, "allowedCmds": allowedCmds, "extension": extension, "path": path, "err": err})
+		logger.Warn("Unpack failed", logger.Ctx{"file": file, "allowedCmds": allowedCmds, "extension": extension, "path": path, "err": err})
 		return fmt.Errorf("Unpack failed: %w", err)
 	}
 

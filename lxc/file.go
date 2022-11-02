@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"os"
@@ -30,7 +29,7 @@ import (
 	"github.com/lxc/lxd/shared/units"
 )
 
-// DirMode represents the file mode for creating dirs on `lxc file pull/push`
+// DirMode represents the file mode for creating dirs on `lxc file pull/push`.
 const DirMode = 0755
 
 type cmdFile struct {
@@ -102,11 +101,11 @@ func (c *cmdFile) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Delete
+// Delete.
 type cmdFileDelete struct {
 	global *cmdGlobal
 	file   *cmdFile
@@ -154,7 +153,7 @@ func (c *cmdFileDelete) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Edit
+// Edit.
 type cmdFileEdit struct {
 	global   *cmdGlobal
 	file     *cmdFile
@@ -189,16 +188,21 @@ func (c *cmdFileEdit) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create temp file
-	f, err := ioutil.TempFile("", "lxd_file_edit_")
+	f, err := os.CreateTemp("", "lxd_file_edit_")
 	if err != nil {
 		return fmt.Errorf(i18n.G("Unable to create a temporary file: %v"), err)
 	}
+
 	fname := f.Name()
-	f.Close()
-	os.Remove(fname)
-	defer os.Remove(fname)
+	_ = f.Close()
+	_ = os.Remove(fname)
+
+	// Tell pull/push that they're called from edit.
+	c.filePull.edit = true
+	c.filePush.edit = true
 
 	// Extract current value
+	defer func() { _ = os.Remove(fname) }()
 	err = c.filePull.Run(cmd, append([]string{args[0]}, fname))
 	if err != nil {
 		return err
@@ -219,10 +223,12 @@ func (c *cmdFileEdit) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Pull
+// Pull.
 type cmdFilePull struct {
 	global *cmdGlobal
 	file   *cmdFile
+
+	edit bool
 }
 
 func (c *cmdFilePull) Command() *cobra.Command {
@@ -250,7 +256,11 @@ func (c *cmdFilePull) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Determine the target
-	target := shared.HostPathFollow(filepath.Clean(args[len(args)-1]))
+	target := filepath.Clean(args[len(args)-1])
+	if !c.edit {
+		target = shared.HostPathFollow(target)
+	}
+
 	targetIsDir := false
 	sb, err := os.Stat(target)
 	if err != nil && !os.IsNotExist(err) {
@@ -275,6 +285,7 @@ func (c *cmdFilePull) Run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+
 		targetIsDir = true
 	} else if c.file.flagMkdir {
 		err := os.MkdirAll(filepath.Dir(target), DirMode)
@@ -308,6 +319,7 @@ func (c *cmdFilePull) Run(cmd *cobra.Command, args []string) error {
 					if err != nil {
 						return err
 					}
+
 					targetIsDir = true
 				}
 
@@ -332,13 +344,14 @@ func (c *cmdFilePull) Run(cmd *cobra.Command, args []string) error {
 		logger.Infof("Pulling %s from %s (%s)", targetPath, pathSpec[1], resp.Type)
 
 		if resp.Type == "symlink" {
-			linkTarget, err := ioutil.ReadAll(buf)
+			linkTarget, err := io.ReadAll(buf)
 			if err != nil {
 				return err
 			}
 
 			// Follow the symlink
 			if targetPath == "-" || c.file.flagRecursive {
+				i := 0
 				for {
 					newPath := strings.TrimSuffix(string(linkTarget), "\n")
 					if !strings.HasPrefix(newPath, "/") {
@@ -352,6 +365,17 @@ func (c *cmdFilePull) Run(cmd *cobra.Command, args []string) error {
 
 					if resp.Type != "symlink" {
 						break
+					}
+
+					i++
+					if i > 255 {
+						return fmt.Errorf("Too many links")
+					}
+
+					// Update link target for next iteration.
+					linkTarget, err = io.ReadAll(buf)
+					if err != nil {
+						return err
 					}
 				}
 			} else {
@@ -372,7 +396,8 @@ func (c *cmdFilePull) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+
+			defer func() { _ = f.Close() }()
 
 			err = os.Chmod(targetPath, os.FileMode(resp.Mode))
 			if err != nil {
@@ -406,17 +431,25 @@ func (c *cmdFilePull) Run(cmd *cobra.Command, args []string) error {
 			progress.Done("")
 			return err
 		}
+
+		err = f.Close()
+		if err != nil {
+			progress.Done("")
+			return err
+		}
+
 		progress.Done("")
 	}
 
 	return nil
 }
 
-// Push
+// Push.
 type cmdFilePush struct {
 	global *cmdGlobal
 	file   *cmdFile
 
+	edit         bool
 	noModeChange bool
 }
 
@@ -477,7 +510,11 @@ func (c *cmdFilePush) Run(cmd *cobra.Command, args []string) error {
 	// Make a list of paths to transfer
 	sourcefilenames := []string{}
 	for _, fname := range args[:len(args)-1] {
-		sourcefilenames = append(sourcefilenames, shared.HostPathFollow(filepath.Clean(fname)))
+		if !c.edit {
+			sourcefilenames = append(sourcefilenames, shared.HostPathFollow(filepath.Clean(fname)))
+		} else {
+			sourcefilenames = append(sourcefilenames, filepath.Clean(fname))
+		}
 	}
 
 	// Determine the target mode
@@ -491,6 +528,7 @@ func (c *cmdFilePush) Run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+
 		mode = os.FileMode(m)
 	}
 
@@ -507,8 +545,9 @@ func (c *cmdFilePush) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			finfo, err := f.Stat()
-			f.Close()
+			_ = f.Close()
 			if err != nil {
 				return err
 			}
@@ -561,7 +600,7 @@ func (c *cmdFilePush) Run(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		defer file.Close()
+		defer func() { _ = file.Close() }()
 		files = append(files, file)
 	}
 
@@ -632,6 +671,7 @@ func (c *cmdFilePush) Run(cmd *cobra.Command, args []string) error {
 			args.GID = int64(gid)
 			args.Mode = int(mode.Perm())
 		}
+
 		args.Type = "file"
 
 		fstat, err := f.Stat()
@@ -662,6 +702,7 @@ func (c *cmdFilePush) Run(cmd *cobra.Command, args []string) error {
 			progress.Done("")
 			return err
 		}
+
 		progress.Done("")
 	}
 
@@ -696,7 +737,8 @@ func (c *cmdFile) recursivePullFile(d lxd.InstanceServer, inst string, p string,
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+
+		defer func() { _ = f.Close() }()
 
 		err = os.Chmod(target, os.FileMode(resp.Mode))
 		if err != nil {
@@ -725,9 +767,16 @@ func (c *cmdFile) recursivePullFile(d lxd.InstanceServer, inst string, p string,
 			progress.Done("")
 			return err
 		}
+
+		err = f.Close()
+		if err != nil {
+			progress.Done("")
+			return err
+		}
+
 		progress.Done("")
 	} else if resp.Type == "symlink" {
-		linkTarget, err := ioutil.ReadAll(buf)
+		linkTarget, err := io.ReadAll(buf)
 		if err != nil {
 			return err
 		}
@@ -781,14 +830,15 @@ func (c *cmdFile) recursivePushFile(d lxd.InstanceServer, inst string, source st
 
 			args.Type = "symlink"
 			args.Content = bytes.NewReader([]byte(symlinkTarget))
-			readCloser = ioutil.NopCloser(args.Content)
+			readCloser = io.NopCloser(args.Content)
 		} else {
 			// File handling
 			f, err := os.Open(p)
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+
+			defer func() { _ = f.Close() }()
 
 			args.Type = "file"
 			args.Content = f
@@ -830,11 +880,14 @@ func (c *cmdFile) recursivePushFile(d lxd.InstanceServer, inst string, source st
 			if args.Type != "directory" {
 				progress.Done("")
 			}
+
 			return err
 		}
+
 		if args.Type != "directory" {
 			progress.Done("")
 		}
+
 		return nil
 	}
 
@@ -880,6 +933,7 @@ func (c *cmdFile) recursiveMkdir(d lxd.InstanceServer, inst string, p string, mo
 		if mode != nil {
 			modeArg = int(mode.Perm())
 		}
+
 		args := lxd.InstanceFileArgs{
 			UID:  uid,
 			GID:  gid,
@@ -897,7 +951,7 @@ func (c *cmdFile) recursiveMkdir(d lxd.InstanceServer, inst string, p string, mo
 	return nil
 }
 
-// Mount
+// Mount.
 type cmdFileMount struct {
 	global *cmdGlobal
 	file   *cmdFile
@@ -949,6 +1003,7 @@ func (c *cmdFileMount) Run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+
 		if !sb.IsDir() {
 			return fmt.Errorf(i18n.G("Target path must be a directory"))
 		}
@@ -998,7 +1053,8 @@ func (c *cmdFileMount) sshfsMount(ctx context.Context, resource remoteResource, 
 	if err != nil {
 		return fmt.Errorf(i18n.G("Failed connecting to instance SFTP: %w"), err)
 	}
-	defer sftpConn.Close()
+
+	defer func() { _ = sftpConn.Close() }()
 
 	// Use the format "lxd.<instance_name>" as the source "host" (although not used for communication)
 	// so that the mount can be seen to be associated with LXD and the instance in the local mount table.
@@ -1036,9 +1092,9 @@ func (c *cmdFileMount) sshfsMount(ctx context.Context, resource remoteResource, 
 		case <-ctx.Done():
 		}
 
-		cancel()                              // Prevents error output when the io.Copy functions finish.
-		sshfsCmd.Process.Signal(os.Interrupt) // This will cause sshfs to unmount.
-		stdin.Close()
+		cancel()                                  // Prevents error output when the io.Copy functions finish.
+		_ = sshfsCmd.Process.Signal(os.Interrupt) // This will cause sshfs to unmount.
+		_ = stdin.Close()
 	}()
 
 	go func() {
@@ -1057,6 +1113,7 @@ func (c *cmdFileMount) sshfsMount(ctx context.Context, resource remoteResource, 
 	if err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, i18n.G("I/O copy from sshfs to instance failed: %v")+"\n", err)
 	}
+
 	cancel() // Ask sshfs to end.
 
 	err = sshfsCmd.Wait()
@@ -1066,7 +1123,7 @@ func (c *cmdFileMount) sshfsMount(ctx context.Context, resource remoteResource, 
 
 	fmt.Println(i18n.G("sshfs has stopped"))
 
-	return nil
+	return sftpConn.Close()
 }
 
 // sshSFTPServer runs an SSH server listening on a random port of 127.0.0.1.
@@ -1134,6 +1191,7 @@ func (c *cmdFileMount) sshSFTPServer(ctx context.Context, instName string, resou
 	if err != nil {
 		return fmt.Errorf(i18n.G("Failed to listen for connection: %w"), err)
 	}
+
 	fmt.Printf("SSH SFTP listening on %v\n", listener.Addr())
 
 	if config.PasswordCallback != nil {
@@ -1153,7 +1211,7 @@ func (c *cmdFileMount) sshSFTPServer(ctx context.Context, instName string, resou
 		go func() {
 			fmt.Printf(i18n.G("SSH client connected %q")+"\n", nConn.RemoteAddr())
 			defer fmt.Printf(i18n.G("SSH client disconnected %q")+"\n", nConn.RemoteAddr())
-			defer nConn.Close()
+			defer func() { _ = nConn.Close() }()
 
 			// Before use, a handshake must be performed on the incoming net.Conn.
 			_, chans, reqs, err := ssh.NewServerConn(nConn, config)
@@ -1173,7 +1231,7 @@ func (c *cmdFileMount) sshSFTPServer(ctx context.Context, instName string, resou
 				// In the case of an SFTP session, this is "subsystem" with a payload string of
 				// "<length=4>sftp"
 				if localChannel.ChannelType() != "session" {
-					localChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+					_ = localChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
 					fmt.Fprintf(os.Stderr, i18n.G("Unknown channel type for client %q: %s")+"\n", nConn.RemoteAddr(), localChannel.ChannelType())
 					continue
 				}
@@ -1197,13 +1255,13 @@ func (c *cmdFileMount) sshSFTPServer(ctx context.Context, instName string, resou
 							}
 						}
 
-						req.Reply(ok, nil)
+						_ = req.Reply(ok, nil)
 					}
 				}(requests)
 
 				// Handle each channel in its own go routine.
 				go func() {
-					defer channel.Close()
+					defer func() { _ = channel.Close() }()
 
 					// Connect to the instance's SFTP server.
 					sftpConn, err := resource.server.GetInstanceFileSFTPConn(instName)
@@ -1211,7 +1269,8 @@ func (c *cmdFileMount) sshSFTPServer(ctx context.Context, instName string, resou
 						fmt.Fprintf(os.Stderr, i18n.G("Failed connecting to instance SFTP for client %q: %v")+"\n", nConn.RemoteAddr(), err)
 						return
 					}
-					defer sftpConn.Close()
+
+					defer func() { _ = sftpConn.Close() }()
 
 					// Copy SFTP data between client and remote instance.
 					ctx, cancel := context.WithCancel(ctx)
@@ -1225,15 +1284,16 @@ func (c *cmdFileMount) sshSFTPServer(ctx context.Context, instName string, resou
 							}
 						}
 						cancel() // Prevents error output when other io.Copy finishes.
-						channel.Close()
+						_ = channel.Close()
 					}()
 
 					_, err = io.Copy(sftpConn, channel)
 					if err != nil && ctx.Err() == nil {
 						fmt.Fprintf(os.Stderr, i18n.G("I/O copy from SSH to instance failed: %v")+"\n", err)
 					}
+
 					cancel() // Prevents error output when other io.Copy finishes.
-					sftpConn.Close()
+					_ = sftpConn.Close()
 				}()
 			}
 		}()

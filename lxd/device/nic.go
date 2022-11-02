@@ -2,6 +2,7 @@ package device
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/network/acl"
@@ -33,8 +34,8 @@ func nicValidationRules(requiredFields []string, optionalFields []string, instCo
 		"maas.subnet.ipv6":                     validate.IsAny,
 		"ipv4.address":                         validate.Optional(validate.IsNetworkAddressV4),
 		"ipv6.address":                         validate.Optional(validate.IsNetworkAddressV6),
-		"ipv4.routes":                          validate.Optional(validate.IsNetworkV4List),
-		"ipv6.routes":                          validate.Optional(validate.IsNetworkV6List),
+		"ipv4.routes":                          validate.Optional(validate.IsListOf(validate.IsNetworkV4)),
+		"ipv6.routes":                          validate.Optional(validate.IsListOf(validate.IsNetworkV6)),
 		"boot.priority":                        validate.Optional(validate.IsUint32),
 		"ipv4.gateway":                         networkValidGateway,
 		"ipv6.gateway":                         networkValidGateway,
@@ -42,8 +43,8 @@ func nicValidationRules(requiredFields []string, optionalFields []string, instCo
 		"ipv6.host_address":                    validate.Optional(validate.IsNetworkAddressV6),
 		"ipv4.host_table":                      validate.Optional(validate.IsUint32),
 		"ipv6.host_table":                      validate.Optional(validate.IsUint32),
-		"ipv4.routes.external":                 validate.Optional(validate.IsNetworkV4List),
-		"ipv6.routes.external":                 validate.Optional(validate.IsNetworkV6List),
+		"ipv4.routes.external":                 validate.Optional(validate.IsListOf(validate.IsNetworkV4)),
+		"ipv6.routes.external":                 validate.Optional(validate.IsListOf(validate.IsNetworkV6)),
 		"security.acls":                        validate.IsAny,
 		"security.acls.default.ingress.action": validate.Optional(validate.IsOneOf(acl.ValidActions...)),
 		"security.acls.default.egress.action":  validate.Optional(validate.IsOneOf(acl.ValidActions...)),
@@ -96,7 +97,7 @@ func nicValidationRules(requiredFields []string, optionalFields []string, instCo
 }
 
 // nicHasAutoGateway takes the value of the "ipv4.gateway" or "ipv6.gateway" config keys and returns whether they
-// specify whether the gateway mode is automatic or not
+// specify whether the gateway mode is automatic or not.
 func nicHasAutoGateway(value string) bool {
 	if value == "" || value == "auto" {
 		return true
@@ -122,4 +123,9 @@ func nicCheckNamesUnique(instConf instance.ConfigReader) error {
 	}
 
 	return nil
+}
+
+// nicCheckDNSNameConflict returns if instNameA matches instNameB (case insensitive).
+func nicCheckDNSNameConflict(instNameA string, instNameB string) bool {
+	return strings.EqualFold(instNameA, instNameB)
 }

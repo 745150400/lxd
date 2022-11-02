@@ -1,5 +1,5 @@
 test_clustering_enable() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   LXD_INIT_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
@@ -179,7 +179,7 @@ test_clustering_enable() {
 }
 
 test_clustering_membership() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -312,12 +312,51 @@ test_clustering_membership() {
   LXD_DIR="${LXD_TWO_DIR}" lxc cluster list-tokens
   ! LXD_DIR="${LXD_TWO_DIR}" lxc cluster list-tokens | grep node7 || false
 
+  # Set cluster token expiry to 10 seconds
+  LXD_DIR="${LXD_ONE_DIR}" lxc config set cluster.join_token_expiry=10S
+
+  # Generate a join token for an eigth and ninth node
+  token_valid=$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster add node8 | tail -n 1)
+  token_expired=$(LXD_DIR="${LXD_ONE_DIR}" lxc cluster add node9 | tail -n 1)
+
+  # Spawn an eigth node, using join token.
+  setup_clustering_netns 8
+  LXD_EIGHT_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_EIGHT_DIR}"
+  ns8="${prefix}8"
+
+  # shellcheck disable=SC2034
+  LXD_SECRET="${token_valid}"
+  spawn_lxd_and_join_cluster "${ns8}" "${bridge}" "${cert}" 8 2 "${LXD_EIGHT_DIR}"
+  unset LXD_SECRET
+
+  # This will cause the token to expiry
+  sleep 11
+
+  # Spawn a ninth node, using join token.
+  setup_clustering_netns 9
+  LXD_NINE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_NINE_DIR}"
+  ns9="${prefix}9"
+
+  # shellcheck disable=SC2034
+  LXD_SECRET="${token_expired}"
+  ! spawn_lxd_and_join_cluster "${ns9}" "${bridge}" "${cert}" 9 2 "${LXD_NINE_DIR}" || false
+  unset LXD_SECRET
+
+  # Unset join_token_expiry which will set it to the default value of 3h
+  LXD_DIR="${LXD_ONE_DIR}" lxc config unset cluster.join_token_expiry
+
+  LXD_DIR="${LXD_NINE_DIR}" lxd shutdown
+  LXD_DIR="${LXD_EIGHT_DIR}" lxd shutdown
   LXD_DIR="${LXD_SIX_DIR}" lxd shutdown
   LXD_DIR="${LXD_FIVE_DIR}" lxd shutdown
   LXD_DIR="${LXD_FOUR_DIR}" lxd shutdown
   LXD_DIR="${LXD_TWO_DIR}" lxd shutdown
   LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
   sleep 0.5
+  rm -f "${LXD_NINE_DIR}/unix.socket"
+  rm -f "${LXD_EIGHT_DIR}/unix.socket"
   rm -f "${LXD_SIX_DIR}/unix.socket"
   rm -f "${LXD_FIVE_DIR}/unix.socket"
   rm -f "${LXD_FOUR_DIR}/unix.socket"
@@ -334,10 +373,12 @@ test_clustering_membership() {
   kill_lxd "${LXD_FOUR_DIR}"
   kill_lxd "${LXD_FIVE_DIR}"
   kill_lxd "${LXD_SIX_DIR}"
+  kill_lxd "${LXD_EIGHT_DIR}"
+  kill_lxd "${LXD_NINE_DIR}"
 }
 
 test_clustering_containers() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -510,7 +551,7 @@ test_clustering_containers() {
 }
 
 test_clustering_storage() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -518,17 +559,14 @@ test_clustering_storage() {
   bridge="${prefix}"
 
   # The random storage backend is not supported in clustering tests,
-  # since we need to have the same storage driver on all nodes.
-  driver="${LXD_BACKEND}"
-  if [ "${driver}" = "random" ] || [ "${driver}" = "lvm" ]; then
-    driver="dir"
-  fi
+  # since we need to have the same storage driver on all nodes, so use the driver chosen for the standalone pool.
+  poolDriver=$(lxc storage show "$(lxc profile device get default root pool)" | grep 'driver:' | awk '{print $2}')
 
   setup_clustering_netns 1
   LXD_ONE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_ONE_DIR}"
   ns1="${prefix}1"
-  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}" "${driver}"
+  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}" "${poolDriver}"
 
   # The state of the preseeded storage pool shows up as CREATED
   LXD_DIR="${LXD_ONE_DIR}" lxc storage list | grep data | grep -q CREATED
@@ -541,7 +579,7 @@ test_clustering_storage() {
   LXD_TWO_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_TWO_DIR}"
   ns2="${prefix}2"
-  spawn_lxd_and_join_cluster "${ns2}" "${bridge}" "${cert}" 2 1 "${LXD_TWO_DIR}" "${driver}"
+  spawn_lxd_and_join_cluster "${ns2}" "${bridge}" "${cert}" 2 1 "${LXD_TWO_DIR}" "${poolDriver}"
 
   # The state of the preseeded storage pool is still CREATED
   LXD_DIR="${LXD_ONE_DIR}" lxc storage list | grep data | grep -q CREATED
@@ -554,21 +592,21 @@ test_clustering_storage() {
   ! LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 dir source=/foo size=123 --target node1 || false
 
   # Test storage pool node state tracking using a dir pool.
-  if [ "${driver}" = "dir" ]; then
+  if [ "${poolDriver}" = "dir" ]; then
     # Create pending nodes.
-    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}" --target node1
-    LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${driver}" --target node2
+    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}" --target node1
+    LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${poolDriver}" --target node2
     LXD_DIR="${LXD_ONE_DIR}" lxd sql global "SELECT nodes.name,storage_pools_nodes.state FROM nodes JOIN storage_pools_nodes ON storage_pools_nodes.node_id = nodes.id JOIN storage_pools ON storage_pools.id = storage_pools_nodes.storage_pool_id WHERE storage_pools.name = 'pool1' AND nodes.name = 'node1'" | grep "| node1 | 0     |"
     LXD_DIR="${LXD_ONE_DIR}" lxd sql global "SELECT nodes.name,storage_pools_nodes.state FROM nodes JOIN storage_pools_nodes ON storage_pools_nodes.node_id = nodes.id JOIN storage_pools ON storage_pools.id = storage_pools_nodes.storage_pool_id WHERE storage_pools.name = 'pool1' AND nodes.name = 'node2'" | grep "| node2 | 0     |"
 
     # Modify first pending node with invalid config and check it fails and all nodes are pending.
     LXD_DIR="${LXD_ONE_DIR}" lxc storage set pool1 source=/tmp/not/exist --target node1
-    ! LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}" || false
+    ! LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}" || false
     LXD_DIR="${LXD_ONE_DIR}" lxd sql global "SELECT nodes.name,storage_pools_nodes.state FROM nodes JOIN storage_pools_nodes ON storage_pools_nodes.node_id = nodes.id JOIN storage_pools ON storage_pools.id = storage_pools_nodes.storage_pool_id WHERE storage_pools.name = 'pool1' AND nodes.name = 'node1'" | grep "| node1 | 0     |"
     LXD_DIR="${LXD_ONE_DIR}" lxd sql global "SELECT nodes.name,storage_pools_nodes.state FROM nodes JOIN storage_pools_nodes ON storage_pools_nodes.node_id = nodes.id JOIN storage_pools ON storage_pools.id = storage_pools_nodes.storage_pool_id WHERE storage_pools.name = 'pool1' AND nodes.name = 'node2'" | grep "| node2 | 0     |"
 
     # Run create on second node, so it succeeds and then fails notifying first node.
-    ! LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${driver}" || false
+    ! LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${poolDriver}" || false
     LXD_DIR="${LXD_ONE_DIR}" lxd sql global "SELECT nodes.name,storage_pools_nodes.state FROM nodes JOIN storage_pools_nodes ON storage_pools_nodes.node_id = nodes.id JOIN storage_pools ON storage_pools.id = storage_pools_nodes.storage_pool_id WHERE storage_pools.name = 'pool1' AND nodes.name = 'node1'" | grep "| node1 | 0     |"
     LXD_DIR="${LXD_ONE_DIR}" lxd sql global "SELECT nodes.name,storage_pools_nodes.state FROM nodes JOIN storage_pools_nodes ON storage_pools_nodes.node_id = nodes.id JOIN storage_pools ON storage_pools.id = storage_pools_nodes.storage_pool_id WHERE storage_pools.name = 'pool1' AND nodes.name = 'node2'" | grep "| node2 | 1     |"
 
@@ -584,15 +622,15 @@ test_clustering_storage() {
     ! stat "${LXD_TWO_SOURCE}/containers" || false
 
     # Create new partially created pool and check we can fix it.
-    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}" source=/tmp/not/exist --target node1
-    LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${driver}" --target node2
+    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}" source=/tmp/not/exist --target node1
+    LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${poolDriver}" --target node2
     LXD_DIR="${LXD_ONE_DIR}" lxc storage show pool1 | grep status: | grep -q Pending
-    ! LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${driver}" || false
+    ! LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${poolDriver}" || false
     LXD_DIR="${LXD_ONE_DIR}" lxc storage show pool1 | grep status: | grep -q Errored
     LXD_DIR="${LXD_ONE_DIR}" lxc storage unset pool1 source --target node1
-    ! LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${driver}" rsync.bwlimit=1000 || false # Check global config is rejected on re-create.
-    LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${driver}"
-    ! LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${driver}" || false # Check re-create after successful create is rejected.
+    ! LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${poolDriver}" rsync.bwlimit=1000 || false # Check global config is rejected on re-create.
+    LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${poolDriver}"
+    ! LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${poolDriver}" || false # Check re-create after successful create is rejected.
     LXD_ONE_SOURCE="$(LXD_DIR="${LXD_ONE_DIR}" lxc storage get pool1 source --target=node1)"
     LXD_TWO_SOURCE="$(LXD_DIR="${LXD_TWO_DIR}" lxc storage get pool1 source --target=node2)"
     stat "${LXD_ONE_SOURCE}/containers"
@@ -610,36 +648,43 @@ test_clustering_storage() {
 
   # Define storage pools on the two nodes
   driver_config=""
-  if [ "${driver}" = "btrfs" ]; then
+  if [ "${poolDriver}" = "btrfs" ]; then
       driver_config="size=20GB"
   fi
-  if [ "${driver}" = "zfs" ]; then
+  if [ "${poolDriver}" = "zfs" ]; then
       driver_config="size=20GB"
   fi
-  if [ "${driver}" = "ceph" ]; then
+  if [ "${poolDriver}" = "ceph" ]; then
       driver_config="source=lxdtest-$(basename "${TEST_DIR}")-pool1"
   fi
+
   driver_config_node1="${driver_config}"
   driver_config_node2="${driver_config}"
-  if [ "${driver}" = "zfs" ]; then
+
+  if [ "${poolDriver}" = "zfs" ]; then
       driver_config_node1="${driver_config_node1} zfs.pool_name=pool1-$(basename "${TEST_DIR}")-${ns1}"
       driver_config_node2="${driver_config_node1} zfs.pool_name=pool1-$(basename "${TEST_DIR}")-${ns2}"
   fi
 
+  if [ "${poolDriver}" = "lvm" ]; then
+      driver_config_node1="${driver_config_node1} lvm.vg_name=pool1-$(basename "${TEST_DIR}")-${ns1}"
+      driver_config_node2="${driver_config_node1} lvm.vg_name=pool1-$(basename "${TEST_DIR}")-${ns2}"
+  fi
+
   if [ -n "${driver_config_node1}" ]; then
     # shellcheck disable=SC2086
-    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}" ${driver_config_node1} --target node1
+    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}" ${driver_config_node1} --target node1
   else
-    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}" --target node1
+    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}" --target node1
   fi
 
   LXD_DIR="${LXD_TWO_DIR}" lxc storage show pool1 | grep -q node1
   ! LXD_DIR="${LXD_TWO_DIR}" lxc storage show pool1 | grep -q node2 || false
   if [ -n "${driver_config_node2}" ]; then
     # shellcheck disable=SC2086
-    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}" ${driver_config_node2} --target node2
+    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}" ${driver_config_node2} --target node2
   else
-    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}" --target node2
+    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}" --target node2
   fi
   LXD_DIR="${LXD_ONE_DIR}" lxc storage show pool1 | grep status: | grep -q Pending
 
@@ -649,17 +694,17 @@ test_clustering_storage() {
   LXD_DIR="${LXD_ONE_DIR}" lxc image delete testimage
 
   # The source config key is not legal for the final pool creation
-  if [ "${driver}" = "dir" ]; then
+  if [ "${poolDriver}" = "dir" ]; then
     ! LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 dir source=/foo || false
   fi
 
   # Create the storage pool
-  if [ "${driver}" = "lvm" ]; then
-      LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${driver}" volume.size=25MB
-  elif [ "${driver}" = "ceph" ]; then
-      LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${driver}" volume.size=25MB ceph.osd.pg_num=16
+  if [ "${poolDriver}" = "lvm" ]; then
+      LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${poolDriver}" volume.size=25MB
+  elif [ "${poolDriver}" = "ceph" ]; then
+      LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${poolDriver}" volume.size=25MB ceph.osd.pg_num=16
   else
-      LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${driver}"
+      LXD_DIR="${LXD_TWO_DIR}" lxc storage create pool1 "${poolDriver}"
   fi
   LXD_DIR="${LXD_ONE_DIR}" lxc storage show pool1 | grep status: | grep -q Created
 
@@ -668,7 +713,7 @@ test_clustering_storage() {
   ! LXD_DIR="${LXD_TWO_DIR}" lxc storage show pool1 | grep -q source || false
   source1="$(basename "${LXD_ONE_DIR}")"
   source2="$(basename "${LXD_TWO_DIR}")"
-  if [ "${driver}" = "ceph" ]; then
+  if [ "${poolDriver}" = "ceph" ]; then
     # For ceph volume the source field is the name of the underlying ceph pool
     source1="lxdtest-$(basename "${TEST_DIR}")"
     source2="${source1}"
@@ -677,14 +722,14 @@ test_clustering_storage() {
   LXD_DIR="${LXD_ONE_DIR}" lxc storage show pool1 --target node2 | grep source | grep -q "${source2}"
 
   # Update the storage pool
-  if [ "${driver}" = "dir" ]; then
+  if [ "${poolDriver}" = "dir" ]; then
     LXD_DIR="${LXD_ONE_DIR}" lxc storage set pool1 rsync.bwlimit 10
     LXD_DIR="${LXD_TWO_DIR}" lxc storage show pool1 | grep rsync.bwlimit | grep -q 10
     LXD_DIR="${LXD_TWO_DIR}" lxc storage unset pool1 rsync.bwlimit
     ! LXD_DIR="${LXD_ONE_DIR}" lxc storage show pool1 | grep -q rsync.bwlimit || false
   fi
 
-  if [ "${driver}" = "ceph" ]; then
+  if [ "${poolDriver}" = "ceph" ]; then
     # Test migration of ceph-based containers
     LXD_DIR="${LXD_TWO_DIR}" ensure_import_testimage
     LXD_DIR="${LXD_ONE_DIR}" lxc launch --target node2 -s pool1 testimage foo
@@ -716,7 +761,7 @@ test_clustering_storage() {
     LXD_THREE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
     chmod +x "${LXD_THREE_DIR}"
     ns3="${prefix}3"
-    spawn_lxd_and_join_cluster "${ns3}" "${bridge}" "${cert}" 3 1 "${LXD_THREE_DIR}" "${driver}"
+    spawn_lxd_and_join_cluster "${ns3}" "${bridge}" "${cert}" 3 1 "${LXD_THREE_DIR}" "${poolDriver}"
 
     # Move the container to node3, renaming it
     LXD_DIR="${LXD_TWO_DIR}" lxc move foo bar --target node3
@@ -766,7 +811,7 @@ test_clustering_storage() {
   fi
 
   # Test migration of zfs/btrfs-based containers
-  if [ "${driver}" = "zfs" ] || [ "${driver}" = "btrfs" ]; then
+  if [ "${poolDriver}" = "zfs" ] || [ "${poolDriver}" = "btrfs" ]; then
     # Launch a container on node2
     LXD_DIR="${LXD_TWO_DIR}" ensure_import_testimage
     LXD_DIR="${LXD_ONE_DIR}" lxc launch --target node2 testimage foo
@@ -807,7 +852,7 @@ test_clustering_storage() {
   LXD_DIR="${LXD_ONE_DIR}" lxc storage delete pool1
   ! LXD_DIR="${LXD_ONE_DIR}" lxc storage list | grep -q pool1 || false
 
-  if [ "${driver}" != "ceph" ]; then
+  if [ "${poolDriver}" != "ceph" ]; then
     # Create a volume on node1
     LXD_DIR="${LXD_ONE_DIR}" lxc storage volume create data web
     LXD_DIR="${LXD_ONE_DIR}" lxc storage volume list data | grep web | grep -q node1
@@ -866,7 +911,7 @@ test_clustering_storage() {
 # two-stage process required multi-node clusters, or directly with the normal
 # procedure for non-clustered daemons.
 test_clustering_storage_single_node() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -874,43 +919,40 @@ test_clustering_storage_single_node() {
   bridge="${prefix}"
 
   # The random storage backend is not supported in clustering tests,
-  # since we need to have the same storage driver on all nodes.
-  driver="${LXD_BACKEND}"
-  if [ "${driver}" = "random" ] || [ "${driver}" = "lvm" ]; then
-    driver="dir"
-  fi
+  # since we need to have the same storage driver on all nodes, so use the driver chosen for the standalone pool.
+  poolDriver=$(lxc storage show "$(lxc profile device get default root pool)" | grep 'driver:' | awk '{print $2}')
 
   setup_clustering_netns 1
   LXD_ONE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_ONE_DIR}"
   ns1="${prefix}1"
-  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}" "${driver}"
+  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}" "${poolDriver}"
 
   # Create a pending storage pool on the node.
   driver_config=""
-  if [ "${driver}" = "btrfs" ]; then
+  if [ "${poolDriver}" = "btrfs" ]; then
       driver_config="size=20GB"
   fi
-  if [ "${driver}" = "zfs" ]; then
+  if [ "${poolDriver}" = "zfs" ]; then
       driver_config="size=20GB"
   fi
-  if [ "${driver}" = "ceph" ]; then
+  if [ "${poolDriver}" = "ceph" ]; then
       driver_config="source=lxdtest-$(basename "${TEST_DIR}")-pool1"
   fi
   driver_config_node="${driver_config}"
-  if [ "${driver}" = "zfs" ]; then
+  if [ "${poolDriver}" = "zfs" ]; then
       driver_config_node="${driver_config_node} zfs.pool_name=pool1-$(basename "${TEST_DIR}")-${ns1}"
   fi
 
   if [ -n "${driver_config_node}" ]; then
     # shellcheck disable=SC2086
-    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}" ${driver_config_node} --target node1
+    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}" ${driver_config_node} --target node1
   else
-    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}" --target node1
+    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}" --target node1
   fi
 
   # Finalize the storage pool creation
-  LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}"
+  LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}"
 
   LXD_DIR="${LXD_ONE_DIR}" lxc storage show pool1 | grep status: | grep -q Created
 
@@ -920,9 +962,9 @@ test_clustering_storage_single_node() {
   # Create the storage pool directly, without the two-stage process.
   if [ -n "${driver_config_node}" ]; then
     # shellcheck disable=SC2086
-    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}" ${driver_config_node}
+    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}" ${driver_config_node}
   else
-    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${driver}"
+    LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 "${poolDriver}"
   fi
 
   # Delete the storage pool
@@ -941,7 +983,7 @@ test_clustering_storage_single_node() {
 }
 
 test_clustering_network() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -959,6 +1001,14 @@ test_clustering_network() {
 
   # Add a newline at the end of each line. YAML as weird rules..
   cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
+
+  # Create a project with restricted.networks.subnets set to check the default networks are created before projects
+  # when a member joins the cluster.
+  LXD_DIR="${LXD_ONE_DIR}" lxc network set "${bridge}" ipv4.routes=192.0.2.0/24
+  LXD_DIR="${LXD_ONE_DIR}" lxc project create foo \
+    -c restricted=true \
+    -c features.networks=true \
+    -c restricted.networks.subnets="${bridge}":192.0.2.0/24
 
   # Spawn a second node
   setup_clustering_netns 2
@@ -1020,7 +1070,7 @@ test_clustering_network() {
   ! LXD_DIR="${LXD_ONE_DIR}" lxc network create "${net}" || false
   LXD_DIR="${LXD_ONE_DIR}" lxc network show "${net}" | grep status: | grep -q Errored # Check has errored status.
 
-  # Check each node status (expect both node1 and node2 to be pending as local node running created failed first).
+  # Check each node status (expect both node1 and node2 to be pending as local member running created failed first).
   LXD_DIR="${LXD_ONE_DIR}" lxd sql global "SELECT nodes.name,networks_nodes.state FROM nodes JOIN networks_nodes ON networks_nodes.node_id = nodes.id JOIN networks ON networks.id = networks_nodes.network_id WHERE networks.name = '${net}' AND nodes.name = 'node1'" | grep "| node1 | 0     |"
   LXD_DIR="${LXD_ONE_DIR}" lxd sql global "SELECT nodes.name,networks_nodes.state FROM nodes JOIN networks_nodes ON networks_nodes.node_id = nodes.id JOIN networks ON networks.id = networks_nodes.network_id WHERE networks.name = '${net}' AND nodes.name = 'node2'" | grep "| node2 | 0     |"
 
@@ -1115,6 +1165,8 @@ test_clustering_network() {
   ! nsenter -n -t "${LXD_PID1}" -- ip link show "${net}" || false # Check bridge is removed.
   ! nsenter -n -t "${LXD_PID2}" -- ip link show "${net}" || false # Check bridge is removed.
 
+  LXD_DIR="${LXD_ONE_DIR}" lxc project delete foo
+
   LXD_DIR="${LXD_TWO_DIR}" lxd shutdown
   LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
   sleep 0.5
@@ -1131,7 +1183,7 @@ test_clustering_network() {
 # Perform an upgrade of a 2-member cluster, then a join a third member and
 # perform one more upgrade
 test_clustering_upgrade() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR LXD_NETNS
 
   setup_clustering_bridge
@@ -1227,7 +1279,7 @@ test_clustering_upgrade() {
 
 # Perform an upgrade of an 8-member cluster.
 test_clustering_upgrade_large() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR LXD_NETNS N
 
   setup_clustering_bridge
@@ -1283,7 +1335,7 @@ test_clustering_upgrade_large() {
 }
 
 test_clustering_publish() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -1335,7 +1387,7 @@ test_clustering_publish() {
 }
 
 test_clustering_profiles() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -1409,7 +1461,7 @@ EOF
 }
 
 test_clustering_update_cert() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -1487,8 +1539,102 @@ test_clustering_update_cert() {
   kill_lxd "${LXD_TWO_DIR}"
 }
 
+test_clustering_update_cert_reversion() {
+  # shellcheck disable=2039,3043
+  local LXD_DIR
+
+  setup_clustering_bridge
+  prefix="lxd$$"
+  bridge="${prefix}"
+
+  # Bootstrap a node to steal its certs
+  setup_clustering_netns 1
+  LXD_ONE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_ONE_DIR}"
+  ns1="${prefix}1"
+  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
+
+  cert_path=$(mktemp -p "${TEST_DIR}" XXX)
+  key_path=$(mktemp -p "${TEST_DIR}" XXX)
+
+  # Save the certs
+  cp "${LXD_ONE_DIR}/cluster.crt" "${cert_path}"
+  cp "${LXD_ONE_DIR}/cluster.key" "${key_path}"
+
+  # Tear down the instance
+  LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
+  sleep 0.5
+  rm -f "${LXD_ONE_DIR}/unix.socket"
+  teardown_clustering_netns
+  teardown_clustering_bridge
+  kill_lxd "${LXD_ONE_DIR}"
+
+  # Set up again
+  setup_clustering_bridge
+
+  # Bootstrap the first node
+  setup_clustering_netns 1
+  LXD_ONE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_ONE_DIR}"
+  ns1="${prefix}1"
+  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}"
+
+  # quick check
+  ! cmp -s "${LXD_ONE_DIR}/cluster.crt" "${cert_path}" || false
+  ! cmp -s "${LXD_ONE_DIR}/cluster.key" "${key_path}" || false
+
+  # Add a newline at the end of each line. YAML as weird rules..
+  cert=$(sed ':a;N;$!ba;s/\n/\n\n/g' "${LXD_ONE_DIR}/cluster.crt")
+
+  # Spawn a second node
+  setup_clustering_netns 2
+  LXD_TWO_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_TWO_DIR}"
+  ns2="${prefix}2"
+  spawn_lxd_and_join_cluster "${ns2}" "${bridge}" "${cert}" 2 1 "${LXD_TWO_DIR}"
+
+  # Spawn a third node
+  setup_clustering_netns 3
+  LXD_THREE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD_THREE_DIR}"
+  ns3="${prefix}3"
+  spawn_lxd_and_join_cluster "${ns3}" "${bridge}" "${cert}" 3 1 "${LXD_THREE_DIR}"
+
+  # Shutdown third node
+  LXD_DIR="${LXD_THREE_DIR}" lxd shutdown
+  sleep 0.5
+  rm -f "${LXD_THREE_DIR}/unix.socket"
+  kill_lxd "${LXD_THREE_DIR}"
+
+  # Send update request
+  ! LXD_DIR="${LXD_ONE_DIR}" lxc cluster update-cert "${cert_path}" "${key_path}" -q || false
+
+  ! cmp -s "${LXD_ONE_DIR}/cluster.crt" "${cert_path}" || false
+  ! cmp -s "${LXD_TWO_DIR}/cluster.crt" "${cert_path}" || false
+
+  ! cmp -s "${LXD_ONE_DIR}/cluster.key" "${key_path}" || false
+  ! cmp -s "${LXD_TWO_DIR}/cluster.key" "${key_path}" || false
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc info --target node2 | grep -q "server_name: node2"
+  LXD_DIR="${LXD_TWO_DIR}" lxc info --target node1 | grep -q "server_name: node1"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc warning list | grep -q "Unable to update cluster certificate"
+
+  LXD_DIR="${LXD_TWO_DIR}" lxd shutdown
+  LXD_DIR="${LXD_ONE_DIR}" lxd shutdown
+  sleep 0.5
+  rm -f "${LXD_TWO_DIR}/unix.socket"
+  rm -f "${LXD_ONE_DIR}/unix.socket"
+
+  teardown_clustering_netns
+  teardown_clustering_bridge
+
+  kill_lxd "${LXD_ONE_DIR}"
+  kill_lxd "${LXD_TWO_DIR}"
+}
+
 test_clustering_join_api() {
-  # shellcheck disable=2039,2034
+  # shellcheck disable=2039,2034,3043
   local LXD_DIR LXD_NETNS
 
   setup_clustering_bridge
@@ -1528,7 +1674,7 @@ test_clustering_join_api() {
 }
 
 test_clustering_shutdown_nodes() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -1600,7 +1746,7 @@ test_clustering_shutdown_nodes() {
 }
 
 test_clustering_projects() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -1665,7 +1811,7 @@ test_clustering_projects() {
 }
 
 test_clustering_address() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -1743,7 +1889,7 @@ test_clustering_address() {
 }
 
 test_clustering_image_replication() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -1906,7 +2052,7 @@ test_clustering_image_replication() {
 }
 
 test_clustering_dns() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   # Because we do not want tests to only run on Ubuntu (due to cluster's fan network dependency)
@@ -1992,7 +2138,7 @@ test_clustering_dns() {
 }
 
 test_clustering_recover() {
-  # shellcheck disable=2039,2034
+  # shellcheck disable=2039,2034,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -2074,7 +2220,7 @@ test_clustering_recover() {
 # When a voter cluster member is shutdown, its role gets transferred to a spare
 # node.
 test_clustering_handover() {
-  # shellcheck disable=2039,2034
+  # shellcheck disable=2039,2034,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -2192,7 +2338,7 @@ test_clustering_handover() {
 # If a voter node crashes and is detected as offline, its role is migrated to a
 # stand-by.
 test_clustering_rebalance() {
-  # shellcheck disable=2039,2034
+  # shellcheck disable=2039,2034,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -2281,7 +2427,7 @@ test_clustering_rebalance() {
 # Recover a cluster where a raft node was removed from the nodes table but not
 # from the raft configuration.
 test_clustering_remove_raft_node() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -2402,7 +2548,7 @@ test_clustering_remove_raft_node() {
 }
 
 test_clustering_failure_domains() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -2506,7 +2652,7 @@ test_clustering_failure_domains() {
 }
 
 test_clustering_image_refresh() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -2514,18 +2660,15 @@ test_clustering_image_refresh() {
   bridge="${prefix}"
 
   # The random storage backend is not supported in clustering tests,
-  # since we need to have the same storage driver on all nodes.
-  driver="${LXD_BACKEND}"
-  if [ "${driver}" = "random" ] || [ "${driver}" = "lvm" ]; then
-    driver="dir"
-  fi
+  # since we need to have the same storage driver on all nodes, so use the driver chosen for the standalone pool.
+  poolDriver=$(lxc storage show "$(lxc profile device get default root pool)" | grep 'driver:' | awk '{print $2}')
 
   # Spawn first node
   setup_clustering_netns 1
   LXD_ONE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_ONE_DIR}"
   ns1="${prefix}1"
-  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}" "${driver}"
+  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}" "${poolDriver}"
 
   LXD_DIR="${LXD_ONE_DIR}" lxc config set cluster.images_minimal_replica 1
   LXD_DIR="${LXD_ONE_DIR}" lxc config set images.auto_update_interval 1
@@ -2541,14 +2684,14 @@ test_clustering_image_refresh() {
   LXD_TWO_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_TWO_DIR}"
   ns2="${prefix}2"
-  spawn_lxd_and_join_cluster "${ns2}" "${bridge}" "${cert}" 2 1 "${LXD_TWO_DIR}" "${driver}"
+  spawn_lxd_and_join_cluster "${ns2}" "${bridge}" "${cert}" 2 1 "${LXD_TWO_DIR}" "${poolDriver}"
 
   # Spawn a third node
   setup_clustering_netns 3
   LXD_THREE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_THREE_DIR}"
   ns3="${prefix}3"
-  spawn_lxd_and_join_cluster "${ns3}" "${bridge}" "${cert}" 3 1 "${LXD_THREE_DIR}" "${driver}"
+  spawn_lxd_and_join_cluster "${ns3}" "${bridge}" "${cert}" 3 1 "${LXD_THREE_DIR}" "${poolDriver}"
 
   # Spawn public node which has a public testimage
   setup_clustering_netns 4
@@ -2601,6 +2744,16 @@ test_clustering_image_refresh() {
 
   pids=""
 
+  if [ "${poolDriver}" != "dir" ]; then
+    # Check image storage volume records exist.
+    lxd sql global 'select name from storage_volumes'
+    if [ "${poolDriver}" = "ceph" ]; then
+      lxd sql global 'select name from storage_volumes' | grep -Fc "${old_fingerprint}" | grep -Fx 1
+    else
+      lxd sql global 'select name from storage_volumes' | grep -Fc "${old_fingerprint}" | grep -Fx 3
+    fi
+  fi
+
   # Trigger image refresh on all nodes
   for lxd_dir in "${LXD_ONE_DIR}" "${LXD_TWO_DIR}" "${LXD_THREE_DIR}"; do
     LXD_DIR="${lxd_dir}" lxc query /internal/testing/image-refresh &
@@ -2611,6 +2764,18 @@ test_clustering_image_refresh() {
   for pid in ${pids}; do
     wait "${pid}"
   done
+
+  if [ "${poolDriver}" != "dir" ]; then
+    lxd sql global 'select name from storage_volumes'
+    # Check image storage volume records actually removed from relevant members and replaced with new fingerprint.
+    if [ "${poolDriver}" = "ceph" ]; then
+      lxd sql global 'select name from storage_volumes' | grep -Fc "${old_fingerprint}" | grep -Fx 0
+      lxd sql global 'select name from storage_volumes' | grep -Fc "${new_fingerprint}" | grep -Fx 1
+    else
+      lxd sql global 'select name from storage_volumes' | grep -Fc "${old_fingerprint}" | grep -Fx 1
+      lxd sql global 'select name from storage_volumes' | grep -Fc "${new_fingerprint}" | grep -Fx 2
+    fi
+  fi
 
   # The projects default and bar should have received the new image
   # while project foo should still have the old image.
@@ -2714,7 +2879,7 @@ test_clustering_image_refresh() {
 }
 
 test_clustering_evacuation() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -2722,18 +2887,15 @@ test_clustering_evacuation() {
   bridge="${prefix}"
 
   # The random storage backend is not supported in clustering tests,
-  # since we need to have the same storage driver on all nodes.
-  driver="${LXD_BACKEND}"
-  if [ "${driver}" = "random" ] || [ "${driver}" = "lvm" ]; then
-    driver="dir"
-  fi
+  # since we need to have the same storage driver on all nodes, so use the driver chosen for the standalone pool.
+  poolDriver=$(lxc storage show "$(lxc profile device get default root pool)" | grep 'driver:' | awk '{print $2}')
 
   # Spawn first node
   setup_clustering_netns 1
   LXD_ONE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_ONE_DIR}"
   ns1="${prefix}1"
-  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}" "${driver}"
+  spawn_lxd_and_bootstrap_cluster "${ns1}" "${bridge}" "${LXD_ONE_DIR}" "${poolDriver}"
 
   # The state of the preseeded storage pool shows up as CREATED
   LXD_DIR="${LXD_ONE_DIR}" lxc storage list | grep data | grep -q CREATED
@@ -2746,14 +2908,14 @@ test_clustering_evacuation() {
   LXD_TWO_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_TWO_DIR}"
   ns2="${prefix}2"
-  spawn_lxd_and_join_cluster "${ns2}" "${bridge}" "${cert}" 2 1 "${LXD_TWO_DIR}" "${driver}"
+  spawn_lxd_and_join_cluster "${ns2}" "${bridge}" "${cert}" 2 1 "${LXD_TWO_DIR}" "${poolDriver}"
 
   # Spawn a third node
   setup_clustering_netns 3
   LXD_THREE_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD_THREE_DIR}"
   ns3="${prefix}3"
-  spawn_lxd_and_join_cluster "${ns3}" "${bridge}" "${cert}" 3 1 "${LXD_THREE_DIR}" "${driver}"
+  spawn_lxd_and_join_cluster "${ns3}" "${bridge}" "${cert}" 3 1 "${LXD_THREE_DIR}" "${poolDriver}"
 
   # Create local pool
   LXD_DIR="${LXD_ONE_DIR}" lxc storage create pool1 dir --target node1
@@ -2855,7 +3017,7 @@ test_clustering_evacuation() {
 }
 
 test_clustering_edit_configuration() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -3004,7 +3166,7 @@ test_clustering_edit_configuration() {
 }
 
 test_clustering_remove_members() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -3091,7 +3253,7 @@ test_clustering_remove_members() {
 }
 
 test_clustering_autotarget() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -3143,7 +3305,7 @@ test_clustering_autotarget() {
 }
 
 test_clustering_groups() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -3271,7 +3433,7 @@ test_clustering_groups() {
 }
 
 test_clustering_events() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_DIR
 
   setup_clustering_bridge
@@ -3346,8 +3508,8 @@ test_clustering_events() {
   done
 
   # Switch into event-hub mode.
-  printf "roles: [\"database\", \"event-hub\"]\nfailure_domain: \"default\"\ngroups: [\"default\"]"  | LXD_DIR="${LXD_ONE_DIR}" lxc cluster edit node1
-  printf "roles: [\"database\", \"event-hub\"]\nfailure_domain: \"default\"\ngroups: [\"default\"]"  | LXD_DIR="${LXD_TWO_DIR}" lxc cluster edit node2
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster role add node1 event-hub
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster role add node2 event-hub
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster list
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep -Fc event-hub | grep -Fx 2
 
@@ -3380,7 +3542,7 @@ test_clustering_events() {
   done
 
   # Switch into full-mesh mode by removing one event-hub role so there is <2 in the cluster.
-  printf "roles: [\"database\"]\nfailure_domain: \"default\"\ngroups: [\"default\"]"  | LXD_DIR="${LXD_ONE_DIR}" lxc cluster edit node1
+  LXD_DIR="${LXD_ONE_DIR}" lxc cluster role remove node1 event-hub
   LXD_DIR="${LXD_ONE_DIR}" lxc cluster list | grep -Fc event-hub | grep -Fx 1
 
   sleep 1 # Wait for notification heartbeat to distribute new roles.
@@ -3405,9 +3567,9 @@ test_clustering_events() {
   done
 
   # Switch back into event-hub mode by giving the role to node4 and node5.
-  printf "roles: [\"database\"]\nfailure_domain: \"default\"\ngroups: [\"default\"]"  | LXD_DIR="${LXD_TWO_DIR}" lxc cluster edit node2
-  printf "roles: [\"event-hub\"]\nfailure_domain: \"default\"\ngroups: [\"default\"]"  | LXD_DIR="${LXD_FOUR_DIR}" lxc cluster edit node4
-  printf "roles: [\"event-hub\"]\nfailure_domain: \"default\"\ngroups: [\"default\"]"  | LXD_DIR="${LXD_FIVE_DIR}" lxc cluster edit node5
+  LXD_DIR="${LXD_TWO_DIR}" lxc cluster role remove node2 event-hub
+  LXD_DIR="${LXD_FOUR_DIR}" lxc cluster role add node4 event-hub
+  LXD_DIR="${LXD_FIVE_DIR}" lxc cluster role add node5 event-hub
 
   sleep 1 # Wait for notification heartbeat to distribute new roles.
   LXD_DIR="${LXD_ONE_DIR}" lxc info | grep -F "server_event_mode: hub-client"

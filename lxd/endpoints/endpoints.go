@@ -7,13 +7,12 @@ import (
 	"sync"
 	"time"
 
-	log "gopkg.in/inconshreveable/log15.v2"
+	tomb "gopkg.in/tomb.v2"
 
 	"github.com/lxc/lxd/lxd/endpoints/listeners"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
-	tomb "gopkg.in/tomb.v2"
 )
 
 // Config holds various configuration values that affect LXD endpoints
@@ -68,6 +67,20 @@ type Config struct {
 
 	// HTTP server handling requests for the LXD metrics API.
 	MetricsServer *http.Server
+
+	// StorageBucketsAddress sets the address for the storage buckets endpoint.
+	//
+	// It can be updated after the endpoints are up using StorageBucketsUpdateAddress().
+	StorageBucketsAddress string
+
+	// HTTP server handling requests for the LXD storage buckets API.
+	StorageBucketsServer *http.Server
+
+	// HTTP server handling requests from VMs via the vsock.
+	VsockServer *http.Server
+
+	// True if VMs are supported.
+	VsockSupport bool
 }
 
 // Up brings up all applicable LXD endpoints and starts accepting HTTP
@@ -118,15 +131,19 @@ func Up(config *Config) (*Endpoints, error) {
 	if config.Dir == "" {
 		return nil, fmt.Errorf("No directory configured")
 	}
+
 	if config.UnixSocket == "" {
 		return nil, fmt.Errorf("No unix socket configured")
 	}
+
 	if config.RestServer == nil {
 		return nil, fmt.Errorf("No REST server configured")
 	}
+
 	if config.DevLxdServer == nil {
 		return nil, fmt.Errorf("No devlxd server configured")
 	}
+
 	if config.Cert == nil {
 		return nil, fmt.Errorf("No TLS certificate configured")
 	}
@@ -137,9 +154,10 @@ func Up(config *Config) (*Endpoints, error) {
 
 	err := endpoints.up(config)
 	if err != nil {
-		endpoints.Down()
+		_ = endpoints.Down()
 		return nil, err
 	}
+
 	return endpoints, nil
 }
 
@@ -166,13 +184,16 @@ func (e *Endpoints) up(config *Config) error {
 	defer e.mu.Unlock()
 
 	e.servers = map[kind]*http.Server{
-		devlxd:  config.DevLxdServer,
-		local:   config.RestServer,
-		network: config.RestServer,
-		cluster: config.RestServer,
-		pprof:   pprofCreateServer(),
-		metrics: config.MetricsServer,
+		devlxd:         config.DevLxdServer,
+		local:          config.RestServer,
+		network:        config.RestServer,
+		cluster:        config.RestServer,
+		pprof:          pprofCreateServer(),
+		metrics:        config.MetricsServer,
+		storageBuckets: config.StorageBucketsServer,
+		vsock:          config.VsockServer,
 	}
+
 	e.cert = config.Cert
 	e.inherited = map[kind]bool{}
 
@@ -205,11 +226,19 @@ func (e *Endpoints) up(config *Config) error {
 		return err
 	}
 
+	// Start the VM sock listener.
+	if config.VsockSupport {
+		e.listeners[vsock], err = createVsockListener(e.cert)
+		if err != nil {
+			return err
+		}
+	}
+
 	if config.NetworkAddress != "" {
 		listener, ok := e.listeners[network]
 		if ok {
 			logger.Infof("Replacing inherited TCP socket with configured one")
-			listener.Close()
+			_ = listener.Close()
 			e.inherited[network] = false
 		}
 
@@ -237,17 +266,16 @@ func (e *Endpoints) up(config *Config) error {
 					return networkAddressErr
 				}
 
-				logger.Infof("Starting cluster handler:")
 				e.serve(cluster)
 			}
 		} else if networkAddressErr != nil {
-			logger.Error("Cannot currently listen on https socket, re-trying once in 30s...", log.Ctx{"err": networkAddressErr})
+			logger.Error("Cannot currently listen on https socket, re-trying once in 30s...", logger.Ctx{"err": networkAddressErr})
 
 			go func() {
 				time.Sleep(30 * time.Second)
 				err := e.NetworkUpdateAddress(config.NetworkAddress)
 				if err != nil {
-					logger.Error("Still unable to listen on https socket", log.Ctx{"err": err})
+					logger.Error("Still unable to listen on https socket", logger.Ctx{"err": err})
 				}
 			}()
 		}
@@ -276,7 +304,6 @@ func (e *Endpoints) up(config *Config) error {
 			return err
 		}
 
-		logger.Infof("Starting cluster handler:")
 		e.serve(cluster)
 	}
 
@@ -286,7 +313,6 @@ func (e *Endpoints) up(config *Config) error {
 			return err
 		}
 
-		logger.Infof("Starting pprof handler:")
 		e.serve(pprof)
 	}
 
@@ -296,14 +322,24 @@ func (e *Endpoints) up(config *Config) error {
 			return err
 		}
 
-		logger.Infof("Starting metrics handler:")
 		e.serve(metrics)
 	}
 
-	logger.Infof("Starting /dev/lxd handler:")
+	if config.StorageBucketsAddress != "" {
+		e.listeners[storageBuckets], err = storageBucketsCreateListener(config.StorageBucketsAddress, e.cert)
+		if err != nil {
+			return err
+		}
+
+		e.serve(storageBuckets)
+	}
+
+	if e.listeners[vsock] != nil {
+		e.serve(vsock)
+	}
+
 	e.serve(devlxd)
 
-	logger.Infof("REST API daemon:")
 	e.serve(local)
 	e.serve(network)
 
@@ -316,7 +352,6 @@ func (e *Endpoints) Down() error {
 	defer e.mu.Unlock()
 
 	if e.listeners[network] != nil || e.listeners[local] != nil {
-		logger.Infof("Stopping REST API handler:")
 		err := e.closeListener(network)
 		if err != nil {
 			return err
@@ -329,7 +364,6 @@ func (e *Endpoints) Down() error {
 	}
 
 	if e.listeners[cluster] != nil {
-		logger.Infof("Stopping cluster handler:")
 		err := e.closeListener(cluster)
 		if err != nil {
 			return err
@@ -337,7 +371,6 @@ func (e *Endpoints) Down() error {
 	}
 
 	if e.listeners[devlxd] != nil {
-		logger.Infof("Stopping /dev/lxd handler:")
 		err := e.closeListener(devlxd)
 		if err != nil {
 			return err
@@ -345,7 +378,6 @@ func (e *Endpoints) Down() error {
 	}
 
 	if e.listeners[pprof] != nil {
-		logger.Infof("Stopping pprof handler:")
 		err := e.closeListener(pprof)
 		if err != nil {
 			return err
@@ -353,8 +385,21 @@ func (e *Endpoints) Down() error {
 	}
 
 	if e.listeners[metrics] != nil {
-		logger.Infof("Stopping metrics handler:")
 		err := e.closeListener(metrics)
+		if err != nil {
+			return err
+		}
+	}
+
+	if e.listeners[storageBuckets] != nil {
+		err := e.closeListener(storageBuckets)
+		if err != nil {
+			return err
+		}
+	}
+
+	if e.listeners[vsock] != nil {
+		err := e.closeListener(vsock)
 		if err != nil {
 			return err
 		}
@@ -362,7 +407,7 @@ func (e *Endpoints) Down() error {
 
 	if e.tomb != nil {
 		e.tomb.Kill(nil)
-		e.tomb.Wait()
+		_ = e.tomb.Wait()
 	}
 
 	return nil
@@ -376,13 +421,12 @@ func (e *Endpoints) serve(kind kind) {
 		return
 	}
 
-	ctx := log.Ctx{"socket": listener.Addr()}
+	ctx := logger.Ctx{"type": kind.String(), "socket": listener.Addr()}
 	if e.inherited[kind] {
 		ctx["inherited"] = true
 	}
 
-	message := fmt.Sprintf(" - binding %s", descriptions[kind])
-	logger.Info(message, ctx)
+	logger.Info("Binding socket", ctx)
 
 	server := e.servers[kind]
 
@@ -393,8 +437,7 @@ func (e *Endpoints) serve(kind kind) {
 	}
 
 	e.tomb.Go(func() error {
-		server.Serve(listener)
-		return nil
+		return server.Serve(listener)
 	})
 }
 
@@ -405,9 +448,10 @@ func (e *Endpoints) closeListener(kind kind) error {
 	if listener == nil {
 		return nil
 	}
+
 	delete(e.listeners, kind)
 
-	logger.Info(" - closing socket", log.Ctx{"socket": listener.Addr()})
+	logger.Info("Closing socket", logger.Ctx{"type": kind.String(), "socket": listener.Addr()})
 
 	return listener.Close()
 }
@@ -427,13 +471,20 @@ func activatedListeners(systemdListeners []net.Listener, cert *shared.CertInfo) 
 		default:
 			continue
 		}
+
 		activatedListeners[kind] = listener
 	}
+
 	return activatedListeners
 }
 
 // Numeric code identifying a specific API endpoint type.
 type kind int
+
+// String returns human readable name of endpoint kind.
+func (k kind) String() string {
+	return descriptions[k]
+}
 
 // Numeric codes identifying the various endpoints.
 const (
@@ -443,14 +494,18 @@ const (
 	pprof
 	cluster
 	metrics
+	vsock
+	storageBuckets
 )
 
 // Human-readable descriptions of the various kinds of endpoints.
 var descriptions = map[kind]string{
-	local:   "Unix socket",
-	devlxd:  "devlxd socket",
-	network: "TCP socket",
-	pprof:   "pprof socket",
-	cluster: "cluster socket",
-	metrics: "metrics socket",
+	local:          "REST API Unix socket",
+	devlxd:         "devlxd socket",
+	network:        "REST API TCP socket",
+	pprof:          "pprof socket",
+	cluster:        "cluster socket",
+	metrics:        "metrics socket",
+	vsock:          "VM socket",
+	storageBuckets: "Storage buckets socket",
 }

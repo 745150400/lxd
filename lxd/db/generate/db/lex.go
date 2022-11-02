@@ -8,38 +8,27 @@ import (
 )
 
 // Return the table name for the given database entity.
-func entityTable(entity string) string {
+func entityTable(entity string, override string) string {
+	if override != "" {
+		return override
+	}
+
 	entityParts := strings.Split(lex.Snake(entity), "_")
 	tableParts := make([]string, len(entityParts))
 	for i, part := range entityParts {
-		tableParts[i] = lex.Plural(part)
+		if strings.HasSuffix(part, "ty") || strings.HasSuffix(part, "ly") {
+			tableParts[i] = part
+		} else {
+			tableParts[i] = lex.Plural(part)
+		}
 	}
 
 	return strings.Join(tableParts, "_")
 }
 
-// Return Go type of the given database entity.
-func entityType(pkg string, entity string) string {
-	typ := lex.Camel(entity)
-	if pkg != "db" {
-		typ = pkg + "." + typ
-	}
-	return typ
-}
-
 // Return the name of the Filter struct for the given database entity.
 func entityFilter(entity string) string {
 	return fmt.Sprintf("%sFilter", lex.Camel(entity))
-}
-
-// Return the name of the Post struct for the given entity.
-func entityPost(entity string) string {
-	return fmt.Sprintf("%sPost", lex.Capital(lex.Plural(entity)))
-}
-
-// Return the name of the Put struct for the given entity.
-func entityPut(entity string) string {
-	return fmt.Sprintf("%sPut", lex.Capital(entity))
 }
 
 // Return the name of the global variable holding the registration code for
@@ -75,6 +64,7 @@ func activeCriteria(filter []string, ignoredFilter []string) string {
 		if i > 0 {
 			expr += " && "
 		}
+
 		expr += fmt.Sprintf("filter.%s != nil", name)
 	}
 
@@ -82,31 +72,34 @@ func activeCriteria(filter []string, ignoredFilter []string) string {
 		if len(expr) > 0 {
 			expr += " && "
 		}
+
 		expr += fmt.Sprintf("filter.%s == nil", name)
 	}
 
 	return expr
 }
 
-// Return the transaction type name for the given database.
-func dbTxType(db string) string {
-	return fmt.Sprintf("*%sTx", lex.Capital(db))
-}
-
 // Return the code for a "dest" function, to be passed as parameter to
 // query.SelectObjects in order to scan a single row.
 func destFunc(slice string, typ string, fields []*Field) string {
-	f := fmt.Sprintf(`func(i int) []interface{} {
-                      %s = append(%s, %s{})
-                      return []interface{}{
-`, slice, slice, typ)
-
+	varName := lex.Minuscule(string(typ[0]))
+	args := make([]string, 0, len(fields))
 	for _, field := range fields {
-		f += fmt.Sprintf("&%s[i].%s,\n", slice, field.Name)
+		arg := fmt.Sprintf("&%s.%s", varName, field.Name)
+		args = append(args, arg)
 	}
 
-	f += "        }\n"
-	f += "}"
+	f := fmt.Sprintf(`func(scan func(dest ...any) error) error {
+                      %s := %s{}
+                      err := scan(%s)
+                      if err != nil {
+                        return err
+                      }
 
+                      %s = append(%s, %s)
+
+                      return nil
+                    }
+`, varName, typ, strings.Join(args, ", "), slice, slice, varName)
 	return f
 }

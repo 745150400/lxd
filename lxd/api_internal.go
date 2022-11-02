@@ -7,8 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,13 +19,12 @@ import (
 
 	"github.com/gorilla/mux"
 	"golang.org/x/sys/unix"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/lxd/backup"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/db/cluster"
-	"github.com/lxc/lxd/lxd/db/node"
 	"github.com/lxc/lxd/lxd/db/query"
+	"github.com/lxc/lxd/lxd/db/warningtype"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
@@ -42,24 +42,24 @@ import (
 )
 
 var apiInternal = []APIEndpoint{
+	internalBGPStateCmd,
+	internalClusterAcceptCmd,
+	internalClusterAssignCmd,
+	internalClusterHandoverCmd,
+	internalClusterInstanceMovedCmd,
+	internalClusterRaftNodeCmd,
+	internalClusterRebalanceCmd,
+	internalContainerOnStartCmd,
+	internalContainerOnStopCmd,
+	internalContainerOnStopNSCmd,
+	internalGarbageCollectorCmd,
+	internalImageOptimizeCmd,
+	internalImageRefreshCmd,
+	internalRAFTSnapshotCmd,
 	internalReadyCmd,
 	internalShutdownCmd,
-	internalContainerOnStartCmd,
-	internalContainerOnStopNSCmd,
-	internalContainerOnStopCmd,
 	internalSQLCmd,
-	internalClusterAcceptCmd,
-	internalClusterRebalanceCmd,
-	internalClusterAssignCmd,
-	internalClusterInstanceMovedCmd,
-	internalGarbageCollectorCmd,
-	internalRAFTSnapshotCmd,
-	internalClusterHandoverCmd,
-	internalClusterRaftNodeCmd,
-	internalImageRefreshCmd,
-	internalImageOptimizeCmd,
 	internalWarningCreateCmd,
-	internalBGPStateCmd,
 }
 
 var internalShutdownCmd = APIEndpoint{
@@ -151,13 +151,13 @@ type internalWarningCreatePost struct {
 
 // internalCreateWarning creates a warning, and is used for testing only.
 func internalCreateWarning(d *Daemon, r *http.Request) response.Response {
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	rdr1 := ioutil.NopCloser(bytes.NewBuffer(body))
-	rdr2 := ioutil.NopCloser(bytes.NewBuffer(body))
+	rdr1 := io.NopCloser(bytes.NewBuffer(body))
+	rdr2 := io.NopCloser(bytes.NewBuffer(body))
 
 	reqRaw := shared.Jmap{}
 	err = json.NewDecoder(rdr1).Decode(&reqRaw)
@@ -180,7 +180,7 @@ func internalCreateWarning(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(fmt.Errorf("Invalid entity type"))
 	}
 
-	err = d.cluster.UpsertWarning(req.Location, req.Project, req.EntityTypeCode, req.EntityID, db.WarningType(req.TypeCode), req.Message)
+	err = d.db.Cluster.UpsertWarning(req.Location, req.Project, req.EntityTypeCode, req.EntityID, warningtype.Type(req.TypeCode), req.Message)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed to create warning: %w", err))
 	}
@@ -221,9 +221,7 @@ func internalWaitReady(d *Daemon, r *http.Request) response.Response {
 		return response.Unavailable(fmt.Errorf("LXD daemon is shutting down"))
 	}
 
-	select {
-	case <-d.readyChan:
-	default:
+	if d.waitReady.Err() == nil {
 		return response.Unavailable(fmt.Errorf("LXD daemon not ready yet"))
 	}
 
@@ -232,20 +230,21 @@ func internalWaitReady(d *Daemon, r *http.Request) response.Response {
 
 func internalShutdown(d *Daemon, r *http.Request) response.Response {
 	force := queryParam(r, "force")
-	logger.Info("Asked to shutdown by API", log.Ctx{"force": force})
+	logger.Info("Asked to shutdown by API", logger.Ctx{"force": force})
 
 	if d.shutdownCtx.Err() != nil {
 		return response.SmartError(fmt.Errorf("Shutdown already in progress"))
 	}
 
 	forceCtx, forceCtxCancel := context.WithCancel(context.Background())
-	defer forceCtxCancel()
 
 	if force == "true" {
 		forceCtxCancel() // Don't wait for operations to finish.
 	}
 
 	return response.ManualResponse(func(w http.ResponseWriter) error {
+		defer forceCtxCancel()
+
 		<-d.setupChan // Wait for daemon to start.
 
 		// Run shutdown sequence synchronously.
@@ -277,7 +276,11 @@ func internalShutdown(d *Daemon, r *http.Request) response.Response {
 // It detects whether the instance reference is an instance ID or instance name and loads instance accordingly.
 func internalContainerHookLoadFromReference(s *state.State, r *http.Request) (instance.Instance, error) {
 	var inst instance.Instance
-	instanceRef := mux.Vars(r)["instanceRef"]
+	instanceRef, err := url.PathUnescape(mux.Vars(r)["instanceRef"])
+	if err != nil {
+		return nil, err
+	}
+
 	projectName := projectParam(r)
 
 	instanceID, err := strconv.Atoi(instanceRef)
@@ -289,8 +292,12 @@ func internalContainerHookLoadFromReference(s *state.State, r *http.Request) (in
 	} else {
 		inst, err = instance.LoadByProjectAndName(s, projectName, instanceRef)
 		if err != nil {
+			if api.StatusErrorCheck(err, http.StatusNotFound) {
+				return nil, err
+			}
+
 			// If DB not available, try loading from backup file.
-			logger.Warn("Failed loading instance from database, trying backup file", log.Ctx{"project": projectName, "instance": instanceRef, "err": err})
+			logger.Warn("Failed loading instance from database, trying backup file", logger.Ctx{"project": projectName, "instance": instanceRef, "err": err})
 
 			instancePath := filepath.Join(shared.VarPath("containers"), project.Instance(projectName, instanceRef))
 			inst, err = instance.LoadFromBackup(s, projectName, instancePath, false)
@@ -310,13 +317,13 @@ func internalContainerHookLoadFromReference(s *state.State, r *http.Request) (in
 func internalContainerOnStart(d *Daemon, r *http.Request) response.Response {
 	inst, err := internalContainerHookLoadFromReference(d.State(), r)
 	if err != nil {
-		logger.Error("The start hook failed to load", log.Ctx{"err": err})
+		logger.Error("The start hook failed to load", logger.Ctx{"err": err})
 		return response.SmartError(err)
 	}
 
 	err = inst.OnHook(instance.HookStart, nil)
 	if err != nil {
-		logger.Error("The start hook failed", log.Ctx{"instance": inst.Name(), "err": err})
+		logger.Error("The start hook failed", logger.Ctx{"instance": inst.Name(), "err": err})
 		return response.SmartError(err)
 	}
 
@@ -326,7 +333,7 @@ func internalContainerOnStart(d *Daemon, r *http.Request) response.Response {
 func internalContainerOnStopNS(d *Daemon, r *http.Request) response.Response {
 	inst, err := internalContainerHookLoadFromReference(d.State(), r)
 	if err != nil {
-		logger.Error("The stopns hook failed to load", log.Ctx{"err": err})
+		logger.Error("The stopns hook failed to load", logger.Ctx{"err": err})
 		return response.SmartError(err)
 	}
 
@@ -334,6 +341,7 @@ func internalContainerOnStopNS(d *Daemon, r *http.Request) response.Response {
 	if target == "" {
 		target = "unknown"
 	}
+
 	netns := queryParam(r, "netns")
 
 	args := map[string]string{
@@ -343,7 +351,7 @@ func internalContainerOnStopNS(d *Daemon, r *http.Request) response.Response {
 
 	err = inst.OnHook(instance.HookStopNS, args)
 	if err != nil {
-		logger.Error("The stopns hook failed", log.Ctx{"instance": inst.Name(), "err": err})
+		logger.Error("The stopns hook failed", logger.Ctx{"instance": inst.Name(), "err": err})
 		return response.SmartError(err)
 	}
 
@@ -353,7 +361,7 @@ func internalContainerOnStopNS(d *Daemon, r *http.Request) response.Response {
 func internalContainerOnStop(d *Daemon, r *http.Request) response.Response {
 	inst, err := internalContainerHookLoadFromReference(d.State(), r)
 	if err != nil {
-		logger.Error("The stop hook failed to load", log.Ctx{"err": err})
+		logger.Error("The stop hook failed to load", logger.Ctx{"err": err})
 		return response.SmartError(err)
 	}
 
@@ -368,7 +376,7 @@ func internalContainerOnStop(d *Daemon, r *http.Request) response.Response {
 
 	err = inst.OnHook(instance.HookStop, args)
 	if err != nil {
-		logger.Error("The stop hook failed", log.Ctx{"instance": inst.Name(), "err": err})
+		logger.Error("The stop hook failed", logger.Ctx{"instance": inst.Name(), "err": err})
 		return response.SmartError(err)
 	}
 
@@ -389,10 +397,10 @@ type internalSQLBatch struct {
 }
 
 type internalSQLResult struct {
-	Type         string          `json:"type" yaml:"type"`
-	Columns      []string        `json:"columns" yaml:"columns"`
-	Rows         [][]interface{} `json:"rows" yaml:"rows"`
-	RowsAffected int64           `json:"rows_affected" yaml:"rows_affected"`
+	Type         string   `json:"type" yaml:"type"`
+	Columns      []string `json:"columns" yaml:"columns"`
+	Rows         [][]any  `json:"rows" yaml:"rows"`
+	RowsAffected int64    `json:"rows_affected" yaml:"rows_affected"`
 }
 
 // Perform a database dump.
@@ -409,25 +417,25 @@ func internalSQLGet(d *Daemon, r *http.Request) response.Response {
 		schemaOnly = 0
 	}
 
-	var schema string
 	var db *sql.DB
 	if database == "global" {
-		db = d.cluster.DB()
-		schema = cluster.FreshSchema()
+		db = d.db.Cluster.DB()
 	} else {
-		db = d.db.DB()
-		schema = node.FreshSchema()
+		db = d.db.Node.DB()
 	}
 
 	tx, err := db.BeginTx(r.Context(), nil)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("failed to start transaction: %w", err))
+		return response.SmartError(fmt.Errorf("Failed to start transaction: %w", err))
 	}
-	defer tx.Rollback()
-	dump, err := query.Dump(r.Context(), tx, schema, schemaOnly == 1)
+
+	defer func() { _ = tx.Rollback() }()
+
+	dump, err := query.Dump(r.Context(), tx, schemaOnly == 1)
 	if err != nil {
-		return response.SmartError(fmt.Errorf("failed dump database %s: %w", database, err))
+		return response.SmartError(fmt.Errorf("Failed dump database %s: %w", database, err))
 	}
+
 	return response.SyncResponse(true, internalSQLDump{Text: dump})
 }
 
@@ -450,9 +458,9 @@ func internalSQLPost(d *Daemon, r *http.Request) response.Response {
 
 	var db *sql.DB
 	if req.Database == "global" {
-		db = d.cluster.DB()
+		db = d.db.Cluster.DB()
 	} else {
-		db = d.db.DB()
+		db = d.db.Node.DB()
 	}
 
 	batch := internalSQLBatch{}
@@ -478,11 +486,11 @@ func internalSQLPost(d *Daemon, r *http.Request) response.Response {
 
 		if strings.HasPrefix(strings.ToUpper(query), "SELECT") {
 			err = internalSQLSelect(tx, query, &result)
-			tx.Rollback()
+			_ = tx.Rollback()
 		} else {
 			err = internalSQLExec(tx, query, &result)
 			if err != nil {
-				tx.Rollback()
+				_ = tx.Rollback()
 			} else {
 				err = tx.Commit()
 			}
@@ -505,7 +513,7 @@ func internalSQLSelect(tx *sql.Tx, query string, result *internalSQLResult) erro
 		return fmt.Errorf("Failed to execute query: %w", err)
 	}
 
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	result.Columns, err = rows.Columns()
 	if err != nil {
@@ -513,8 +521,8 @@ func internalSQLSelect(tx *sql.Tx, query string, result *internalSQLResult) erro
 	}
 
 	for rows.Next() {
-		row := make([]interface{}, len(result.Columns))
-		rowPointers := make([]interface{}, len(result.Columns))
+		row := make([]any, len(result.Columns))
+		rowPointers := make([]any, len(result.Columns))
 		for i := range row {
 			rowPointers[i] = &row[i]
 		}
@@ -575,10 +583,11 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 	// Get a list of all storage pools.
 	storagePoolNames, err := storagePoolsDir.Readdirnames(-1)
 	if err != nil {
-		storagePoolsDir.Close()
+		_ = storagePoolsDir.Close()
 		return err
 	}
-	storagePoolsDir.Close()
+
+	_ = storagePoolsDir.Close()
 
 	// Check whether the instance exists on any of the storage pools as either a container or a VM.
 	instanceMountPoints := []string{}
@@ -647,7 +656,7 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 	}
 
 	// Try to retrieve the storage pool the instance supposedly lives on.
-	pool, err := storagePools.GetPoolByName(d.State(), instancePoolName)
+	pool, err := storagePools.LoadByName(d.State(), instancePoolName)
 	if response.IsNotFoundError(err) {
 		// Create the storage pool db entry if it doesn't exist.
 		_, err = storagePoolDBCreate(d.State(), instancePoolName, "", backupConf.Pool.Driver, backupConf.Pool.Config)
@@ -655,7 +664,7 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 			return fmt.Errorf("Create storage pool database entry: %w", err)
 		}
 
-		pool, err = storagePools.GetPoolByName(d.State(), instancePoolName)
+		pool, err = storagePools.LoadByName(d.State(), instancePoolName)
 		if err != nil {
 			return fmt.Errorf("Load storage pool database entry: %w", err)
 		}
@@ -682,18 +691,26 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 	}
 
 	// Check if a storage volume entry for the instance already exists.
-	_, volume, ctVolErr := d.cluster.GetLocalStoragePoolVolume(projectName, backupConf.Container.Name, instanceDBVolType, pool.ID())
-	if ctVolErr != nil && !response.IsNotFoundError(ctVolErr) {
-		return ctVolErr
+	var dbVolume *db.StorageVolume
+	err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		dbVolume, err = tx.GetStoragePoolVolume(ctx, pool.ID(), projectName, instanceDBVolType, backupConf.Container.Name, true)
+		if err != nil && !response.IsNotFoundError(err) {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	// If a storage volume entry exists only proceed if force was specified.
-	if ctVolErr == nil && !force {
+	if dbVolume != nil && !force {
 		return fmt.Errorf(`Storage volume for instance %q already exists in the database. Set "force" to overwrite`, backupConf.Container.Name)
 	}
 
 	// Check if an entry for the instance already exists in the db.
-	_, instanceErr := d.cluster.GetInstanceID(projectName, backupConf.Container.Name)
+	_, instanceErr := d.db.Cluster.GetInstanceID(projectName, backupConf.Container.Name)
 	if instanceErr != nil && !response.IsNotFoundError(instanceErr) {
 		return instanceErr
 	}
@@ -707,17 +724,17 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 		return fmt.Errorf(`No storage volume struct in the backup file found. The storage volume needs to be recovered manually`)
 	}
 
-	if ctVolErr == nil {
-		if volume.Name != backupConf.Volume.Name {
-			return fmt.Errorf(`The name %q of the storage volume is not identical to the instance's name "%s"`, volume.Name, backupConf.Container.Name)
+	if dbVolume != nil {
+		if dbVolume.Name != backupConf.Volume.Name {
+			return fmt.Errorf(`The name %q of the storage volume is not identical to the instance's name "%s"`, dbVolume.Name, backupConf.Container.Name)
 		}
 
-		if volume.Type != backupConf.Volume.Type {
-			return fmt.Errorf(`The type %q of the storage volume is not identical to the instance's type %q`, volume.Type, backupConf.Volume.Type)
+		if dbVolume.Type != backupConf.Volume.Type {
+			return fmt.Errorf(`The type %q of the storage volume is not identical to the instance's type %q`, dbVolume.Type, backupConf.Volume.Type)
 		}
 
 		// Remove the storage volume db entry for the instance since force was specified.
-		err := d.cluster.RemoveStoragePoolVolume(projectName, backupConf.Container.Name, instanceDBVolType, pool.ID())
+		err := d.db.Cluster.RemoveStoragePoolVolume(projectName, backupConf.Container.Name, instanceDBVolType, pool.ID())
 		if err != nil {
 			return err
 		}
@@ -725,13 +742,13 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 
 	if instanceErr == nil {
 		// Remove the storage volume db entry for the instance since force was specified.
-		err := d.cluster.DeleteInstance(projectName, backupConf.Container.Name)
+		err := d.db.Cluster.DeleteInstance(projectName, backupConf.Container.Name)
 		if err != nil {
 			return err
 		}
 	}
 
-	profiles, err := d.State().Cluster.GetProfiles(projectName, backupConf.Container.Profiles)
+	profiles, err := d.State().DB.Cluster.GetProfiles(projectName, backupConf.Container.Profiles)
 	if err != nil {
 		return fmt.Errorf("Failed loading profiles for instance: %w", err)
 	}
@@ -754,12 +771,17 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 		return fmt.Errorf("No instance config in backup config")
 	}
 
-	instDBArgs := backupConf.ToInstanceDBArgs(projectName)
+	instDBArgs, err := backup.ConfigToInstanceDBArgs(d.State(), backupConf, projectName, true)
+	if err != nil {
+		return err
+	}
 
-	_, instOp, err := instance.CreateInternal(d.State(), *instDBArgs, true, nil, revert)
+	_, instOp, cleanup, err := instance.CreateInternal(d.State(), *instDBArgs, true)
 	if err != nil {
 		return fmt.Errorf("Failed creating instance record: %w", err)
 	}
+
+	revert.Add(cleanup)
 	defer instOp.Done(err)
 
 	instancePath := storagePools.InstancePath(instanceType, projectName, backupConf.Container.Name, false)
@@ -767,6 +789,7 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 	if backupConf.Container.Config["security.privileged"] == "" {
 		isPrivileged = true
 	}
+
 	err = storagePools.CreateContainerMountpoint(instanceMountPoint, instancePath, isPrivileged)
 	if err != nil {
 		return err
@@ -776,7 +799,7 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 		snapInstName := fmt.Sprintf("%s%s%s", backupConf.Container.Name, shared.SnapshotDelimiter, snap.Name)
 
 		// Check if an entry for the snapshot already exists in the db.
-		_, snapErr := d.cluster.GetInstanceSnapshotID(projectName, backupConf.Container.Name, snap.Name)
+		_, snapErr := d.db.Cluster.GetInstanceSnapshotID(projectName, backupConf.Container.Name, snap.Name)
 		if snapErr != nil && !response.IsNotFoundError(snapErr) {
 			return snapErr
 		}
@@ -787,25 +810,33 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 		}
 
 		// Check if a storage volume entry for the snapshot already exists.
-		_, _, csVolErr := d.cluster.GetLocalStoragePoolVolume(projectName, snapInstName, instanceDBVolType, pool.ID())
-		if csVolErr != nil && !response.IsNotFoundError(csVolErr) {
-			return csVolErr
+		var dbVolume *db.StorageVolume
+		err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			dbVolume, err = tx.GetStoragePoolVolume(ctx, pool.ID(), projectName, instanceDBVolType, snapInstName, true)
+			if err != nil && !response.IsNotFoundError(err) {
+				return err
+			}
+
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 
 		// If a storage volume entry exists only proceed if force was specified.
-		if csVolErr == nil && !force {
+		if dbVolume != nil && !force {
 			return fmt.Errorf(`Storage volume for snapshot %q already exists in the database. Set "force" to overwrite`, snapInstName)
 		}
 
 		if snapErr == nil {
-			err := d.cluster.DeleteInstance(projectName, snapInstName)
+			err := d.db.Cluster.DeleteInstance(projectName, snapInstName)
 			if err != nil {
 				return err
 			}
 		}
 
-		if csVolErr == nil {
-			err := d.cluster.RemoveStoragePoolVolume(projectName, snapInstName, instanceDBVolType, pool.ID())
+		if dbVolume != nil {
+			err := d.db.Cluster.RemoveStoragePoolVolume(projectName, snapInstName, instanceDBVolType, pool.ID())
 			if err != nil {
 				return err
 			}
@@ -818,7 +849,7 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 			return err
 		}
 
-		profiles, err := d.State().Cluster.GetProfiles(projectName, snap.Profiles)
+		profiles, err := d.State().DB.Cluster.GetProfiles(projectName, snap.Profiles)
 		if err != nil {
 			return fmt.Errorf("Failed loading profiles for instance snapshot %q: %w", snapInstName, err)
 		}
@@ -834,7 +865,7 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 
 		internalImportRootDevicePopulate(instancePoolName, snap.Devices, snap.ExpandedDevices, profiles)
 
-		_, snapInstOp, err := instance.CreateInternal(d.State(), db.InstanceArgs{
+		_, snapInstOp, cleanup, err := instance.CreateInternal(d.State(), db.InstanceArgs{
 			Project:      projectName,
 			Architecture: arch,
 			BaseImage:    baseImage,
@@ -846,12 +877,14 @@ func internalImportFromBackup(d *Daemon, projectName string, instName string, fo
 			Ephemeral:    snap.Ephemeral,
 			LastUsedDate: snap.LastUsedAt,
 			Name:         snapInstName,
-			Profiles:     snap.Profiles,
+			Profiles:     profiles,
 			Stateful:     snap.Stateful,
-		}, true, nil, revert)
+		}, true)
 		if err != nil {
 			return fmt.Errorf("Failed creating instance snapshot record %q: %w", snap.Name, err)
 		}
+
+		revert.Add(cleanup)
 		defer snapInstOp.Done(err)
 
 		// Recreate missing mountpoints and symlinks.
@@ -941,7 +974,8 @@ func internalImportRootDevicePopulate(instancePoolName string, localDevices map[
 		// Inherit any extra root disk config from the expanded root disk from backup.yaml.
 		if expandedRootName != "" {
 			for k, v := range expandedRootConfig {
-				if _, found := rootDev[k]; !found {
+				_, found := rootDev[k]
+				if !found {
 					rootDev[k] = v
 				}
 			}

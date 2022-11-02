@@ -4,7 +4,7 @@ package api
 //
 // swagger:model
 //
-// API extension: network_peer
+// API extension: network_peer.
 type NetworkPeersPost struct {
 	NetworkPeerPut `yaml:",inline"`
 
@@ -25,7 +25,7 @@ type NetworkPeersPost struct {
 //
 // swagger:model
 //
-// API extension: network_peer
+// API extension: network_peer.
 type NetworkPeerPut struct {
 	// Description of the peer
 	// Example: Peering with network1 in project1
@@ -40,7 +40,7 @@ type NetworkPeerPut struct {
 //
 // swagger:model
 //
-// API extension: network_forward
+// API extension: network_forward.
 type NetworkPeer struct {
 	NetworkPeerPut `yaml:",inline"`
 
@@ -71,8 +71,8 @@ type NetworkPeer struct {
 }
 
 // Etag returns the values used for etag generation.
-func (p *NetworkPeer) Etag() []interface{} {
-	return []interface{}{p.Name, p.Description, p.Config}
+func (p *NetworkPeer) Etag() []any {
+	return []any{p.Name, p.Description, p.Config}
 }
 
 // Writable converts a full NetworkPeer struct into a NetworkPeerPut struct (filters read-only fields).

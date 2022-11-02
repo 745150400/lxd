@@ -4,15 +4,15 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 
-	"github.com/lxc/lxd/shared"
-
 	"golang.org/x/crypto/scrypt"
+
+	"github.com/lxc/lxd/shared"
 )
 
-// PasswordCheck validates the provided password against the encoded secret
+// PasswordCheck validates the provided password against the encoded secret.
 func PasswordCheck(secret string, password string) error {
 	// No password set
 	if secret == "" {
@@ -84,18 +84,18 @@ func LoadServerCert(dir string) (*shared.CertInfo, error) {
 // WriteCert writes the given material to the appropriate certificate files in
 // the given LXD var directory.
 func WriteCert(dir, prefix string, cert, key, ca []byte) error {
-	err := ioutil.WriteFile(filepath.Join(dir, prefix+".crt"), cert, 0644)
+	err := os.WriteFile(filepath.Join(dir, prefix+".crt"), cert, 0644)
 	if err != nil {
 		return err
 	}
 
-	err = ioutil.WriteFile(filepath.Join(dir, prefix+".key"), key, 0600)
+	err = os.WriteFile(filepath.Join(dir, prefix+".key"), key, 0600)
 	if err != nil {
 		return err
 	}
 
 	if ca != nil {
-		err = ioutil.WriteFile(filepath.Join(dir, prefix+".ca"), ca, 0644)
+		err = os.WriteFile(filepath.Join(dir, prefix+".ca"), ca, 0644)
 		if err != nil {
 			return err
 		}

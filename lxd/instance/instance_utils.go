@@ -2,6 +2,7 @@ package instance
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"fmt"
@@ -13,13 +14,13 @@ import (
 	"time"
 
 	"github.com/flosch/pongo2"
+	liblxc "github.com/lxc/go-lxc"
 	"github.com/pborman/uuid"
-	log "gopkg.in/inconshreveable/log15.v2"
-	liblxc "gopkg.in/lxc/go-lxc.v2"
 
-	lxd "github.com/lxc/lxd/client"
+	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/backup"
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/instance/operationlock"
@@ -38,15 +39,14 @@ import (
 )
 
 // ValidDevices is linked from instance/drivers.validDevices to validate device config.
-var ValidDevices func(state *state.State, projectName string, instanceType instancetype.Type, devices deviceConfig.Devices, expanded bool) error
+var ValidDevices func(state *state.State, p api.Project, instanceType instancetype.Type, localDevices deviceConfig.Devices, expandedDevices deviceConfig.Devices) error
 
 // Load is linked from instance/drivers.load to allow different instance types to be loaded.
-var Load func(s *state.State, args db.InstanceArgs, profiles []api.Profile) (Instance, error)
+var Load func(s *state.State, args db.InstanceArgs, p api.Project) (Instance, error)
 
 // Create is linked from instance/drivers.create to allow difference instance types to be created.
-// Accepts a reverter that revert steps this function does will be added to. It is up to the caller to call the
-// revert's Fail() or Success() function as needed.
-var Create func(s *state.State, args db.InstanceArgs, volumeConfig map[string]string, revert *revert.Reverter) (Instance, error)
+// Returns a revert fail function that can be used to undo this function if a subsequent step fails.
+var Create func(s *state.State, args db.InstanceArgs, p api.Project) (Instance, revert.Hook, error)
 
 // CompareSnapshots returns a list of snapshots to sync to the target and a list of
 // snapshots to remove from the target. A snapshot will be marked as "to sync" if it either doesn't
@@ -74,7 +74,7 @@ func CompareSnapshots(source Instance, target Instance) ([]Instance, []Instance,
 
 	// Generate a list of source snapshot creation dates.
 	for _, snap := range sourceSnapshots {
-		_, snapName, _ := shared.InstanceGetParentAndSnapshotName(snap.Name())
+		_, snapName, _ := api.GetParentAndSnapshotName(snap.Name())
 
 		sourceSnapshotsTime[snapName] = snap.CreationDate()
 	}
@@ -83,7 +83,7 @@ func CompareSnapshots(source Instance, target Instance) ([]Instance, []Instance,
 	// the snapshot or the creation time is different on the source then add the target snapshot
 	// to the "to delete" list.
 	for _, snap := range targetSnapshots {
-		_, snapName, _ := shared.InstanceGetParentAndSnapshotName(snap.Name())
+		_, snapName, _ := api.GetParentAndSnapshotName(snap.Name())
 
 		targetSnapshotsTime[snapName] = snap.CreationDate()
 		existDate, exists := sourceSnapshotsTime[snapName]
@@ -100,7 +100,7 @@ func CompareSnapshots(source Instance, target Instance) ([]Instance, []Instance,
 	// For each of the source snapshots, decide whether it needs to be synced or not based on
 	// whether it already exists in the target and whether the creation dates match.
 	for _, snap := range sourceSnapshots {
-		_, snapName, _ := shared.InstanceGetParentAndSnapshotName(snap.Name())
+		_, snapName, _ := api.GetParentAndSnapshotName(snap.Name())
 
 		existDate, exists := targetSnapshotsTime[snapName]
 		if !exists || existDate != snap.CreationDate() {
@@ -165,12 +165,14 @@ func ValidConfig(sysOS *sys.OS, config map[string]string, expanded bool, instanc
 	if err != nil {
 		return err
 	}
+
 	isDenyDefault := shared.IsTrue(val)
 
 	val, _, err = exclusiveConfigKeys("security.syscalls.deny_compat", "security.syscalls.blacklist_compat", config)
 	if err != nil {
 		return err
 	}
+
 	isDenyCompat := shared.IsTrue(val)
 
 	if rawSeccomp && (isAllow || isDeny || isDenyDefault || isDenyCompat) {
@@ -216,12 +218,15 @@ func validConfigKey(os *sys.OS, key string, value string, instanceType instancet
 	if err != nil {
 		return err
 	}
+
 	if err = f(value); err != nil {
 		return err
 	}
+
 	if key == "raw.lxc" {
 		return lxcValidConfig(value)
 	}
+
 	if key == "security.syscalls.deny_compat" || key == "security.syscalls.blacklist_compat" {
 		for _, arch := range os.Architectures {
 			if arch == osarch.ARCH_64BIT_INTEL_X86 ||
@@ -232,6 +237,7 @@ func validConfigKey(os *sys.OS, key string, value string, instanceType instancet
 		}
 		return fmt.Errorf("%s isn't supported on this architecture", key)
 	}
+
 	return nil
 }
 
@@ -298,14 +304,14 @@ func lxcValidConfig(rawLxc string) error {
 		}
 
 		networkKeyPrefix := "lxc.net."
-		if !RuntimeLiblxcVersionAtLeast(liblxc.Version(), 2, 1, 0) {
+		if !liblxc.RuntimeLiblxcVersionAtLeast(liblxc.Version(), 2, 1, 0) {
 			networkKeyPrefix = "lxc.network."
 		}
 
 		if strings.HasPrefix(key, networkKeyPrefix) {
 			fields := strings.Split(key, ".")
 
-			if !RuntimeLiblxcVersionAtLeast(liblxc.Version(), 2, 1, 0) {
+			if !liblxc.RuntimeLiblxcVersionAtLeast(liblxc.Version(), 2, 1, 0) {
 				// lxc.network.X.ipv4 or lxc.network.X.ipv6
 				if len(fields) == 4 && shared.StringInSlice(fields[3], []string{"ipv4", "ipv6"}) {
 					continue
@@ -353,7 +359,7 @@ func AllowedUnprivilegedOnlyMap(rawIdmap string) error {
 // LoadByID loads an instance by ID.
 func LoadByID(s *state.State, id int) (Instance, error) {
 	// Get the DB record
-	project, name, err := s.Cluster.GetInstanceProjectAndName(id)
+	project, name, err := s.DB.Cluster.GetInstanceProjectAndName(id)
 	if err != nil {
 		return nil, err
 	}
@@ -362,11 +368,11 @@ func LoadByID(s *state.State, id int) (Instance, error) {
 }
 
 // Convenience to load a db.Instance object, accounting for snapshots.
-func fetchInstanceDatabaseObject(s *state.State, project, name string) (*db.Instance, error) {
-	var container *db.Instance
-	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
+func fetchInstanceDatabaseObject(s *state.State, project, name string) (*cluster.Instance, error) {
+	var container *cluster.Instance
+	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
-		container, err = LoadInstanceDatabaseObject(tx, project, name)
+		container, err = LoadInstanceDatabaseObject(ctx, tx, project, name)
 		return err
 	})
 	if err != nil {
@@ -377,8 +383,8 @@ func fetchInstanceDatabaseObject(s *state.State, project, name string) (*db.Inst
 }
 
 // LoadInstanceDatabaseObject loads a db.Instance object, accounting for snapshots.
-func LoadInstanceDatabaseObject(tx *db.ClusterTx, project, name string) (*db.Instance, error) {
-	var container *db.Instance
+func LoadInstanceDatabaseObject(ctx context.Context, tx *db.ClusterTx, project, name string) (*cluster.Instance, error) {
+	var container *cluster.Instance
 	var err error
 
 	if strings.Contains(name, shared.SnapshotDelimiter) {
@@ -386,20 +392,20 @@ func LoadInstanceDatabaseObject(tx *db.ClusterTx, project, name string) (*db.Ins
 		instanceName := parts[0]
 		snapshotName := parts[1]
 
-		instance, err := tx.GetInstance(project, instanceName)
+		instance, err := cluster.GetInstance(ctx, tx.Tx(), project, instanceName)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to fetch instance %q in project %q: %w", name, project, err)
 		}
 
-		snapshot, err := tx.GetInstanceSnapshot(project, instanceName, snapshotName)
+		snapshot, err := cluster.GetInstanceSnapshot(ctx, tx.Tx(), project, instanceName, snapshotName)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to fetch snapshot %q of instance %q in project %q: %w", snapshotName, instanceName, project, err)
 		}
 
-		c := db.InstanceSnapshotToInstance(instance, snapshot)
+		c := snapshot.ToInstance(instance.Name, instance.Node, instance.Type, instance.Architecture)
 		container = &c
 	} else {
-		container, err = tx.GetInstance(project, name)
+		container, err = cluster.GetInstance(ctx, tx.Tx(), project, name)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to fetch instance %q in project %q: %w", name, project, err)
 		}
@@ -409,15 +415,40 @@ func LoadInstanceDatabaseObject(tx *db.ClusterTx, project, name string) (*db.Ins
 }
 
 // LoadByProjectAndName loads an instance by project and name.
-func LoadByProjectAndName(s *state.State, project, name string) (Instance, error) {
+func LoadByProjectAndName(s *state.State, projectName string, instanceName string) (Instance, error) {
 	// Get the DB record
-	container, err := fetchInstanceDatabaseObject(s, project, name)
+	var args db.InstanceArgs
+	var p *api.Project
+	err := s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		proj, err := cluster.GetProject(ctx, tx.Tx(), projectName)
+		if err != nil {
+			return err
+		}
+
+		p, err = proj.ToAPI(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
+		inst, err := LoadInstanceDatabaseObject(ctx, tx, projectName, instanceName)
+		if err != nil {
+			return err
+		}
+
+		instArgs, err := tx.InstancesToInstanceArgs(ctx, true, *inst)
+		if err != nil {
+			return err
+		}
+
+		args = instArgs[inst.ID]
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	args := db.InstanceToArgs(container)
-	inst, err := Load(s, args, nil)
+	inst, err := Load(s, args, *p)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to load instance: %w", err)
 	}
@@ -425,124 +456,31 @@ func LoadByProjectAndName(s *state.State, project, name string) (Instance, error
 	return inst, nil
 }
 
-// LoadAllInternal loads a list of db instances into a list of instances.
-func LoadAllInternal(s *state.State, dbInstances []db.Instance) ([]Instance, error) {
-	// Figure out what profiles are in use
-	profiles := map[string]map[string]api.Profile{}
-	for _, instArgs := range dbInstances {
-		projectProfiles, ok := profiles[instArgs.Project]
-		if !ok {
-			projectProfiles = map[string]api.Profile{}
-			profiles[instArgs.Project] = projectProfiles
-		}
-		for _, profile := range instArgs.Profiles {
-			_, ok := projectProfiles[profile]
-			if !ok {
-				projectProfiles[profile] = api.Profile{}
-			}
-		}
+// LoadNodeAll loads all instances on this server.
+func LoadNodeAll(s *state.State, instanceType instancetype.Type) ([]Instance, error) {
+	var err error
+	var instances []Instance
+
+	filter := cluster.InstanceFilter{Type: instanceType.Filter()}
+	if s.ServerName != "" {
+		filter.Node = &s.ServerName
 	}
 
-	// Get the profile data
-	for project, projectProfiles := range profiles {
-		for name := range projectProfiles {
-			_, profile, err := s.Cluster.GetProfile(project, name)
-			if err != nil {
-				return nil, err
-			}
-
-			projectProfiles[name] = *profile
-		}
-	}
-
-	// Load the instances structs
-	instances := []Instance{}
-	for _, dbInstance := range dbInstances {
-		// Figure out the instances's profiles
-		cProfiles := []api.Profile{}
-		for _, name := range dbInstance.Profiles {
-			cProfiles = append(cProfiles, profiles[dbInstance.Project][name])
-		}
-
-		args := db.InstanceToArgs(&dbInstance)
-		inst, err := Load(s, args, cProfiles)
+	err = s.DB.Cluster.InstanceList(func(dbInst db.InstanceArgs, p api.Project) error {
+		inst, err := Load(s, dbInst, p)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("Failed loading instance %q in project %q: %w", dbInst.Name, dbInst.Project, err)
 		}
 
 		instances = append(instances, inst)
+
+		return nil
+	}, filter)
+	if err != nil {
+		return nil, err
 	}
 
 	return instances, nil
-}
-
-// LoadByProject loads all instances in a project.
-func LoadByProject(s *state.State, project string) ([]Instance, error) {
-	// Get all the instances.
-	var cts []db.Instance
-	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		filter := db.InstanceFilter{
-			Project: &project,
-		}
-		var err error
-		cts, err = tx.GetInstances(filter)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return LoadAllInternal(s, cts)
-}
-
-// LoadFromAllProjects loads all instances across all projects.
-func LoadFromAllProjects(s *state.State) ([]Instance, error) {
-	var projects []string
-
-	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		var err error
-		projects, err = tx.GetProjectNames()
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	instances := []Instance{}
-	for _, project := range projects {
-		projectInstances, err := LoadByProject(s, project)
-		if err != nil {
-			return nil, fmt.Errorf("Load instances in project %s: %w", project, nil)
-		}
-		instances = append(instances, projectInstances...)
-	}
-
-	return instances, nil
-}
-
-// LoadNodeAll loads all instances of this nodes.
-func LoadNodeAll(s *state.State, instanceType instancetype.Type) ([]Instance, error) {
-	// Get all the container arguments
-	var insts []db.Instance
-	err := s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		var err error
-		filter := db.InstanceTypeFilter(instanceType)
-		insts, err = tx.GetLocalInstancesInProject(filter)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return LoadAllInternal(s, insts)
 }
 
 // LoadFromBackup loads from a mounted instance's backup file.
@@ -558,17 +496,37 @@ func LoadFromBackup(s *state.State, projectName string, instancePath string, app
 		return nil, fmt.Errorf("Failed parsing instance backup file from %q: %w", backupYamlPath, err)
 	}
 
-	instDBArgs := backupConf.ToInstanceDBArgs(projectName)
+	instDBArgs, err := backup.ConfigToInstanceDBArgs(s, backupConf, projectName, applyProfiles)
+	if err != nil {
+		return nil, err
+	}
 
 	if !applyProfiles {
 		// Stop instance.Load() from expanding profile config from DB, and apply expanded config from
 		// backup file to local config. This way we can still see the devices even if DB not available.
-		instDBArgs.Profiles = nil
 		instDBArgs.Config = backupConf.Container.ExpandedConfig
 		instDBArgs.Devices = deviceConfig.NewDevices(backupConf.Container.ExpandedDevices)
 	}
 
-	inst, err = Load(s, *instDBArgs, nil)
+	var p *api.Project
+	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		proj, err := cluster.GetProject(ctx, tx.Tx(), projectName)
+		if err != nil {
+			return err
+		}
+
+		p, err = proj.ToAPI(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	inst, err = Load(s, *instDBArgs, *p)
 	if err != nil {
 		return nil, fmt.Errorf("Failed loading instance from backup file %q: %w", backupYamlPath, err)
 	}
@@ -577,22 +535,20 @@ func LoadFromBackup(s *state.State, projectName string, instancePath string, app
 }
 
 // DeleteSnapshots calls the Delete() function on each of the supplied instance's snapshots.
-func DeleteSnapshots(s *state.State, projectName, instanceName string) error {
-	results, err := s.Cluster.GetInstanceSnapshotsNames(projectName, instanceName)
+func DeleteSnapshots(inst Instance) error {
+	snapInsts, err := inst.Snapshots()
 	if err != nil {
 		return err
 	}
 
-	for _, snapName := range results {
-		snapInst, err := LoadByProjectAndName(s, projectName, snapName)
-		if err != nil {
-			logger.Error("DeleteSnapshots: Failed to load the snapshot", log.Ctx{"project": projectName, "instance": instanceName, "snapshot": snapName, "err": err})
-			continue
-		}
+	snapInstsCount := len(snapInsts)
 
-		err = snapInst.Delete(true)
+	for k := range snapInsts {
+		// Delete the snapshots in reverse order.
+		k = snapInstsCount - 1 - k
+		err = snapInsts[k].Delete(true)
 		if err != nil {
-			logger.Error("DeleteSnapshots: Failed to delete the snapshot", log.Ctx{"project": projectName, "instance": instanceName, "snapshot": snapName, "err": err})
+			logger.Error("Failed deleting snapshot", logger.Ctx{"project": snapInsts[k].Project(), "instance": snapInsts[k].Name(), "err": err})
 		}
 	}
 
@@ -609,6 +565,7 @@ func DeviceNextInterfaceHWAddr() (string, error) {
 			if err != nil {
 				return "", err
 			}
+
 			ret.WriteString(fmt.Sprintf("%x", c.Int64()))
 		} else {
 			ret.WriteString(string(c))
@@ -621,7 +578,7 @@ func DeviceNextInterfaceHWAddr() (string, error) {
 // BackupLoadByName load an instance backup from the database.
 func BackupLoadByName(s *state.State, project, name string) (*backup.InstanceBackup, error) {
 	// Get the backup database record
-	args, err := s.Cluster.GetInstanceBackup(project, name)
+	args, err := s.DB.Cluster.GetInstanceBackup(project, name)
 	if err != nil {
 		return nil, fmt.Errorf("Load backup from database: %w", err)
 	}
@@ -646,7 +603,7 @@ func ResolveImage(s *state.State, project string, source api.InstanceSource) (st
 			return source.Alias, nil
 		}
 
-		_, alias, err := s.Cluster.GetImageAlias(project, source.Alias, true)
+		_, alias, err := s.DB.Cluster.GetImageAlias(project, source.Alias, true)
 		if err != nil {
 			return "", err
 		}
@@ -659,14 +616,14 @@ func ResolveImage(s *state.State, project string, source api.InstanceSource) (st
 			return "", fmt.Errorf("Property match is only supported for local images")
 		}
 
-		hashes, err := s.Cluster.GetImagesFingerprints(project, false)
+		hashes, err := s.DB.Cluster.GetImagesFingerprints(project, false)
 		if err != nil {
 			return "", err
 		}
 
 		var image *api.Image
 		for _, imageHash := range hashes {
-			_, img, err := s.Cluster.GetImage(imageHash, db.ImageFilter{Project: &project})
+			_, img, err := s.DB.Cluster.GetImage(imageHash, cluster.ImageFilter{Project: &project})
 			if err != nil {
 				continue
 			}
@@ -750,7 +707,7 @@ func SuitableArchitectures(s *state.State, project string, req api.InstancesPost
 
 		// Handle local images.
 		if req.Source.Server == "" {
-			_, img, err := s.Cluster.GetImage(hash, db.ImageFilter{Project: &project})
+			_, img, err := s.DB.Cluster.GetImage(hash, cluster.ImageFilter{Project: &project})
 			if err != nil {
 				return nil, err
 			}
@@ -844,7 +801,7 @@ func SuitableArchitectures(s *state.State, project string, req api.InstancesPost
 // so it takes an argument indicating whether the name is to be used for a snapshot or not.
 func ValidName(instanceName string, isSnapshot bool) error {
 	if isSnapshot {
-		parentName, snapshotName, _ := shared.InstanceGetParentAndSnapshotName(instanceName)
+		parentName, snapshotName, _ := api.GetParentAndSnapshotName(instanceName)
 		err := validate.IsHostname(parentName)
 		if err != nil {
 			return fmt.Errorf("Invalid instance name: %w", err)
@@ -869,15 +826,19 @@ func ValidName(instanceName string, isSnapshot bool) error {
 }
 
 // CreateInternal creates an instance record and storage volume record in the database and sets up devices.
-// Accepts an (optionally nil) volumeConfig map that can be used to specify extra custom settings for the volume
-// record. Also accepts a reverter that revert steps this function does will be added to. It is up to the caller to
+// Accepts a reverter that revert steps this function does will be added to. It is up to the caller to
 // call the revert's Fail() or Success() function as needed.
 // Returns the created instance, along with a "create" operation lock that needs to be marked as Done once the
-// instance is fully completed.
-func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool, volumeConfig map[string]string, revert *revert.Reverter) (Instance, *operationlock.InstanceOperation, error) {
+// instance is fully completed, and a revert fail function that can be used to undo this function if a subsequent
+// step fails.
+func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool) (Instance, *operationlock.InstanceOperation, revert.Hook, error) {
+	revert := revert.New()
+	defer revert.Fail()
+
 	// Check instance type requested is supported by this machine.
-	if _, supported := s.InstanceTypes[args.Type]; !supported {
-		return nil, nil, fmt.Errorf("Instance type %q is not supported on this server", args.Type)
+	err := s.InstanceTypes[args.Type]
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("Instance type %q is not supported on this server: %w", args.Type, err)
 	}
 
 	// Set default values.
@@ -886,7 +847,10 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool, volu
 	}
 
 	if args.Profiles == nil {
-		args.Profiles = []string{"default"}
+		args.Profiles, err = s.DB.Cluster.GetProfiles(args.Project, []string{"default"})
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("Failed to get default profile for new instance")
+		}
 	}
 
 	if args.Config == nil {
@@ -909,9 +873,9 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool, volu
 		args.Architecture = s.OS.Architectures[0]
 	}
 
-	err := ValidName(args.Name, args.Snapshot)
+	err = ValidName(args.Name, args.Snapshot)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	if !args.Snapshot {
@@ -932,7 +896,7 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool, volu
 	// Validate instance config.
 	err = ValidConfig(s.OS, args.Config, false, args.Type)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Leave validating devices to Create function call below.
@@ -940,30 +904,30 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool, volu
 	// Validate architecture.
 	_, err = osarch.ArchitectureName(args.Architecture)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	if !shared.IntInSlice(args.Architecture, s.OS.Architectures) {
-		return nil, nil, fmt.Errorf("Requested architecture isn't supported by this host")
+		return nil, nil, nil, fmt.Errorf("Requested architecture isn't supported by this host")
 	}
 
 	// Validate profiles.
-	profiles, err := s.Cluster.GetProfileNames(args.Project)
+	profiles, err := s.DB.Cluster.GetProfileNames(args.Project)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	checkedProfiles := []string{}
+	checkedProfiles := map[string]bool{}
 	for _, profile := range args.Profiles {
-		if !shared.StringInSlice(profile, profiles) {
-			return nil, nil, fmt.Errorf("Requested profile %q doesn't exist", profile)
+		if !shared.StringInSlice(profile.Name, profiles) {
+			return nil, nil, nil, fmt.Errorf("Requested profile %q doesn't exist", profile.Name)
 		}
 
-		if shared.StringInSlice(profile, checkedProfiles) {
-			return nil, nil, fmt.Errorf("Duplicate profile found in request")
+		if checkedProfiles[profile.Name] {
+			return nil, nil, nil, fmt.Errorf("Duplicate profile found in request")
 		}
 
-		checkedProfiles = append(checkedProfiles, profile)
+		checkedProfiles[profile.Name] = true
 	}
 
 	if args.CreationDate.IsZero() {
@@ -974,16 +938,29 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool, volu
 		args.LastUsedDate = time.Unix(0, 0).UTC()
 	}
 
-	var dbInst db.Instance
-	var op *operationlock.InstanceOperation
+	// Prevent concurrent create requests for same instance.
+	op, err := operationlock.Create(args.Project, args.Name, operationlock.ActionCreate, false, false)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 
-	err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		node, err := tx.GetLocalNodeName()
+	revert.Add(func() { op.Done(err) })
+
+	var dbInst cluster.Instance
+	var p *api.Project
+
+	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		proj, err := cluster.GetProject(ctx, tx.Tx(), args.Project)
 		if err != nil {
 			return err
 		}
 
-		devices, err := db.APIToDevices(args.Devices.CloneNative())
+		p, err = proj.ToAPI(ctx, tx.Tx())
+		if err != nil {
+			return err
+		}
+
+		devices, err := cluster.APIToDevices(args.Devices.CloneNative())
 		if err != nil {
 			return err
 		}
@@ -992,42 +969,62 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool, volu
 			parts := strings.SplitN(args.Name, shared.SnapshotDelimiter, 2)
 			instanceName := parts[0]
 			snapshotName := parts[1]
-			instance, err := tx.GetInstance(args.Project, instanceName)
+			instance, err := cluster.GetInstance(ctx, tx.Tx(), args.Project, instanceName)
 			if err != nil {
 				return fmt.Errorf("Get instance %q in project %q", instanceName, args.Project)
 			}
-			snapshot := db.InstanceSnapshot{
+
+			snapshot := cluster.InstanceSnapshot{
 				Project:      args.Project,
 				Instance:     instanceName,
 				Name:         snapshotName,
 				CreationDate: args.CreationDate,
 				Stateful:     args.Stateful,
 				Description:  args.Description,
-				Config:       args.Config,
-				Devices:      devices,
 				ExpiryDate:   sql.NullTime{Time: args.ExpiryDate, Valid: true},
 			}
-			_, err = tx.CreateInstanceSnapshot(snapshot)
+
+			id, err := cluster.CreateInstanceSnapshot(ctx, tx.Tx(), snapshot)
 			if err != nil {
 				return fmt.Errorf("Add snapshot info to the database: %w", err)
 			}
 
+			err = cluster.CreateInstanceSnapshotConfig(ctx, tx.Tx(), id, args.Config)
+			if err != nil {
+				return err
+			}
+
+			err = cluster.CreateInstanceSnapshotDevices(ctx, tx.Tx(), id, devices)
+			if err != nil {
+				return err
+			}
+
 			// Read back the snapshot, to get ID and creation time.
-			s, err := tx.GetInstanceSnapshot(args.Project, instanceName, snapshotName)
+			s, err := cluster.GetInstanceSnapshot(ctx, tx.Tx(), args.Project, instanceName, snapshotName)
 			if err != nil {
 				return fmt.Errorf("Fetch created snapshot from the database: %w", err)
 			}
 
-			dbInst = db.InstanceSnapshotToInstance(instance, s)
+			dbInst = s.ToInstance(instance.Name, instance.Node, instance.Type, instance.Architecture)
+
+			newArgs, err := tx.InstancesToInstanceArgs(ctx, false, dbInst)
+			if err != nil {
+				return err
+			}
+
+			// Populate profile info that was already loaded.
+			newInstArgs := newArgs[dbInst.ID]
+			newInstArgs.Profiles = args.Profiles
+			args = newInstArgs
 
 			return nil
 		}
 
 		// Create the instance entry.
-		dbInst = db.Instance{
+		dbInst = cluster.Instance{
 			Project:      args.Project,
 			Name:         args.Name,
-			Node:         node,
+			Node:         s.ServerName,
 			Type:         args.Type,
 			Snapshot:     args.Snapshot,
 			Architecture: args.Architecture,
@@ -1036,19 +1033,36 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool, volu
 			Stateful:     args.Stateful,
 			LastUseDate:  sql.NullTime{Time: args.LastUsedDate, Valid: true},
 			Description:  args.Description,
-			Config:       args.Config,
-			Devices:      devices,
-			Profiles:     args.Profiles,
 			ExpiryDate:   sql.NullTime{Time: args.ExpiryDate, Valid: true},
 		}
 
-		_, err = tx.CreateInstance(dbInst)
+		instanceID, err := cluster.CreateInstance(ctx, tx.Tx(), dbInst)
 		if err != nil {
 			return fmt.Errorf("Add instance info to the database: %w", err)
 		}
 
+		err = cluster.CreateInstanceDevices(ctx, tx.Tx(), instanceID, devices)
+		if err != nil {
+			return err
+		}
+
+		err = cluster.CreateInstanceConfig(ctx, tx.Tx(), instanceID, args.Config)
+		if err != nil {
+			return err
+		}
+
+		profileNames := make([]string, 0, len(args.Profiles))
+		for _, profile := range args.Profiles {
+			profileNames = append(profileNames, profile.Name)
+		}
+
+		err = cluster.UpdateInstanceProfiles(ctx, tx.Tx(), int(instanceID), dbInst.Project, profileNames)
+		if err != nil {
+			return err
+		}
+
 		// Read back the instance, to get ID and creation time.
-		dbRow, err := tx.GetInstance(args.Project, args.Name)
+		dbRow, err := cluster.GetInstance(ctx, tx.Tx(), args.Project, args.Name)
 		if err != nil {
 			return fmt.Errorf("Fetch created instance from the database: %w", err)
 		}
@@ -1059,12 +1073,15 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool, volu
 			return fmt.Errorf("Unexpected instance database ID %d: %w", dbInst.ID, err)
 		}
 
-		op, err = operationlock.Create(dbInst.Project, dbInst.Name, "create", false, false)
+		newArgs, err := tx.InstancesToInstanceArgs(ctx, false, dbInst)
 		if err != nil {
 			return err
 		}
 
-		revert.Add(func() { op.Done(err) })
+		// Populate profile info that was already loaded.
+		newInstArgs := newArgs[dbInst.ID]
+		newInstArgs.Profiles = args.Profiles
+		args = newInstArgs
 
 		return nil
 	})
@@ -1075,27 +1092,29 @@ func CreateInternal(s *state.State, args db.InstanceArgs, clearLogDir bool, volu
 				thing = "Snapshot"
 			}
 
-			return nil, nil, fmt.Errorf("%s %q already exists", thing, args.Name)
+			return nil, nil, nil, fmt.Errorf("%s %q already exists", thing, args.Name)
 		}
 
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	revert.Add(func() { s.Cluster.DeleteInstance(dbInst.Project, dbInst.Name) })
-
-	args = db.InstanceToArgs(&dbInst)
-	inst, err := Create(s, args, volumeConfig, revert)
+	revert.Add(func() { _ = s.DB.Cluster.DeleteInstance(dbInst.Project, dbInst.Name) })
+	inst, cleanup, err := Create(s, args, *p)
 	if err != nil {
-		logger.Error("Failed initialising instance", log.Ctx{"project": args.Project, "instance": args.Name, "type": args.Type, "err": err})
-		return nil, nil, fmt.Errorf("Failed initialising instance: %w", err)
+		logger.Error("Failed initialising instance", logger.Ctx{"project": args.Project, "instance": args.Name, "type": args.Type, "err": err})
+		return nil, nil, nil, fmt.Errorf("Failed initialising instance: %w", err)
 	}
+
+	revert.Add(cleanup)
 
 	// Wipe any existing log for this instance name.
 	if clearLogDir {
-		os.RemoveAll(inst.LogPath())
+		_ = os.RemoveAll(inst.LogPath())
 	}
 
-	return inst, op, nil
+	cleanup = revert.Clone().Fail
+	revert.Success()
+	return inst, op, cleanup, err
 }
 
 // NextSnapshotName finds the next snapshot for an instance.
@@ -1118,7 +1137,7 @@ func NextSnapshotName(s *state.State, inst Instance, defaultPattern string) (str
 	if count > 1 {
 		return "", fmt.Errorf("Snapshot pattern may contain '%%d' only once")
 	} else if count == 1 {
-		i := s.Cluster.GetNextInstanceSnapshotIndex(inst.Project(), inst.Name(), pattern)
+		i := s.DB.Cluster.GetNextInstanceSnapshotIndex(inst.Project().Name, inst.Name(), pattern)
 		return strings.Replace(pattern, "%d", strconv.Itoa(i), 1), nil
 	}
 
@@ -1130,7 +1149,7 @@ func NextSnapshotName(s *state.State, inst Instance, defaultPattern string) (str
 	}
 
 	for _, snap := range snapshots {
-		_, snapOnlyName, _ := shared.InstanceGetParentAndSnapshotName(snap.Name())
+		_, snapOnlyName, _ := api.GetParentAndSnapshotName(snap.Name())
 		if snapOnlyName == pattern {
 			snapshotExists = true
 			break
@@ -1140,7 +1159,7 @@ func NextSnapshotName(s *state.State, inst Instance, defaultPattern string) (str
 	// Append '-0', '-1', etc. if the actual pattern/snapshot name already exists
 	if snapshotExists {
 		pattern = fmt.Sprintf("%s-%%d", pattern)
-		i := s.Cluster.GetNextInstanceSnapshotIndex(inst.Project(), inst.Name(), pattern)
+		i := s.DB.Cluster.GetNextInstanceSnapshotIndex(inst.Project().Name, inst.Name(), pattern)
 		return strings.Replace(pattern, "%d", strconv.Itoa(i), 1), nil
 	}
 
@@ -1150,15 +1169,25 @@ func NextSnapshotName(s *state.State, inst Instance, defaultPattern string) (str
 // MoveTemporaryName returns a name derived from the instance's volatile.uuid, to use when moving an instance
 // across pools or cluster members which can be used for the naming the temporary copy before deleting the original
 // instance and renaming the copy to the original name.
-func MoveTemporaryName(inst Instance) string {
-	return fmt.Sprintf("lxd-move-of-%s", inst.LocalConfig()["volatile.uuid"])
+// If volatile.uuid is not set, a new UUID is generated and stored in the instance's config.
+func MoveTemporaryName(inst Instance) (string, error) {
+	instUUID := inst.LocalConfig()["volatile.uuid"]
+	if instUUID == "" {
+		instUUID = uuid.New()
+		err := inst.VolatileSet(map[string]string{"volatile.uuid": instUUID})
+		if err != nil {
+			return "", fmt.Errorf("Failed generating instance UUID: %w", err)
+		}
+	}
+
+	return fmt.Sprintf("lxd-move-of-%s", instUUID), nil
 }
 
 // IsSameLogicalInstance returns true if the supplied Instance and db.Instance have the same project and name or
 // if they have the same volatile.uuid values.
-func IsSameLogicalInstance(inst Instance, dbInst *db.Instance) bool {
+func IsSameLogicalInstance(inst Instance, dbInst *db.InstanceArgs) bool {
 	// Instance name is unique within a project.
-	if dbInst.Project == inst.Project() && dbInst.Name == inst.Name() {
+	if dbInst.Project == inst.Project().Name && dbInst.Name == inst.Name() {
 		return true
 	}
 
@@ -1170,73 +1199,4 @@ func IsSameLogicalInstance(inst Instance, dbInst *db.Instance) bool {
 	}
 
 	return false
-}
-
-// RuntimeLiblxcVersionAtLeast checks if the system's liblxc matches the
-// provided version requirement
-func RuntimeLiblxcVersionAtLeast(version string, major int, minor int, micro int) bool {
-	version = strings.Replace(version, " (devel)", "-devel", 1)
-	parts := strings.Split(version, ".")
-	partsLen := len(parts)
-	if partsLen == 0 {
-		return false
-	}
-
-	develParts := strings.Split(parts[partsLen-1], "-")
-	if len(develParts) == 2 && develParts[1] == "devel" {
-		return true
-	}
-
-	maj := -1
-	min := -1
-	mic := -1
-
-	for i, v := range parts {
-		if i > 2 {
-			break
-		}
-
-		num, err := strconv.Atoi(v)
-		if err != nil {
-			return false
-		}
-
-		switch i {
-		case 0:
-			maj = num
-		case 1:
-			min = num
-		case 2:
-			mic = num
-		}
-	}
-
-	/* Major version is greater. */
-	if maj > major {
-		return true
-	}
-
-	if maj < major {
-		return false
-	}
-
-	/* Minor number is greater.*/
-	if min > minor {
-		return true
-	}
-
-	if min < minor {
-		return false
-	}
-
-	/* Patch number is greater. */
-	if mic > micro {
-		return true
-	}
-
-	if mic < micro {
-		return false
-	}
-
-	return true
 }

@@ -1,12 +1,11 @@
 //go:build linux && cgo
-// +build linux,cgo
 
 package seccomp
 
 import (
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path"
@@ -14,21 +13,21 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 
+	liblxc "github.com/lxc/go-lxc"
 	"golang.org/x/sys/unix"
-	log "gopkg.in/inconshreveable/log15.v2"
-	liblxc "gopkg.in/lxc/go-lxc.v2"
 
-	// Used by cgo
-	_ "github.com/lxc/lxd/lxd/include"
-
+	"github.com/lxc/lxd/lxd/cgroup"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
+	_ "github.com/lxc/lxd/lxd/include" // Used by cgo
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/lxd/ucred"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/idmap"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/netutils"
@@ -75,6 +74,7 @@ struct seccomp_notify_proxy_msg {
 	// followed by: seccomp_notif, seccomp_notif_resp, cookie
 };
 
+#define LXD_SCHED_PARAM_SIZE (sizeof(struct sched_param))
 #define SECCOMP_PROXY_MSG_SIZE (sizeof(struct seccomp_notify_proxy_msg))
 #define SECCOMP_NOTIFY_SIZE (sizeof(struct seccomp_notif))
 #define SECCOMP_RESPONSE_SIZE (sizeof(struct seccomp_notif_resp))
@@ -129,6 +129,8 @@ struct lxd_seccomp_data_arch {
 	int nr_setxattr;
 	int nr_mount;
 	int nr_bpf;
+	int nr_sched_setscheduler;
+	int nr_sysinfo;
 };
 
 #define LXD_SECCOMP_NOTIFY_MKNOD    0
@@ -136,66 +138,68 @@ struct lxd_seccomp_data_arch {
 #define LXD_SECCOMP_NOTIFY_SETXATTR 2
 #define LXD_SECCOMP_NOTIFY_MOUNT 3
 #define LXD_SECCOMP_NOTIFY_BPF 4
+#define LXD_SECCOMP_NOTIFY_SCHED_SETSCHEDULER 5
+#define LXD_SECCOMP_NOTIFY_SYSINFO 6
 
 // ordered by likelihood of usage...
 static const struct lxd_seccomp_data_arch seccomp_notify_syscall_table[] = {
-	{ -1, LXD_SECCOMP_NOTIFY_MKNOD, LXD_SECCOMP_NOTIFY_MKNODAT, LXD_SECCOMP_NOTIFY_SETXATTR, LXD_SECCOMP_NOTIFY_MOUNT, LXD_SECCOMP_NOTIFY_BPF },
+	{ -1, LXD_SECCOMP_NOTIFY_MKNOD, LXD_SECCOMP_NOTIFY_MKNODAT, LXD_SECCOMP_NOTIFY_SETXATTR, LXD_SECCOMP_NOTIFY_MOUNT, LXD_SECCOMP_NOTIFY_BPF, LXD_SECCOMP_NOTIFY_SCHED_SETSCHEDULER, LXD_SECCOMP_NOTIFY_SYSINFO},
 #ifdef AUDIT_ARCH_X86_64
-	{ AUDIT_ARCH_X86_64,      133, 259, 188, 165, 321 },
+	{ AUDIT_ARCH_X86_64,      133, 259, 188, 165, 321, 144, 99 },
 #endif
 #ifdef AUDIT_ARCH_I386
-	{ AUDIT_ARCH_I386,         14, 297, 226,  21, 357 },
+	{ AUDIT_ARCH_I386,         14, 297, 226,  21, 357, 156, 116 },
 #endif
 #ifdef AUDIT_ARCH_AARCH64
-	{ AUDIT_ARCH_AARCH64,      -1,  33,   5,  21, 386 },
+	{ AUDIT_ARCH_AARCH64,      -1,  33,   5,  21, 386, 156, 179 },
 #endif
 #ifdef AUDIT_ARCH_ARM
-	{ AUDIT_ARCH_ARM,          14, 324, 226,  21, 386 },
+	{ AUDIT_ARCH_ARM,          14, 324, 226,  21, 386, 156, 116 },
 #endif
 #ifdef AUDIT_ARCH_ARMEB
-	{ AUDIT_ARCH_ARMEB,        14, 324, 226,  21, 386 },
+	{ AUDIT_ARCH_ARMEB,        14, 324, 226,  21, 386, 156, 116 },
 #endif
 #ifdef AUDIT_ARCH_S390
-	{ AUDIT_ARCH_S390,         14, 290, 224,  21, 386 },
+	{ AUDIT_ARCH_S390,         14, 290, 224,  21, 386, 156, 116 },
 #endif
 #ifdef AUDIT_ARCH_S390X
-	{ AUDIT_ARCH_S390X,        14, 290, 224,  21, 351 },
+	{ AUDIT_ARCH_S390X,        14, 290, 224,  21, 351, 156, 116 },
 #endif
 #ifdef AUDIT_ARCH_PPC
-	{ AUDIT_ARCH_PPC,          14, 288, 209,  21, 361 },
+	{ AUDIT_ARCH_PPC,          14, 288, 209,  21, 361, 156, 116 },
 #endif
 #ifdef AUDIT_ARCH_PPC64
-	{ AUDIT_ARCH_PPC64,        14, 288, 209,  21, 361 },
+	{ AUDIT_ARCH_PPC64,        14, 288, 209,  21, 361, 156, 116 },
 #endif
 #ifdef AUDIT_ARCH_PPC64LE
-	{ AUDIT_ARCH_PPC64LE,      14, 288, 209,  21, 361 },
+	{ AUDIT_ARCH_PPC64LE,      14, 288, 209,  21, 361, 156, 116 },
 #endif
 #ifdef AUDIT_ARCH_RISCV64
-	{ AUDIT_ARCH_RISCV64,      -1,  33,   5,  40, 280 },
+	{ AUDIT_ARCH_RISCV64,      -1,  33,   5,  40, 280, -1, 179 },
 #endif
 #ifdef AUDIT_ARCH_SPARC
-	{ AUDIT_ARCH_SPARC,        14, 286, 169, 167, 349 },
+	{ AUDIT_ARCH_SPARC,        14, 286, 169, 167, 349, 243, 214 },
 #endif
 #ifdef AUDIT_ARCH_SPARC64
-	{ AUDIT_ARCH_SPARC64,      14, 286, 169, 167, 349 },
+	{ AUDIT_ARCH_SPARC64,      14, 286, 169, 167, 349, 243, 214 },
 #endif
 #ifdef AUDIT_ARCH_MIPS
-	{ AUDIT_ARCH_MIPS,         14, 290, 224,  21,  -1 },
+	{ AUDIT_ARCH_MIPS,         14, 290, 224,  21,  -1, 141, 4116 },
 #endif
 #ifdef AUDIT_ARCH_MIPSEL
-	{ AUDIT_ARCH_MIPSEL,       14, 290, 224,  21,  -1 },
+	{ AUDIT_ARCH_MIPSEL,       14, 290, 224,  21,  -1, 141, 4116 },
 #endif
 #ifdef AUDIT_ARCH_MIPS64
-	{ AUDIT_ARCH_MIPS64,      131, 249, 180, 160,  -1 },
+	{ AUDIT_ARCH_MIPS64,      131, 249, 180, 160,  -1, 141, 5097 },
 #endif
 #ifdef AUDIT_ARCH_MIPS64N32
-	{ AUDIT_ARCH_MIPS64N32,   131, 253, 180, 160,  -1 },
+	{ AUDIT_ARCH_MIPS64N32,   131, 253, 180, 160,  -1, 141, 4116 },
 #endif
 #ifdef AUDIT_ARCH_MIPSEL64
-	{ AUDIT_ARCH_MIPSEL64,    131, 249, 180, 160,  -1 },
+	{ AUDIT_ARCH_MIPSEL64,    131, 249, 180, 160,  -1, 141, 5097 },
 #endif
 #ifdef AUDIT_ARCH_MIPSEL64N32
-	{ AUDIT_ARCH_MIPSEL64N32, 131, 253, 180, 160,  -1 },
+	{ AUDIT_ARCH_MIPSEL64N32, 131, 253, 180, 160,  -1, 141, 4116 },
 #endif
 };
 
@@ -229,6 +233,12 @@ static int seccomp_notify_get_syscall(struct seccomp_notif *req,
 
 		if (entry->nr_bpf == req->data.nr)
 			return LXD_SECCOMP_NOTIFY_BPF;
+
+		if (entry->nr_sched_setscheduler == req->data.nr)
+			return LXD_SECCOMP_NOTIFY_SCHED_SETSCHEDULER;
+
+		if (entry->nr_sysinfo == req->data.nr)
+			return LXD_SECCOMP_NOTIFY_SYSINFO;
 
 		break;
 	}
@@ -326,7 +336,7 @@ static int handle_bpf_syscall(pid_t pid_target, int notify_fd, int mem_fd,
 
 	*bpf_prog_type = attr.prog_type;
 
-	pidfd = pidfd_open(tgid, 0);
+	pidfd = lxd_pidfd_open(tgid, 0);
 	if (pidfd < 0)
 		return -errno;
 
@@ -470,6 +480,8 @@ const lxdSeccompNotifyMknodat = C.LXD_SECCOMP_NOTIFY_MKNODAT
 const lxdSeccompNotifySetxattr = C.LXD_SECCOMP_NOTIFY_SETXATTR
 const lxdSeccompNotifyMount = C.LXD_SECCOMP_NOTIFY_MOUNT
 const lxdSeccompNotifyBpf = C.LXD_SECCOMP_NOTIFY_BPF
+const lxdSeccompNotifySchedSetscheduler = C.LXD_SECCOMP_NOTIFY_SCHED_SETSCHEDULER
+const lxdSeccompNotifySysinfo = C.LXD_SECCOMP_NOTIFY_SYSINFO
 
 const seccompHeader = `2
 `
@@ -495,6 +507,12 @@ mknodat notify [2,8192,SCMP_CMP_MASKED_EQ,61440]
 mknodat notify [2,24576,SCMP_CMP_MASKED_EQ,61440]
 `
 const seccompNotifySetxattr = `setxattr notify [3,1,SCMP_CMP_EQ]
+`
+
+const seccompNotifySchedSetscheduler = `sched_setscheduler notify
+`
+
+const seccompNotifySysinfo = `sysinfo notify
 `
 
 const seccompBlockNewMountAPI = `fsopen errno 38
@@ -588,11 +606,12 @@ stub_x32_execveat errno 38
 // This is used rather than instance.Instance to avoid import loops.
 type Instance interface {
 	Name() string
-	Project() string
+	Project() api.Project
 	ExpandedConfig() map[string]string
 	IsPrivileged() bool
 	Architecture() int
 	RootfsPath() string
+	CGroup() (*cgroup.CGroup, error)
 	CurrentIdmap() (*idmap.IdmapSet, error)
 	DiskIdmap() (*idmap.IdmapSet, error)
 	IdmappedStorage(path string) idmap.IdmapStorageType
@@ -603,7 +622,7 @@ var seccompPath = shared.VarPath("security", "seccomp")
 
 // ProfilePath returns the seccomp path for the instance.
 func ProfilePath(c Instance) string {
-	return path.Join(seccompPath, project.Instance(c.Project(), c.Name()))
+	return path.Join(seccompPath, project.Instance(c.Project().Name, c.Name()))
 }
 
 // InstanceNeedsPolicy returns whether the instance needs a policy or not.
@@ -631,7 +650,9 @@ func InstanceNeedsPolicy(c Instance) bool {
 		"security.syscalls.deny_compat",
 		"security.syscalls.blacklist_compat",
 		"security.syscalls.intercept.mknod",
+		"security.syscalls.intercept.sched_setscheduler",
 		"security.syscalls.intercept.setxattr",
+		"security.syscalls.intercept.sysinfo",
 		"security.syscalls.intercept.mount",
 		"security.syscalls.intercept.bpf",
 	}
@@ -647,6 +668,7 @@ func InstanceNeedsPolicy(c Instance) bool {
 	if !ok {
 		value, ok = config["security.syscalls.blacklist_default"]
 	}
+
 	if !ok || shared.IsTrue(value) {
 		return true
 	}
@@ -669,10 +691,12 @@ func InstanceNeedsIntercept(s *state.State, c Instance) (bool, error) {
 	config := c.ExpandedConfig()
 
 	var keys = map[string]func(state *state.State) error{
-		"security.syscalls.intercept.mknod":    lxcSupportSeccompNotify,
-		"security.syscalls.intercept.setxattr": lxcSupportSeccompNotify,
-		"security.syscalls.intercept.mount":    lxcSupportSeccompNotifyContinue,
-		"security.syscalls.intercept.bpf":      lxcSupportSeccompNotifyAddfd,
+		"security.syscalls.intercept.mknod":              lxcSupportSeccompNotify,
+		"security.syscalls.intercept.sched_setscheduler": lxcSupportSeccompNotify,
+		"security.syscalls.intercept.setxattr":           lxcSupportSeccompNotify,
+		"security.syscalls.intercept.sysinfo":            lxcSupportSeccompNotify,
+		"security.syscalls.intercept.mount":              lxcSupportSeccompNotifyContinue,
+		"security.syscalls.intercept.bpf":                lxcSupportSeccompNotifyAddfd,
 	}
 
 	needed := false
@@ -721,12 +745,14 @@ func seccompGetPolicyContent(s *state.State, c Instance) (string, error) {
 	if allowlist == "" {
 		allowlist = config["security.syscalls.whitelist"]
 	}
+
 	if allowlist != "" {
 		if s.OS.LXCFeatures["seccomp_allow_deny_syntax"] {
 			policy += "allowlist\n[all]\n"
 		} else {
 			policy += "whitelist\n[all]\n"
 		}
+
 		policy += allowlist
 	} else {
 		if s.OS.LXCFeatures["seccomp_allow_deny_syntax"] {
@@ -739,6 +765,7 @@ func seccompGetPolicyContent(s *state.State, c Instance) (string, error) {
 		if !ok {
 			defaultFlag, ok = config["security.syscalls.blacklist_default"]
 		}
+
 		if !ok || shared.IsTrue(defaultFlag) {
 			policy += defaultSeccompPolicy
 		}
@@ -759,8 +786,16 @@ func seccompGetPolicyContent(s *state.State, c Instance) (string, error) {
 			policy += seccompNotifyMknod
 		}
 
+		if shared.IsTrue(config["security.syscalls.intercept.sched_setscheduler"]) {
+			policy += seccompNotifySchedSetscheduler
+		}
+
 		if shared.IsTrue(config["security.syscalls.intercept.setxattr"]) {
 			policy += seccompNotifySetxattr
+		}
+
+		if shared.IsTrue(config["security.syscalls.intercept.sysinfo"]) {
+			policy += seccompNotifySysinfo
 		}
 
 		if shared.IsTrue(config["security.syscalls.intercept.mount"]) {
@@ -786,11 +821,13 @@ func seccompGetPolicyContent(s *state.State, c Instance) (string, error) {
 	if !ok {
 		compat = config["security.syscalls.blacklist_compat"]
 	}
+
 	if shared.IsTrue(compat) {
 		arch, err := osarch.ArchitectureName(c.Architecture())
 		if err != nil {
 			return "", err
 		}
+
 		policy += fmt.Sprintf(compatBlockingPolicy, arch)
 	}
 
@@ -798,6 +835,7 @@ func seccompGetPolicyContent(s *state.State, c Instance) (string, error) {
 	if !ok {
 		denylist = config["security.syscalls.blacklist"]
 	}
+
 	if denylist != "" {
 		policy += denylist
 	}
@@ -822,11 +860,12 @@ func CreateProfile(s *state.State, c Instance) error {
 		return err
 	}
 
-	if err := os.MkdirAll(seccompPath, 0700); err != nil {
+	err = os.MkdirAll(seccompPath, 0700)
+	if err != nil {
 		return err
 	}
 
-	return ioutil.WriteFile(ProfilePath(c), []byte(profile), 0600)
+	return os.WriteFile(ProfilePath(c), []byte(profile), 0600)
 }
 
 // DeleteProfile removes a seccomp profile.
@@ -834,7 +873,7 @@ func DeleteProfile(c Instance) {
 	/* similar to AppArmor, if we've never started this container, the
 	 * delete can fail and that's ok.
 	 */
-	os.Remove(ProfilePath(c))
+	_ = os.Remove(ProfilePath(c))
 }
 
 // Server defines a seccomp server.
@@ -897,14 +936,17 @@ func NewSeccompIovec(ucred *unix.Ucred) *Iovec {
 // PutSeccompIovec puts a seccomp iovec.
 func (siov *Iovec) PutSeccompIovec() {
 	if siov.memFd >= 0 {
-		unix.Close(siov.memFd)
+		_ = unix.Close(siov.memFd)
 	}
+
 	if siov.procFd >= 0 {
-		unix.Close(siov.procFd)
+		_ = unix.Close(siov.procFd)
 	}
+
 	if siov.notifyFd >= 0 {
-		unix.Close(siov.notifyFd)
+		_ = unix.Close(siov.notifyFd)
 	}
+
 	C.free(unsafe.Pointer(siov.msg))
 	C.free(unsafe.Pointer(siov.req))
 	C.free(unsafe.Pointer(siov.resp))
@@ -933,6 +975,7 @@ func (siov *Iovec) IsValidSeccompIovec(size uint64) bool {
 		logger.Warnf("Disconnected from seccomp socket after incomplete receive")
 		return false
 	}
+
 	if siov.msg.__reserved != 0 {
 		logger.Warnf("Disconnected from seccomp socket after client sent non-zero reserved field: pid=%v",
 			siov.ucred.Pid)
@@ -974,6 +1017,7 @@ retry:
 			logger.Debugf("Caught EINTR, retrying...")
 			goto retry
 		}
+
 		logger.Debugf("Disconnected from seccomp socket after failed write for process %v: %s", siov.ucred.Pid, err)
 		return fmt.Errorf("Failed to send response to seccomp client %v", siov.ucred.Pid)
 	}
@@ -1048,12 +1092,12 @@ func NewSeccompServer(s *state.State, path string, findPID func(pid int32, state
 					bytes, err := siov.ReceiveSeccompIovec(int(unixFile.Fd()))
 					if err != nil {
 						logger.Debugf("Disconnected from seccomp socket after failed receive: pid=%v, err=%s", ucred.Pid, err)
-						c.Close()
+						_ = c.Close()
 						return
 					}
 
 					if siov.IsValidSeccompIovec(bytes) {
-						go server.HandleValid(int(unixFile.Fd()), siov, findPID)
+						go func() { _ = server.HandleValid(int(unixFile.Fd()), siov, findPID) }()
 					} else {
 						go server.HandleInvalid(int(unixFile.Fd()), siov)
 					}
@@ -1067,7 +1111,7 @@ func NewSeccompServer(s *state.State, path string, findPID func(pid int32, state
 
 // TaskIDs returns the task IDs for a process.
 func TaskIDs(pid int) (int64, int64, int64, int64, error) {
-	status, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 	if err != nil {
 		return -1, -1, -1, -1, err
 	}
@@ -1087,7 +1131,7 @@ func TaskIDs(pid int) (int64, int64, int64, int64, error) {
 
 		if !UIDFound {
 			m := reUID.FindStringSubmatch(line)
-			if m != nil && len(m) > 2 {
+			if len(m) > 2 {
 				// effective uid
 				result, err := strconv.ParseInt(m[2], 10, 64)
 				if err != nil {
@@ -1098,7 +1142,7 @@ func TaskIDs(pid int) (int64, int64, int64, int64, error) {
 				UIDFound = true
 			}
 
-			if m != nil && len(m) > 4 {
+			if len(m) > 4 {
 				// fsuid
 				result, err := strconv.ParseInt(m[4], 10, 64)
 				if err != nil {
@@ -1113,7 +1157,7 @@ func TaskIDs(pid int) (int64, int64, int64, int64, error) {
 
 		if !GIDFound {
 			m := reGID.FindStringSubmatch(line)
-			if m != nil && len(m) > 2 {
+			if len(m) > 2 {
 				// effective gid
 				result, err := strconv.ParseInt(m[2], 10, 64)
 				if err != nil {
@@ -1124,7 +1168,7 @@ func TaskIDs(pid int) (int64, int64, int64, int64, error) {
 				GIDFound = true
 			}
 
-			if m != nil && len(m) > 4 {
+			if len(m) > 4 {
 				// fsgid
 				result, err := strconv.ParseInt(m[4], 10, 64)
 				if err != nil {
@@ -1148,9 +1192,10 @@ func FindTGID(procFd int) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+
 	statusFile = os.NewFile(uintptr(fd), "/proc/<pid>/status")
-	status, err := ioutil.ReadAll(statusFile)
-	statusFile.Close()
+	status, err := io.ReadAll(statusFile)
+	_ = statusFile.Close()
 	if err != nil {
 		return -1, err
 	}
@@ -1158,7 +1203,7 @@ func FindTGID(procFd int) (int, error) {
 	reTGID := regexp.MustCompile(`^Tgid:\s+([0-9]+)`)
 	for _, line := range strings.Split(string(status), "\n") {
 		m := reTGID.FindStringSubmatch(line)
-		if m != nil && len(m) > 1 {
+		if len(m) > 1 {
 			result, err := strconv.ParseUint(m[1], 10, 32)
 			if err != nil {
 				return -1, err
@@ -1180,10 +1225,11 @@ func CallForkmknod(c Instance, dev deviceConfig.Device, requestPID int, s *state
 
 	pidFdNr, pidFd := MakePidFd(requestPID, s)
 	if pidFdNr >= 0 {
-		defer pidFd.Close()
+		defer func() { _ = pidFd.Close() }()
 	}
 
 	_, stderr, err := shared.RunCommandSplit(
+		context.TODO(),
 		nil,
 		[]*os.File{pidFd},
 		util.GetExecPath(),
@@ -1252,7 +1298,7 @@ func (s *Server) doDeviceSyscall(c Instance, args *MknodArgs, siov *Iovec) int {
 
 // HandleMknodSyscall handles a mknod syscall.
 func (s *Server) HandleMknodSyscall(c Instance, siov *Iovec) int {
-	ctx := log.Ctx{"container": c.Name(),
+	ctx := logger.Ctx{"container": c.Name(),
 		"project":               c.Project(),
 		"syscall_number":        siov.req.data.nr,
 		"audit_architecture":    siov.req.data.arch,
@@ -1295,6 +1341,7 @@ func (s *Server) HandleMknodSyscall(c Instance, siov *Iovec) int {
 		cPid:  C.pid_t(siov.req.pid),
 		path:  C.GoString(&cPathBuf[0]),
 	}
+
 	ctx["syscall_args"] = &args
 
 	return s.doDeviceSyscall(c, &args, siov)
@@ -1302,7 +1349,7 @@ func (s *Server) HandleMknodSyscall(c Instance, siov *Iovec) int {
 
 // HandleMknodatSyscall handles a mknodat syscall.
 func (s *Server) HandleMknodatSyscall(c Instance, siov *Iovec) int {
-	ctx := log.Ctx{"container": c.Name(),
+	ctx := logger.Ctx{"container": c.Name(),
 		"project":               c.Project(),
 		"syscall_number":        siov.req.data.nr,
 		"audit_architecture":    siov.req.data.arch,
@@ -1360,6 +1407,7 @@ func (s *Server) HandleMknodatSyscall(c Instance, siov *Iovec) int {
 		cPid:  C.pid_t(siov.req.pid),
 		path:  C.GoString(&cPathBuf[0]),
 	}
+
 	ctx["syscall_args"] = &args
 
 	return s.doDeviceSyscall(c, &args, siov)
@@ -1381,7 +1429,7 @@ type SetxattrArgs struct {
 
 // HandleSetxattrSyscall handles setxattr syscalls.
 func (s *Server) HandleSetxattrSyscall(c Instance, siov *Iovec) int {
-	ctx := log.Ctx{"container": c.Name(),
+	ctx := logger.Ctx{"container": c.Name(),
 		"project":               c.Project(),
 		"syscall_number":        siov.req.data.nr,
 		"audit_architecture":    siov.req.data.arch,
@@ -1400,7 +1448,7 @@ func (s *Server) HandleSetxattrSyscall(c Instance, siov *Iovec) int {
 
 	pidFdNr, pidFd := MakePidFd(args.pid, s.s)
 	if pidFdNr >= 0 {
-		defer pidFd.Close()
+		defer func() { _ = pidFd.Close() }()
 	}
 
 	uid, gid, fsuid, fsgid, err := TaskIDs(args.pid)
@@ -1441,6 +1489,7 @@ func (s *Server) HandleSetxattrSyscall(c Instance, siov *Iovec) int {
 
 		return int(-C.EPERM)
 	}
+
 	args.path = C.GoString(&cBuf[0])
 
 	// const char *name
@@ -1455,6 +1504,7 @@ func (s *Server) HandleSetxattrSyscall(c Instance, siov *Iovec) int {
 
 		return int(-C.EPERM)
 	}
+
 	args.name = C.GoString(&cBuf[0])
 
 	// size_t size
@@ -1475,6 +1525,7 @@ func (s *Server) HandleSetxattrSyscall(c Instance, siov *Iovec) int {
 
 		return int(-C.EPERM)
 	}
+
 	args.value = buf
 
 	whiteout := 0
@@ -1487,6 +1538,7 @@ func (s *Server) HandleSetxattrSyscall(c Instance, siov *Iovec) int {
 	}
 
 	_, stderr, err := shared.RunCommandSplit(
+		context.TODO(),
 		nil,
 		[]*os.File{pidFd},
 		util.GetExecPath(),
@@ -1503,7 +1555,7 @@ func (s *Server) HandleSetxattrSyscall(c Instance, siov *Iovec) int {
 		fmt.Sprintf("%d", args.flags),
 		fmt.Sprintf("%d", whiteout),
 		fmt.Sprintf("%d", args.size),
-		fmt.Sprintf("%s", args.value))
+		string(args.value))
 	if err != nil {
 		errno, err := strconv.Atoi(stderr)
 		if err != nil || errno == C.ENOANO {
@@ -1511,6 +1563,303 @@ func (s *Server) HandleSetxattrSyscall(c Instance, siov *Iovec) int {
 		}
 
 		return -errno
+	}
+
+	return 0
+}
+
+// SchedSetschedulerArgs arguments for setxattr.
+type SchedSetschedulerArgs struct {
+	switchPidns   int
+	pidCaller     int
+	pidTarget     int
+	policy        C.int
+	schedPriority C.int
+	nsuid         int64
+	nsgid         int64
+}
+
+// HandleSchedSetschedulerSyscall handles sched_setscheduler syscalls.
+func (s *Server) HandleSchedSetschedulerSyscall(c Instance, siov *Iovec) int {
+	ctx := logger.Ctx{"container": c.Name(),
+		"project":               c.Project(),
+		"syscall_number":        siov.req.data.nr,
+		"audit_architecture":    siov.req.data.arch,
+		"seccomp_notify_id":     siov.req.id,
+		"seccomp_notify_flags":  siov.req.flags,
+		"seccomp_notify_pid":    siov.req.pid,
+		"seccomp_notify_fd":     siov.notifyFd,
+		"seccomp_notify_mem_fd": siov.memFd,
+	}
+
+	defer logger.Debug("Handling sched_setscheduler syscall", ctx)
+
+	args := SchedSetschedulerArgs{}
+	args.pidCaller = int(siov.req.pid)
+
+	pidFdNr, pidFd := MakePidFd(args.pidCaller, s.s)
+	if pidFdNr >= 0 {
+		defer func() { _ = pidFd.Close() }()
+	}
+
+	uid, gid, _, _, err := TaskIDs(args.pidCaller)
+	if err != nil {
+		if s.s.OS.SeccompListenerContinue {
+			ctx["syscall_continue"] = "true"
+			C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+			return 0
+		}
+
+		return int(-C.EPERM)
+	}
+
+	idmapset, err := c.CurrentIdmap()
+	if err != nil {
+		if s.s.OS.SeccompListenerContinue {
+			ctx["syscall_continue"] = "true"
+			C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+			return 0
+		}
+
+		return int(-C.EINVAL)
+	}
+
+	// Only care about userns root for now.
+	args.nsuid, args.nsgid = idmapset.ShiftFromNs(uid, gid)
+	if args.nsuid != 0 || args.nsgid != 0 {
+		if s.s.OS.SeccompListenerContinue {
+			ctx["syscall_continue"] = "true"
+			C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+			return 0
+		}
+
+		return int(-C.EINVAL)
+	}
+
+	// The target pid is only valid in the container's pid namespace as
+	// we're taking it from the raw system call arguments.
+	args.pidTarget = int(siov.req.data.args[0])
+	if args.pidTarget < 0 {
+		if s.s.OS.SeccompListenerContinue {
+			ctx["syscall_continue"] = "true"
+			C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+			return 0
+		}
+
+		return int(-C.EINVAL)
+	}
+
+	// If the caller passed zero they want to change their own attributes.
+	if args.pidTarget == 0 {
+		// This pid is relative to our pid namespace so we need to
+		// inform forksyscall to not switch pid namespaces when
+		// emulating the system call.
+		args.pidTarget = args.pidCaller
+		args.switchPidns = 0
+	} else {
+		// The pid is relative to the container's pid namespace.
+		args.switchPidns = 1
+	}
+
+	// error out if policy < 0
+	if args.policy < 0 {
+		if s.s.OS.SeccompListenerContinue {
+			ctx["syscall_continue"] = "true"
+			C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+			return 0
+		}
+
+		return int(-C.EINVAL)
+	}
+
+	// int policy
+	args.policy = C.int(siov.req.data.args[1])
+
+	schedParamArgs := C.struct_sched_param{}
+	_, err = C.pread(C.int(siov.memFd), unsafe.Pointer(&schedParamArgs), C.LXD_SCHED_PARAM_SIZE, C.off_t(siov.req.data.args[2]))
+	if err != nil {
+		if s.s.OS.SeccompListenerContinue {
+			ctx["syscall_continue"] = "true"
+			C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+			return 0
+		}
+
+		return int(-C.EPERM)
+	}
+
+	args.schedPriority = schedParamArgs.sched_priority
+
+	_, stderr, err := shared.RunCommandSplit(
+		context.TODO(),
+		nil,
+		[]*os.File{pidFd},
+		util.GetExecPath(),
+		"forksyscall",
+		"sched_setscheduler",
+		fmt.Sprintf("%d", args.pidCaller),
+		fmt.Sprintf("%d", pidFdNr),
+		fmt.Sprintf("%d", args.switchPidns),
+		fmt.Sprintf("%d", args.pidTarget),
+		fmt.Sprintf("%d", args.policy),
+		fmt.Sprintf("%d", args.schedPriority),
+	)
+	if err != nil {
+		errno, err := strconv.Atoi(stderr)
+		if err != nil || errno == C.ENOANO {
+			return int(-C.EPERM)
+		}
+
+		return -errno
+	}
+
+	return 0
+}
+
+// HandleSysinfoSyscall handles sysinfo syscalls.
+func (s *Server) HandleSysinfoSyscall(c Instance, siov *Iovec) int {
+	l := logger.AddContext(logger.Log, logger.Ctx{
+		"container":             c.Name(),
+		"project":               c.Project(),
+		"syscall_number":        siov.req.data.nr,
+		"audit_architecture":    siov.req.data.arch,
+		"seccomp_notify_id":     siov.req.id,
+		"seccomp_notify_flags":  siov.req.flags,
+		"seccomp_notify_pid":    siov.req.pid,
+		"seccomp_notify_fd":     siov.notifyFd,
+		"seccomp_notify_mem_fd": siov.memFd,
+	})
+
+	defer l.Debug("Handling sysinfo syscall")
+
+	// Pre-fill sysinfo struct with metrics from host system.
+	info := unix.Sysinfo_t{}
+	err := unix.Sysinfo(&info)
+	if err != nil {
+		l.Warn("Failed getting sysinfo", logger.Ctx{"err": err})
+		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+		return 0
+	}
+
+	instMetrics := Sysinfo{} // Architecture independent place to hold instance metrics.
+
+	cg, err := cgroup.NewFileReadWriter(int(siov.msg.init_pid), liblxc.HasApiExtension("cgroup2"))
+	if err != nil {
+		l.Warn("Failed loading cgroup", logger.Ctx{"err": err, "pid": siov.msg.init_pid})
+		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+		return 0
+	}
+
+	// Get instance uptime.
+	pidStat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", siov.msg.init_pid))
+	if err != nil {
+		l.Warn("Failed getting init process info", logger.Ctx{"err": err, "pid": siov.msg.init_pid})
+		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+		return 0
+	}
+
+	fields := strings.Fields(string(pidStat))
+	tickValue, err := strconv.ParseInt(fields[21], 10, 64)
+	if err != nil {
+		l.Warn("Failed parsing init process info", logger.Ctx{"err": err, "pid": siov.msg.init_pid})
+		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+		return 0
+	}
+
+	age := float64(tickValue / 100)
+	if age > 0 {
+		instMetrics.Uptime = int64(time.Since(s.s.OS.BootTime).Seconds() - age)
+	}
+
+	// Get instance process count.
+	pids, err := cg.GetTotalProcesses()
+	if err != nil {
+		l.Warn("Failed getting process count", logger.Ctx{"err": err})
+		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+		return 0
+	}
+
+	instMetrics.Procs = uint16(pids)
+
+	// Get instance memory stats.
+	memStats, err := cg.GetMemoryStats()
+	if err != nil {
+		l.Warn("Failed getting memory stats", logger.Ctx{"err": err})
+		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+		return 0
+	}
+
+	for k, v := range memStats {
+		switch k {
+		case "shmem":
+			instMetrics.Sharedram = v
+		case "cache":
+			instMetrics.Bufferram = v
+		}
+	}
+
+	// Get instance memory limit.
+	memoryLimit, err := cg.GetEffectiveMemoryLimit()
+	if err != nil {
+		l.Warn("Failed getting effective memory limit", logger.Ctx{"err": err})
+		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+		return 0
+	}
+
+	// Get instance memory usage.
+	memoryUsage, err := cg.GetMemoryUsage()
+	if err != nil {
+		l.Warn("Failed to get memory usage", logger.Ctx{"err": err})
+		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+		return 0
+	}
+
+	instMetrics.Totalram = uint64(memoryLimit)
+	instMetrics.Freeram = instMetrics.Totalram - uint64(memoryUsage) - instMetrics.Bufferram
+
+	// Get instance swap info.
+	if s.s.OS.CGInfo.Supports(cgroup.MemorySwapUsage, cg) {
+		swapLimit, err := cg.GetMemorySwapLimit()
+		if err != nil {
+			l.Warn("Failed getting swap limit", logger.Ctx{"err": err})
+			C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+			return 0
+		}
+
+		swapUsage, err := cg.GetMemorySwapUsage()
+		if err != nil {
+			l.Warn("Failed getting swap usage", logger.Ctx{"err": err})
+			C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+			return 0
+		}
+
+		instMetrics.Totalswap = uint64(swapLimit)
+		instMetrics.Freeswap = instMetrics.Totalswap - uint64(swapUsage)
+	}
+
+	// Get writable pointer to buffer of sysinfo syscall result.
+	const sz = int(unsafe.Sizeof(info))
+	var b []byte = (*(*[sz]byte)(unsafe.Pointer(&info)))[:]
+
+	// Write instance metrics to native sysinfo struct.
+	instMetrics.ToNative(&info)
+
+	// Write sysinfo response into buffer.
+	_, err = unix.Pwrite(siov.memFd, b, int64(siov.req.data.args[0]))
+	if err != nil {
+		l.Warn("Failed writing sysinfo", logger.Ctx{"err": err})
+		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
+
+		return 0
 	}
 
 	return 0
@@ -1577,6 +1926,7 @@ func mountFlagsToOpts(flags C.ulong) string {
 		if (flag == C.MS_BIND) && msRec == C.MS_REC {
 			flag |= msRec
 		}
+
 		optOrArg := mountFlagsToOptMap[flag]
 
 		if optOrArg == "" {
@@ -1584,7 +1934,7 @@ func mountFlagsToOpts(flags C.ulong) string {
 		}
 
 		if opts == "" {
-			opts = fmt.Sprintf("%s", optOrArg)
+			opts = optOrArg
 		} else {
 			opts = fmt.Sprintf("%s,%s", opts, optOrArg)
 		}
@@ -1623,11 +1973,13 @@ func (s *Server) mountHandleHugetlbfsArgs(c Instance, args *MountArgs, nsuid int
 					// If the user specified garbage, let the kernel tell em whats what.
 					return nil
 				}
+
 				uidOpt, _ = idmapset.ShiftIntoNs(n, 0)
 				if uidOpt < 0 {
 					// If the user specified garbage, let the kernel tell em whats what.
 					return nil
 				}
+
 				optStrings[i] = fmt.Sprintf("uid=%d", uidOpt)
 			}
 		} else if strings.HasPrefix(optString, "gid=") {
@@ -1638,11 +1990,13 @@ func (s *Server) mountHandleHugetlbfsArgs(c Instance, args *MountArgs, nsuid int
 					// If the user specified garbage, let the kernel tell em whats what.
 					return nil
 				}
+
 				gidOpt, _ = idmapset.ShiftIntoNs(n, 0)
 				if gidOpt < 0 {
 					// If the user specified garbage, let the kernel tell em whats what.
 					return nil
 				}
+
 				optStrings[i] = fmt.Sprintf("gid=%d", gidOpt)
 			}
 		}
@@ -1663,7 +2017,7 @@ func (s *Server) mountHandleHugetlbfsArgs(c Instance, args *MountArgs, nsuid int
 
 // HandleMountSyscall handles mount syscalls.
 func (s *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
-	ctx := log.Ctx{"container": c.Name(),
+	ctx := logger.Ctx{"container": c.Name(),
 		"project":               c.Project(),
 		"syscall_number":        siov.req.data.nr,
 		"audit_architecture":    siov.req.data.arch,
@@ -1682,7 +2036,7 @@ func (s *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
 
 	pidFdNr, pidFd := MakePidFd(args.pid, s.s)
 	if pidFdNr >= 0 {
-		defer pidFd.Close()
+		defer func() { _ = pidFd.Close() }()
 	}
 
 	mntSource := [unix.PathMax]C.char{}
@@ -1774,6 +2128,7 @@ func (s *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
 		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
 		return 0
 	}
+
 	ctx["host_uid"] = args.uid
 	ctx["host_gid"] = args.gid
 	ctx["host_fsuid"] = args.fsuid
@@ -1814,6 +2169,7 @@ func (s *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
 		ctx["fuse_target"] = args.target
 		ctx["fuse_opts"] = fuseOpts
 		_, _, err = shared.RunCommandSplit(
+			context.TODO(),
 			nil,
 			[]*os.File{pidFd},
 			util.GetExecPath(),
@@ -1826,11 +2182,12 @@ func (s *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
 			fmt.Sprintf("%d", args.gid),
 			fmt.Sprintf("%d", args.fsuid),
 			fmt.Sprintf("%d", args.fsgid),
-			fmt.Sprintf("%s", fuseSource),
-			fmt.Sprintf("%s", args.target),
-			fmt.Sprintf("%s", fuseOpts))
+			fuseSource,
+			args.target,
+			fuseOpts)
 	} else {
 		_, _, err = shared.RunCommandSplit(
+			context.TODO(),
 			nil,
 			[]*os.File{pidFd},
 			util.GetExecPath(),
@@ -1839,9 +2196,9 @@ func (s *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
 			fmt.Sprintf("%d", args.pid),
 			fmt.Sprintf("%d", pidFdNr),
 			fmt.Sprintf("%d", 0),
-			fmt.Sprintf("%s", args.source),
-			fmt.Sprintf("%s", args.target),
-			fmt.Sprintf("%s", args.fstype),
+			args.source,
+			args.target,
+			args.fstype,
 			fmt.Sprintf("%d", args.flags),
 			string(args.idmapType),
 			fmt.Sprintf("%d", args.uid),
@@ -1852,8 +2209,9 @@ func (s *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
 			fmt.Sprintf("%d", args.nsgid),
 			fmt.Sprintf("%d", args.nsfsuid),
 			fmt.Sprintf("%d", args.nsfsgid),
-			fmt.Sprintf("%s", args.data))
+			args.data)
 	}
+
 	if err != nil {
 		ctx["syscall_continue"] = "true"
 		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
@@ -1865,7 +2223,7 @@ func (s *Server) HandleMountSyscall(c Instance, siov *Iovec) int {
 
 // HandleBpfSyscall handles mount syscalls.
 func (s *Server) HandleBpfSyscall(c Instance, siov *Iovec) int {
-	ctx := log.Ctx{"container": c.Name(),
+	ctx := logger.Ctx{"container": c.Name(),
 		"project":               c.Project(),
 		"syscall_number":        siov.req.data.nr,
 		"audit_architecture":    siov.req.data.arch,
@@ -1881,7 +2239,7 @@ func (s *Server) HandleBpfSyscall(c Instance, siov *Iovec) int {
 
 	if shared.IsFalseOrEmpty(c.ExpandedConfig()["security.syscalls.intercept.bpf.devices"]) {
 		ctx["syscall_continue"] = "true"
-		ctx["syscall_handler_reason"] = fmt.Sprintf("No bpf policy specified")
+		ctx["syscall_handler_reason"] = "No bpf policy specified"
 		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
 		return 0
 	}
@@ -1889,7 +2247,7 @@ func (s *Server) HandleBpfSyscall(c Instance, siov *Iovec) int {
 	tgid, err := FindTGID(siov.procFd)
 	if err != nil || tgid == -1 {
 		ctx["syscall_continue"] = "true"
-		ctx["syscall_handler_reason"] = fmt.Sprintf("Could not find thread group leader ID")
+		ctx["syscall_handler_reason"] = "Could not find thread group leader ID"
 		C.seccomp_notify_update_response(siov.resp, 0, C.uint32_t(seccompUserNotifFlagContinue))
 		return 0
 	}
@@ -1934,6 +2292,10 @@ func (s *Server) handleSyscall(c Instance, siov *Iovec) int {
 		return s.HandleMountSyscall(c, siov)
 	case lxdSeccompNotifyBpf:
 		return s.HandleBpfSyscall(c, siov)
+	case lxdSeccompNotifySchedSetscheduler:
+		return s.HandleSchedSetschedulerSyscall(c, siov)
+	case lxdSeccompNotifySysinfo:
+		return s.HandleSysinfoSyscall(c, siov)
 	}
 
 	return int(-C.EINVAL)
@@ -1948,10 +2310,11 @@ func (s *Server) HandleValid(fd int, siov *Iovec, findPID func(pid int32, state 
 	c, err := findPID(int32(siov.msg.monitor_pid), s.s)
 	if err != nil {
 		if s.s.OS.SeccompListenerContinue {
-			siov.SendSeccompIovec(fd, 0, seccompUserNotifFlagContinue)
+			_ = siov.SendSeccompIovec(fd, 0, seccompUserNotifFlagContinue)
 		} else {
-			siov.SendSeccompIovec(fd, int(-C.EPERM), 0)
+			_ = siov.SendSeccompIovec(fd, int(-C.EPERM), 0)
 		}
+
 		logger.Errorf("Failed to find container for monitor %d", siov.msg.monitor_pid)
 		return err
 	}
@@ -1968,7 +2331,7 @@ func (s *Server) HandleValid(fd int, siov *Iovec, findPID func(pid int32, state 
 
 // Stop stops a seccomp server.
 func (s *Server) Stop() error {
-	os.Remove(s.path)
+	_ = os.Remove(s.path)
 	return s.l.Close()
 }
 
@@ -2021,7 +2384,7 @@ func lxcSupportSeccompNotify(state *state.State) error {
 		return fmt.Errorf("LXC doesn't support notify proxy: %w", err)
 	}
 
-	c.Release()
+	_ = c.Release()
 	return nil
 }
 
@@ -2031,14 +2394,11 @@ func MountSyscallFilter(config map[string]string) []string {
 
 	if shared.IsFalseOrEmpty(config["security.syscalls.intercept.mount"]) {
 		return fs
-
 	}
 
 	fsAllowed := strings.Split(config["security.syscalls.intercept.mount.allowed"], ",")
 	if len(fsAllowed) > 0 && fsAllowed[0] != "" {
-		for _, allowedfs := range fsAllowed {
-			fs = append(fs, allowedfs)
-		}
+		fs = append(fs, fsAllowed...)
 	}
 
 	return fs
@@ -2048,7 +2408,6 @@ func MountSyscallFilter(config map[string]string) []string {
 func SyscallInterceptMountFilter(config map[string]string) (map[string]string, error) {
 	if shared.IsFalseOrEmpty(config["security.syscalls.intercept.mount"]) {
 		return map[string]string{}, nil
-
 	}
 
 	fsMap := map[string]string{}
@@ -2087,7 +2446,8 @@ func (s *Server) MountSyscallValid(c Instance, args *MountArgs) (bool, string) {
 		return false, ""
 	}
 
-	if fuse, ok := fsMap[args.fstype]; ok {
+	fuse, ok := fsMap[args.fstype]
+	if ok {
 		return true, fuse
 	}
 

@@ -7,16 +7,17 @@ import (
 	"os"
 	"path/filepath"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/lxd/backup"
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/rsync"
+	"github.com/lxc/lxd/lxd/storage/filesystem"
 	"github.com/lxc/lxd/lxd/storage/quota"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/instancewriter"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/units"
 )
 
@@ -28,12 +29,17 @@ func (d *dir) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.Oper
 	revert := revert.New()
 	defer revert.Fail()
 
+	if shared.PathExists(vol.MountPath()) {
+		return fmt.Errorf("Volume path %q already exists", vol.MountPath())
+	}
+
 	// Create the volume itself.
 	err := vol.EnsureMountPath()
 	if err != nil {
 		return err
 	}
-	revert.Add(func() { os.RemoveAll(volPath) })
+
+	revert.Add(func() { _ = os.RemoveAll(volPath) })
 
 	// Create sparse loopback file if volume is block.
 	rootBlockPath := ""
@@ -43,7 +49,7 @@ func (d *dir) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.Oper
 		if err != nil {
 			return err
 		}
-	} else {
+	} else if vol.volType != VolumeTypeBucket {
 		// Filesystem quotas only used with non-block volume types.
 		revertFunc, err := d.setupInitialQuota(vol)
 		if err != nil {
@@ -56,7 +62,7 @@ func (d *dir) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.Oper
 	}
 
 	// Run the volume filler function if supplied.
-	err = d.runFiller(vol, rootBlockPath, filler)
+	err = d.runFiller(vol, rootBlockPath, filler, false)
 	if err != nil {
 		return err
 	}
@@ -116,6 +122,7 @@ func (d *dir) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcData 
 			if err != nil {
 				return err
 			}
+
 			revert.Add(revertQuota)
 
 			revert.Success()
@@ -129,7 +136,7 @@ func (d *dir) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcData 
 }
 
 // CreateVolumeFromCopy provides same-pool volume copying functionality.
-func (d *dir) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, op *operations.Operation) error {
+func (d *dir) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, allowInconsistent bool, op *operations.Operation) error {
 	var err error
 	var srcSnapshots []Volume
 
@@ -142,7 +149,7 @@ func (d *dir) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool
 	}
 
 	// Run the generic copy.
-	return genericVFSCopyVolume(d, d.setupInitialQuota, vol, srcVol, srcSnapshots, false, op)
+	return genericVFSCopyVolume(d, d.setupInitialQuota, vol, srcVol, srcSnapshots, false, allowInconsistent, op)
 }
 
 // CreateVolumeFromMigration creates a volume being sent via a migration.
@@ -151,8 +158,8 @@ func (d *dir) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, vol
 }
 
 // RefreshVolume provides same-pool volume and specific snapshots syncing functionality.
-func (d *dir) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, op *operations.Operation) error {
-	return genericVFSCopyVolume(d, d.setupInitialQuota, vol, srcVol, srcSnapshots, true, op)
+func (d *dir) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, allowInconsistent bool, op *operations.Operation) error {
+	return genericVFSCopyVolume(d, d.setupInitialQuota, vol, srcVol, srcSnapshots, true, allowInconsistent, op)
 }
 
 // DeleteVolume deletes a volume of the storage device. If any snapshots of the volume remain then
@@ -175,15 +182,17 @@ func (d *dir) DeleteVolume(vol Volume, op *operations.Operation) error {
 	}
 
 	// Get the volume ID for the volume, which is used to remove project quota.
-	volID, err := d.getVolID(vol.volType, vol.name)
-	if err != nil {
-		return err
-	}
+	if vol.Type() != VolumeTypeBucket {
+		volID, err := d.getVolID(vol.volType, vol.name)
+		if err != nil {
+			return err
+		}
 
-	// Remove the project quota.
-	err = d.deleteQuota(volPath, volID)
-	if err != nil {
-		return err
+		// Remove the project quota.
+		err = d.deleteQuota(volPath, volID)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Remove the volume from the storage device.
@@ -207,9 +216,36 @@ func (d *dir) HasVolume(vol Volume) bool {
 	return genericVFSHasVolume(vol)
 }
 
+// FillVolumeConfig populate volume with default config.
+func (d *dir) FillVolumeConfig(vol Volume) error {
+	initialSize := vol.config["size"]
+
+	err := d.fillVolumeConfig(&vol)
+	if err != nil {
+		return err
+	}
+
+	// Buckets do not support default volume size.
+	// If size is specified manually, do not remove, so it triggers validation failure and an error to user.
+	if vol.volType == VolumeTypeBucket && initialSize == "" {
+		delete(vol.config, "size")
+	}
+
+	return nil
+}
+
 // ValidateVolume validates the supplied volume config. Optionally removes invalid keys from the volume's config.
 func (d *dir) ValidateVolume(vol Volume, removeUnknownKeys bool) error {
-	return d.validateVolume(vol, nil, removeUnknownKeys)
+	err := d.validateVolume(vol, nil, removeUnknownKeys)
+	if err != nil {
+		return err
+	}
+
+	if vol.config["size"] != "" && vol.volType == VolumeTypeBucket {
+		return fmt.Errorf("Size cannot be specified for buckets")
+	}
+
+	return nil
 }
 
 // UpdateVolume applies config changes to the volume.
@@ -292,29 +328,31 @@ func (d *dir) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op
 		}
 
 		return nil
-	}
-
-	// For non-VM block volumes, set filesystem quota.
-	volID, err := d.getVolID(vol.volType, vol.name)
-	if err != nil {
-		return err
-	}
-
-	// Custom handling for filesystem volume associated with a VM.
-	volPath := vol.MountPath()
-	if sizeBytes > 0 && vol.volType == VolumeTypeVM && shared.PathExists(filepath.Join(volPath, genericVolumeDiskFile)) {
-		// Get the size of the VM image.
-		blockSize, err := BlockDiskSizeBytes(filepath.Join(volPath, genericVolumeDiskFile))
+	} else if vol.Type() != VolumeTypeBucket {
+		// For non-VM block volumes, set filesystem quota.
+		volID, err := d.getVolID(vol.volType, vol.name)
 		if err != nil {
 			return err
 		}
 
-		// Add that to the requested filesystem size (to ignore it from the quota).
-		sizeBytes += blockSize
-		d.logger.Debug("Accounting for VM image file size", "sizeBytes", sizeBytes)
+		// Custom handling for filesystem volume associated with a VM.
+		volPath := vol.MountPath()
+		if sizeBytes > 0 && vol.volType == VolumeTypeVM && shared.PathExists(filepath.Join(volPath, genericVolumeDiskFile)) {
+			// Get the size of the VM image.
+			blockSize, err := BlockDiskSizeBytes(filepath.Join(volPath, genericVolumeDiskFile))
+			if err != nil {
+				return err
+			}
+
+			// Add that to the requested filesystem size (to ignore it from the quota).
+			sizeBytes += blockSize
+			d.logger.Debug("Accounting for VM image file size", logger.Ctx{"sizeBytes": sizeBytes})
+		}
+
+		return d.setQuota(vol.MountPath(), volID, sizeBytes)
 	}
 
-	return d.setQuota(vol.MountPath(), volID, sizeBytes)
+	return nil
 }
 
 // GetVolumeDiskPath returns the location of a disk volume.
@@ -353,7 +391,7 @@ func (d *dir) UnmountVolume(vol Volume, keepBlockDev bool, op *operations.Operat
 
 	refCount := vol.MountRefCountDecrement()
 	if refCount > 0 {
-		d.logger.Debug("Skipping unmount as in use", log.Ctx{"volName": vol.name, "refCount": refCount})
+		d.logger.Debug("Skipping unmount as in use", logger.Ctx{"volName": vol.name, "refCount": refCount})
 		return false, ErrInUse
 	}
 
@@ -378,38 +416,64 @@ func (d *dir) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWrit
 
 // CreateVolumeSnapshot creates a snapshot of a volume.
 func (d *dir) CreateVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
-	parentName, _, _ := shared.InstanceGetParentAndSnapshotName(snapVol.name)
-	srcPath := GetVolumeMountPath(d.name, snapVol.volType, parentName)
-	snapPath := snapVol.MountPath()
-
-	// Create the parent directory.
-	err := createParentSnapshotDirIfMissing(d.name, snapVol.volType, parentName)
-	if err != nil {
-		return err
-	}
+	parentName, _, _ := api.GetParentAndSnapshotName(snapVol.name)
 
 	// Create snapshot directory.
-	err = snapVol.EnsureMountPath()
+	err := snapVol.EnsureMountPath()
 	if err != nil {
 		return err
 	}
 
-	revertPath := true
-	defer func() {
-		if revertPath {
-			os.RemoveAll(snapPath)
+	revert := revert.New()
+	defer revert.Fail()
+
+	snapPath := snapVol.MountPath()
+	revert.Add(func() { _ = os.RemoveAll(snapPath) })
+
+	if snapVol.contentType != ContentTypeBlock || snapVol.volType != VolumeTypeCustom {
+		var rsyncArgs []string
+
+		if snapVol.IsVMBlock() {
+			rsyncArgs = append(rsyncArgs, "--exclude", genericVolumeDiskFile)
 		}
-	}()
 
-	bwlimit := d.config["rsync.bwlimit"]
+		bwlimit := d.config["rsync.bwlimit"]
+		srcPath := GetVolumeMountPath(d.name, snapVol.volType, parentName)
+		d.Logger().Debug("Copying fileystem volume", logger.Ctx{"sourcePath": srcPath, "targetPath": snapPath, "bwlimit": bwlimit, "rsyncArgs": rsyncArgs})
 
-	// Copy volume into snapshot directory.
-	_, err = rsync.LocalCopy(srcPath, snapPath, bwlimit, true)
-	if err != nil {
-		return err
+		// Copy filesystem volume into snapshot directory.
+		_, err = rsync.LocalCopy(srcPath, snapPath, bwlimit, true, rsyncArgs...)
+		if err != nil {
+			return err
+		}
 	}
 
-	revertPath = false
+	if snapVol.IsVMBlock() || (snapVol.contentType == ContentTypeBlock && snapVol.volType == VolumeTypeCustom) {
+		parentVol := NewVolume(d, d.name, snapVol.volType, snapVol.contentType, parentName, nil, d.config)
+		srcDevPath, err := d.GetVolumeDiskPath(parentVol)
+		if err != nil {
+			return err
+		}
+
+		targetDevPath, err := d.GetVolumeDiskPath(snapVol)
+		if err != nil {
+			return err
+		}
+
+		d.Logger().Debug("Copying block volume", logger.Ctx{"srcDevPath": srcDevPath, "targetPath": targetDevPath})
+
+		err = ensureSparseFile(targetDevPath, 0)
+		if err != nil {
+			return err
+		}
+
+		err = copyDevice(srcDevPath, targetDevPath)
+		if err != nil {
+			return err
+		}
+	}
+
+	revert.Success()
 	return nil
 }
 
@@ -424,7 +488,7 @@ func (d *dir) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) err
 		return fmt.Errorf("Failed to remove '%s': %w", snapPath, err)
 	}
 
-	parentName, _, _ := shared.InstanceGetParentAndSnapshotName(snapVol.name)
+	parentName, _, _ := api.GetParentAndSnapshotName(snapVol.name)
 
 	// Remove the parent snapshot directory if this is the last snapshot being removed.
 	err = deleteParentSnapshotDirIfEmpty(d.name, snapVol.volType, parentName)
@@ -436,7 +500,7 @@ func (d *dir) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) err
 }
 
 // MountVolumeSnapshot sets up a read-only mount on top of the snapshot to avoid accidental modifications.
-func (d *dir) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
+func (d *dir) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
 	unlock := snapVol.MountLock()
 	defer unlock()
 
@@ -447,11 +511,17 @@ func (d *dir) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (boo
 	if !shared.PathExists(snapPath) || snapVol.volType != VolumeTypeCustom {
 		err := snapVol.EnsureMountPath()
 		if err != nil {
-			return false, err
+			return err
 		}
 	}
 
-	return mountReadOnly(snapPath, snapPath)
+	_, err := mountReadOnly(snapPath, snapPath)
+	if err != nil {
+		return err
+	}
+
+	snapVol.MountRefCountIncrement() // From here on it is up to caller to call UnmountVolumeSnapshot() when done.
+	return nil
 }
 
 // UnmountVolumeSnapshot removes the read-only mount placed on top of a snapshot.
@@ -459,8 +529,21 @@ func (d *dir) UnmountVolumeSnapshot(snapVol Volume, op *operations.Operation) (b
 	unlock := snapVol.MountLock()
 	defer unlock()
 
-	snapPath := snapVol.MountPath()
-	return forceUnmount(snapPath)
+	mountPath := snapVol.MountPath()
+
+	refCount := snapVol.MountRefCountDecrement()
+
+	if filesystem.IsMountPoint(mountPath) {
+		if refCount > 0 {
+			d.logger.Debug("Skipping unmount as in use", logger.Ctx{"volName": snapVol.name, "refCount": refCount})
+			return false, ErrInUse
+		}
+
+		snapPath := snapVol.MountPath()
+		return forceUnmount(snapPath)
+	}
+
+	return false, nil
 }
 
 // VolumeSnapshots returns a list of snapshots for the volume (in no particular order).
@@ -470,18 +553,56 @@ func (d *dir) VolumeSnapshots(vol Volume, op *operations.Operation) ([]string, e
 
 // RestoreVolume restores a volume from a snapshot.
 func (d *dir) RestoreVolume(vol Volume, snapshotName string, op *operations.Operation) error {
-	srcPath := GetVolumeMountPath(d.name, vol.volType, GetSnapshotVolumeName(vol.name, snapshotName))
+	snapVol, err := vol.NewSnapshot(snapshotName)
+	if err != nil {
+		return err
+	}
+
+	srcPath := snapVol.MountPath()
 	if !shared.PathExists(srcPath) {
 		return fmt.Errorf("Snapshot not found")
 	}
 
 	volPath := vol.MountPath()
 
-	// Restore using rsync.
-	bwlimit := d.config["rsync.bwlimit"]
-	_, err := rsync.LocalCopy(srcPath, volPath, bwlimit, true)
-	if err != nil {
-		return fmt.Errorf("Failed to rsync volume: %w", err)
+	// Restore filesystem volume.
+	if vol.contentType != ContentTypeBlock || vol.volType != VolumeTypeCustom {
+		var rsyncArgs []string
+
+		if vol.IsVMBlock() {
+			rsyncArgs = append(rsyncArgs, "--exclude", genericVolumeDiskFile)
+		}
+
+		bwlimit := d.config["rsync.bwlimit"]
+		_, err := rsync.LocalCopy(srcPath, volPath, bwlimit, true, rsyncArgs...)
+		if err != nil {
+			return fmt.Errorf("Failed to rsync volume: %w", err)
+		}
+	}
+
+	// Restore block volume.
+	if vol.IsVMBlock() || (vol.contentType == ContentTypeBlock && vol.volType == VolumeTypeCustom) {
+		srcDevPath, err := d.GetVolumeDiskPath(snapVol)
+		if err != nil {
+			return err
+		}
+
+		targetDevPath, err := d.GetVolumeDiskPath(vol)
+		if err != nil {
+			return err
+		}
+
+		d.Logger().Debug("Restoring block volume", logger.Ctx{"srcDevPath": srcDevPath, "targetPath": targetDevPath})
+
+		err = ensureSparseFile(targetDevPath, 0)
+		if err != nil {
+			return err
+		}
+
+		err = copyDevice(srcDevPath, targetDevPath)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

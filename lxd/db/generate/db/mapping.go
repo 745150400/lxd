@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"go/ast"
 	"net/url"
 	"strings"
 
@@ -70,6 +71,19 @@ func (m *Mapping) Identifier() *Field {
 	return nil
 }
 
+// TableName determines the table associated to the struct.
+// - Individual fields may bypass this with their own `sql=<table>.<column>` tags.
+// - The override `table=<name>` directive key is checked first.
+// - The struct name itself is used to approximate the table name if none of the above apply.
+func (m *Mapping) TableName(entity string, override string) string {
+	table := entityTable(entity, override)
+	if m.Type == ReferenceTable || m.Type == MapTable {
+		table = "%s_" + table
+	}
+
+	return table
+}
+
 // ContainsFields checks that the mapping contains fields with the same type
 // and name of given ones.
 func (m *Mapping) ContainsFields(fields []*Field) bool {
@@ -102,7 +116,8 @@ func (m *Mapping) ActiveFilters(kind string) []*Field {
 	names := activeFilters(kind)
 	fields := []*Field{}
 	for _, name := range names {
-		if field := m.FieldByName(name); field != nil {
+		field := m.FieldByName(name)
+		if field != nil {
 			fields = append(fields, field)
 		}
 	}
@@ -124,6 +139,7 @@ func (m *Mapping) FilterFieldByName(name string) (*Field, error) {
 			if filter.Type.Code != TypeColumn {
 				return nil, fmt.Errorf("Unknown filter %q not a column", name)
 			}
+
 			return filter, nil
 		}
 	}
@@ -140,6 +156,7 @@ func (m *Mapping) ColumnFields(exclude ...string) []*Field {
 		if shared.StringInSlice(field.Name, exclude) {
 			continue
 		}
+
 		if field.Type.Code == TypeColumn {
 			fields = append(fields, field)
 		}
@@ -186,13 +203,12 @@ func (m *Mapping) FieldArgs(fields []*Field, extra ...string) string {
 		if name == "type" {
 			name = lex.Minuscule(m.Name) + field.Name
 		}
+
 		arg := fmt.Sprintf("%s %s", name, field.Type.Name)
 		args = append(args, arg)
 	}
 
-	for _, arg := range extra {
-		args = append(args, arg)
-	}
+	args = append(args, extra...)
 
 	return strings.Join(args, ", ")
 }
@@ -206,6 +222,7 @@ func (m *Mapping) FieldParams(fields []*Field) string {
 		if name == "type" {
 			name = lex.Minuscule(m.Name) + field.Name
 		}
+
 		args[i] = name
 	}
 
@@ -235,7 +252,7 @@ func (f *Field) Stmt() string {
 
 // IsScalar returns true if the field is a scalar column value from a joined table.
 func (f *Field) IsScalar() bool {
-	return f.Config.Get("join") != "" || f.Config.Get("leftjoin") != ""
+	return f.JoinConfig() != ""
 }
 
 // IsIndirect returns true if the field is a scalar column value from a joined
@@ -258,16 +275,250 @@ func (f *Field) Column() string {
 
 	column := lex.Snake(f.Name)
 
-	join := f.Config.Get("join")
-	if join == "" {
-		join = f.Config.Get("leftjoin")
-	}
-
+	join := f.JoinConfig()
 	if join != "" {
 		column = fmt.Sprintf("%s AS %s", join, column)
 	}
 
 	return column
+}
+
+// SelectColumn returns a column name suitable for use with 'SELECT' statements.
+// - Applies a `coalesce()` function if the 'coalesce' tag is present.
+// - Returns the column in the form '<joinTable>.<joinColumn> AS <column>' if the `join` tag is present.
+func (f *Field) SelectColumn(mapping *Mapping, primaryTable string) (string, error) {
+	// ReferenceTable and MapTable require specific fields, so parse those instead of checking tags.
+	if mapping.Type == ReferenceTable || mapping.Type == MapTable {
+		table := primaryTable
+		column := fmt.Sprintf("%s.%s", table, lex.Snake(f.Name))
+		column = strings.Replace(column, "reference", "%s", -1)
+
+		return column, nil
+	}
+
+	tableName, columnName, err := f.SQLConfig()
+	if err != nil {
+		return "", err
+	}
+
+	if tableName == "" {
+		tableName = primaryTable
+	}
+
+	if columnName == "" {
+		columnName = lex.Snake(f.Name)
+	}
+
+	var column string
+	join := f.JoinConfig()
+	if join != "" {
+		column = join
+	} else {
+		column = fmt.Sprintf("%s.%s", tableName, columnName)
+	}
+
+	coalesce, ok := f.Config["coalesce"]
+	if ok {
+		column = fmt.Sprintf("coalesce(%s, %s)", column, coalesce[0])
+	}
+
+	if join != "" {
+		column = fmt.Sprintf("%s AS %s", column, columnName)
+	}
+
+	return column, nil
+}
+
+// OrderBy returns a column name suitable for use with the 'ORDER BY' clause.
+func (f *Field) OrderBy(mapping *Mapping, primaryTable string) (string, error) {
+	// ReferenceTable and MapTable require specific fields, so parse those instead of checking tags.
+	if mapping.Type == ReferenceTable || mapping.Type == MapTable {
+		table := primaryTable
+		column := fmt.Sprintf("%s.%s", table, lex.Snake(f.Name))
+		column = strings.Replace(column, "reference", "%s", -1)
+
+		return column, nil
+	}
+
+	if f.IsScalar() {
+		tableName, _, err := f.ScalarTableColumn()
+		if err != nil {
+			return "", err
+		}
+
+		return tableName + ".id", nil
+	}
+
+	tableName, columnName, err := f.SQLConfig()
+	if err != nil {
+		return "", nil
+	}
+
+	if columnName == "" {
+		columnName = lex.Snake(f.Name)
+	}
+
+	if tableName == "" {
+		tableName = primaryTable
+	}
+
+	if tableName != "" {
+		return fmt.Sprintf("%s.%s", tableName, columnName), nil
+	}
+
+	return fmt.Sprintf("%s.%s", entityTable(mapping.Name, tableName), columnName), nil
+}
+
+// JoinClause returns an SQL 'JOIN' clause using the 'join'  and 'joinon' tags, if present.
+func (f *Field) JoinClause(mapping *Mapping, table string) (string, error) {
+	joinTemplate := "\n  JOIN %s ON %s = %s.id"
+	if f.Config.Get("join") != "" && f.Config.Get("leftjoin") != "" {
+		return "", fmt.Errorf("Cannot join and leftjoin at the same time for field %q of struct %q", f.Name, mapping.Name)
+	}
+
+	join := f.JoinConfig()
+	if f.Config.Get("leftjoin") != "" {
+		joinTemplate = strings.Replace(joinTemplate, "JOIN", "LEFT JOIN", -1)
+	}
+
+	joinTable, _, ok := strings.Cut(join, ".")
+	if !ok {
+		return "", fmt.Errorf("'join' tag for field %q of struct %q must be of form <table>.<column>", f.Name, mapping.Name)
+	}
+
+	joinOn := f.Config.Get("joinon")
+	if joinOn == "" {
+		tableName, columnName, err := f.SQLConfig()
+		if err != nil {
+			return "", err
+		}
+
+		if tableName != "" && columnName != "" {
+			joinOn = fmt.Sprintf("%s.%s", tableName, columnName)
+		} else {
+			joinOn = fmt.Sprintf("%s.%s_id", table, lex.Singular(joinTable))
+		}
+	}
+
+	_, _, ok = strings.Cut(joinOn, ".")
+	if !ok {
+		return "", fmt.Errorf("'joinon' tag of field %q of struct %q must be of form '<table>.<column>'", f.Name, mapping.Name)
+	}
+
+	return fmt.Sprintf(joinTemplate, joinTable, joinOn, joinTable), nil
+}
+
+// InsertColumn returns a column name and parameter value suitable for an 'INSERT', 'UPDATE', or 'DELETE' statement.
+// - If a 'join' tag is present, the package will be searched for the corresponding 'jointableID' registered statement
+// to select the ID to insert into this table.
+// - If a 'joinon' tag is present, but this table is not among the conditions, then the join will be considered indirect,
+// and an empty string will be returned.
+func (f *Field) InsertColumn(pkg *ast.Package, dbPkg *ast.Package, mapping *Mapping, primaryTable string) (string, string, error) {
+	var column string
+	var value string
+	var err error
+	if f.IsScalar() {
+		tableName, columnName, err := f.SQLConfig()
+		if err != nil {
+			return "", "", err
+		}
+
+		if tableName == "" {
+			tableName = primaryTable
+		}
+
+		// If there is a 'joinon' tag present without this table in the condition, then assume there is no column for this field.
+		joinOn := f.Config.Get("joinon")
+		if joinOn != "" {
+			before, after, ok := strings.Cut(joinOn, ".")
+			if !ok {
+				return "", "", fmt.Errorf("'joinon' tag of field %q of struct %q must be of form '<table>.<column>'", f.Name, mapping.Name)
+			}
+
+			columnName = after
+			if tableName != before {
+				return "", "", nil
+			}
+		}
+
+		table, _, ok := strings.Cut(f.JoinConfig(), ".")
+		if !ok {
+			return "", "", fmt.Errorf("'join' tag of field %q of struct %q must be of form <table>.<column>", f.Name, mapping.Name)
+		}
+
+		if columnName != "" {
+			column = columnName
+		} else {
+			column = lex.Singular(table) + "_id"
+		}
+
+		varName := stmtCodeVar(lex.Singular(table), "ID")
+		joinStmt, err := ParseStmt(pkg, dbPkg, varName)
+		if err != nil {
+			return "", "", fmt.Errorf("Failed to find registered statement %q for field %q of struct %q: %w", varName, f.Name, mapping.Name, err)
+		}
+
+		value = fmt.Sprintf("(%s)", strings.Replace(strings.Replace(joinStmt, "`", "", -1), "\n", "", -1))
+		value = strings.Replace(value, "  ", " ", -1)
+	} else {
+		column, err = f.SelectColumn(mapping, primaryTable)
+		if err != nil {
+			return "", "", err
+		}
+
+		// Strip the table name and coalesce function if present.
+		_, column, _ = strings.Cut(column, ".")
+		column, _, _ = strings.Cut(column, ",")
+
+		if mapping.Type == ReferenceTable || mapping.Type == MapTable {
+			column = strings.Replace(column, "reference", "%s", -1)
+		}
+
+		value = "?"
+	}
+
+	return column, value, nil
+}
+
+func (f Field) JoinConfig() string {
+	join := f.Config.Get("join")
+	if join == "" {
+		join = f.Config.Get("leftjoin")
+	}
+
+	return join
+}
+
+// SQLConfig returns the table and column specified by the 'sql' config key, if present.
+func (f Field) SQLConfig() (string, string, error) {
+	where := f.Config.Get("sql")
+
+	if where == "" {
+		return "", "", nil
+	}
+
+	table, column, ok := strings.Cut(where, ".")
+	if !ok {
+		return "", "", fmt.Errorf("'sql' config for field %q should be of the form <table>.<column>", f.Name)
+	}
+
+	return table, column, nil
+}
+
+// ScalarTableColumn gets the table and column from the join configuration.
+func (f Field) ScalarTableColumn() (string, string, error) {
+	join := f.JoinConfig()
+
+	if join == "" {
+		return "", "", fmt.Errorf("Missing join config for field %q", f.Name)
+	}
+
+	joinFields := strings.Split(join, ".")
+	if len(joinFields) != 2 {
+		return "", "", fmt.Errorf("Join config must be of the format <table>.<column> for field %q", f.Name)
+	}
+
+	return joinFields[0], joinFields[1], nil
 }
 
 // FieldNames returns the names of the given fields.
@@ -276,6 +527,7 @@ func FieldNames(fields []*Field) []string {
 	for _, f := range fields {
 		names = append(names, f.Name)
 	}
+
 	return names
 }
 
@@ -292,24 +544,3 @@ const (
 	TypeSlice
 	TypeMap
 )
-
-// IsColumnType returns true if the given type name is one mapping directly to
-// a database column.
-func IsColumnType(name string) bool {
-	return shared.StringInSlice(name, columnarTypeNames)
-}
-
-var columnarTypeNames = []string{
-	"bool",
-	"instancetype.Type",
-	"int",
-	"int64",
-	"OperationType",
-	"CertificateType",
-	"DeviceType",
-	"string",
-	"time.Time",
-	"sql.NullTime",
-	"WarningType",
-	"WarningStatus",
-}

@@ -9,7 +9,6 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/lxd/util"
@@ -19,11 +18,12 @@ import (
 
 func restServer(tlsConfig *tls.Config, cert *x509.Certificate, debug bool, d *Daemon) *http.Server {
 	mux := mux.NewRouter()
-	mux.StrictSlash(false)
+	mux.StrictSlash(false) // Don't redirect to URL with trailing slash.
+	mux.UseEncodedPath()   // Allow encoded values in path segments.
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		response.SyncResponse(true, []string{"/1.0"}).Render(w)
+		_ = response.SyncResponse(true, []string{"/1.0"}).Render(w)
 	})
 
 	for _, c := range api10 {
@@ -45,8 +45,8 @@ func createCmd(restAPI *mux.Router, version string, c APIEndpoint, cert *x509.Ce
 		w.Header().Set("Content-Type", "application/json")
 
 		if !authenticate(r, cert) {
-			log.Error("Not authorized")
-			response.InternalError(fmt.Errorf("Not authorized")).Render(w)
+			logger.Error("Not authorized")
+			_ = response.InternalError(fmt.Errorf("Not authorized")).Render(w)
 			return
 		}
 
@@ -55,13 +55,14 @@ func createCmd(restAPI *mux.Router, version string, c APIEndpoint, cert *x509.Ce
 			newBody := &bytes.Buffer{}
 			captured := &bytes.Buffer{}
 			multiW := io.MultiWriter(newBody, captured)
-			if _, err := io.Copy(multiW, r.Body); err != nil {
-				response.InternalError(err).Render(w)
+			_, err := io.Copy(multiW, r.Body)
+			if err != nil {
+				_ = response.InternalError(err).Render(w)
 				return
 			}
 
 			r.Body = shared.BytesReadCloser{Buf: newBody}
-			util.DebugJSON("API Request", captured, log.New())
+			util.DebugJSON("API Request", captured, logger.Log)
 		}
 
 		// Actually process the request
@@ -87,15 +88,15 @@ func createCmd(restAPI *mux.Router, version string, c APIEndpoint, cert *x509.Ce
 		case "PATCH":
 			resp = handleRequest(c.Patch)
 		default:
-			resp = response.NotFound(fmt.Errorf("Method '%s' not found", r.Method))
+			resp = response.NotFound(fmt.Errorf("Method %q not found", r.Method))
 		}
 
 		// Handle errors
 		err := resp.Render(w)
 		if err != nil {
-			err := response.InternalError(err).Render(w)
+			writeErr := response.InternalError(err).Render(w)
 			if err != nil {
-				logger.Error("Failed writing error for HTTP response", log.Ctx{"url": uri, "error": err})
+				logger.Error("Failed writing error for HTTP response", logger.Ctx{"url": uri, "error": err, "writeErr": writeErr})
 			}
 		}
 	})

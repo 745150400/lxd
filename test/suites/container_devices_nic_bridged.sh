@@ -42,18 +42,22 @@ test_container_devices_nic_bridged() {
 
   lxc init testimage "${ctName}" -p "${ctName}"
 
-  # Test device name validation.
-  lxc config device add "${ctName}" 127.0.0.1 nic network=${brName}
+  # Check that adding another NIC to the same network fails because it triggers duplicate instance DNS name checks.
+  # Because this would effectively cause 2 NICs with the same instance name to be connected to the same network.
+  ! lxc config device add "${ctName}" eth1 nic network=${brName} || false
+
+  # Test device name validation (use vlan=1 to avoid trigger instance DNS name conflict detection).
+  lxc config device add "${ctName}" 127.0.0.1 nic network=${brName} vlan=1
   lxc config device remove "${ctName}" 127.0.0.1
-  lxc config device add "${ctName}" ::1 nic network=${brName}
+  lxc config device add "${ctName}" ::1 nic network=${brName} vlan=1
   lxc config device remove "${ctName}" ::1
-  lxc config device add "${ctName}" _valid-name nic network=${brName}
+  lxc config device add "${ctName}" _valid-name nic network=${brName} vlan=1
   lxc config device remove "${ctName}" _valid-name
-  lxc config device add "${ctName}" /foo nic network=${brName}
+  lxc config device add "${ctName}" /foo nic network=${brName} vlan=1
   lxc config device remove "${ctName}" /foo
-  ! lxc config device add "${ctName}" .invalid nic network=${brName} || false
-  ! lxc config device add "${ctName}" ./invalid nic network=${brName} || false
-  ! lxc config device add "${ctName}" ../invalid nic network=${brName} || false
+  ! lxc config device add "${ctName}" .invalid nic network=${brName} vlan=1 || false
+  ! lxc config device add "${ctName}" ./invalid nic network=${brName} vlan=1 || false
+  ! lxc config device add "${ctName}" ../invalid nic network=${brName} vlan=1 || false
 
   # Start instance.
   lxc start "${ctName}"
@@ -342,7 +346,7 @@ test_container_devices_nic_bridged() {
   lxc launch testimage "${ctName}" -p "${ctName}"
 
   # Request DHCPv4 lease with custom name (to check managed name is allocated instead).
-  lxc exec "${ctName}" -- udhcpc -i eth0 -n -q -F "${ctName}custom"
+  lxc exec "${ctName}" -- udhcpc -f -i eth0 -n -q -t5 -F "${ctName}custom"
 
   # Check DHCPv4 lease is allocated.
   if ! grep -i "${ctMAC}" "${LXD_DIR}/networks/${brName}/dnsmasq.leases" ; then
@@ -363,7 +367,7 @@ test_container_devices_nic_bridged() {
   fi
 
   if [ "$busyboxUdhcpc6" = "1" ]; then
-        lxc exec "${ctName}" -- udhcpc6 -i eth0 -n -q 2>&1 | grep 'IPv6 obtained'
+        lxc exec "${ctName}" -- udhcpc6 -f -i eth0 -n -q -t5 2>&1 | grep 'IPv6 obtained'
   fi
 
   # Delete container, check LXD releases lease.
@@ -421,9 +425,12 @@ test_container_devices_nic_bridged() {
   # Check dnsmasq leases file removed if DHCP disabled and that device can be removed.
   lxc config device add "${ctName}" eth0 nic nictype=bridged parent="${brName}" name=eth0
   lxc start "${ctName}"
-  lxc exec "${ctName}" -- udhcpc -i eth0 -n -q
+  lxc exec "${ctName}" -- udhcpc -f -i eth0 -n -q -t5
   lxc network set "${brName}" ipv4.address none
   lxc network set "${brName}" ipv6.address none
+
+  # Confirm IPv6 is disabled.
+  [ "$(cat /proc/sys/net/ipv6/conf/${brName}/disable_ipv6)" = "1" ]
 
   if [ -f "${LXD_DIR}/networks/${brName}/dnsmasq.leases" ] ; then
     echo "dnsmasq.leases file still present after disabling DHCP"
@@ -435,6 +442,7 @@ test_container_devices_nic_bridged() {
     false
   fi
 
+  lxc profile device unset "${ctName}" eth0 ipv6.routes
   lxc config device remove "${ctName}" eth0
   lxc stop -f "${ctName}"
   if [ -f "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/${ctName}.eth0" ] ; then
@@ -445,6 +453,10 @@ test_container_devices_nic_bridged() {
   # Re-enable DHCP on network.
   lxc network set "${brName}" ipv4.address 192.0.2.1/24
   lxc network set "${brName}" ipv6.address 2001:db8::1/64
+  lxc profile device set "${ctName}" eth0 ipv6.routes "2001:db8::1${ipRand}/128"
+
+  # Confirm IPv6 is re-enabled.
+  [ "$(cat /proc/sys/net/ipv6/conf/${brName}/disable_ipv6)" = "0" ]
 
   # Check dnsmasq host file is created on add.
   lxc config device add "${ctName}" eth0 nic nictype=bridged parent="${brName}" name=eth0
@@ -535,6 +547,94 @@ test_container_devices_nic_bridged() {
     echo "bridge command doesn't support port isolation, skipping port isolation checks"
   fi
 
+  # Test interface naming scheme.
+  lxc init testimage test-naming
+  lxc start test-naming
+  lxc query "/1.0/instances/test-naming/state" | jq -r .network.eth0.host_name | grep ^veth
+  lxc stop -f test-naming
+
+  lxc config set instances.nic.host_name random
+  lxc start test-naming
+  lxc query "/1.0/instances/test-naming/state" | jq -r .network.eth0.host_name | grep ^veth
+  lxc stop -f test-naming
+
+  lxc config set instances.nic.host_name mac
+  lxc start test-naming
+  lxc query "/1.0/instances/test-naming/state" | jq -r .network.eth0.host_name | grep ^lxd
+  lxc stop -f test-naming
+
+  lxc config unset instances.nic.host_name
+  lxc delete -f test-naming
+
+  # Test new container with conflicting addresses can be created as a copy.
+  lxc config device set "${ctName}" eth0 \
+    ipv4.address=192.0.2.232 \
+    hwaddr="" # Remove static MAC so that copies use new MAC (as changing MAC triggers device remove/add on snapshot restore).
+  grep -F "192.0.2.232" "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/${ctName}.eth0"
+  lxc copy "${ctName}" foo # Gets new MAC address but IPs still conflict.
+  ! stat "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/foo.eth0" || false
+  lxc snapshot foo
+  lxc export foo foo.tar.gz
+  ! lxc start foo || false
+  lxc config device set foo eth0 \
+    ipv4.address=192.0.2.233 \
+    ipv6.address=2001:db8::3
+  grep -F "192.0.2.233" "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/foo.eth0"
+  lxc start foo
+  lxc stop -f foo
+
+  # Test container snapshot with conflicting addresses can be restored.
+  lxc restore foo snap0 # Test restore, IPs conflict on config device update (due to only IPs changing).
+  ! stat "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/foo.eth0" || false # Check lease file removed (due to non-user requested update failing).
+  lxc config device get foo eth0 ipv4.address | grep -Fx '192.0.2.232'
+  ! lxc start foo || false
+  lxc config device set foo eth0 \
+    hwaddr="0a:92:a7:0d:b7:c9" \
+    ipv4.address=192.0.2.233 \
+    ipv6.address=2001:db8::3
+  lxc start foo
+  lxc stop -f foo
+
+  lxc restore foo snap0 # Test restore, IPs conflict on config device remove/add (due to MAC change).
+  ! stat "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/foo.eth0" || false # Check lease file removed (due to MAC change).
+  lxc config device get foo eth0 ipv4.address | grep -Fx '192.0.2.232'
+  ! lxc start foo || false
+  lxc config device set foo eth0 \
+    hwaddr="0a:92:a7:0d:b7:c9" \
+    ipv4.address=192.0.2.233 \
+    ipv6.address=2001:db8::3
+  grep -F "192.0.2.233" "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/foo.eth0"
+  lxc start foo
+  lxc delete -f foo
+
+  # Test container with conflicting addresses can be restored from backup.
+  lxc import foo.tar.gz
+  ! stat "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/foo.eth0" || false
+  ! lxc start foo || false
+  lxc config device get foo eth0 ipv4.address | grep -Fx '192.0.2.232'
+  lxc config show foo/snap0 | grep -F 'ipv4.address: 192.0.2.232'
+  lxc config device set foo eth0 \
+    hwaddr="0a:92:a7:0d:b7:c9" \
+    ipv4.address=192.0.2.233 \
+    ipv6.address=2001:db8::3
+  grep -F "192.0.2.233" "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/foo.eth0"
+  lxc config device get foo eth0 ipv4.address | grep -Fx '192.0.2.233'
+  lxc start foo
+
+  # Check MAC conflict detection:
+  ! lxc config device set "${ctName}" eth0 hwaddr="0a:92:a7:0d:b7:c9" || false
+
+  # Test container with conflicting addresses rebuilds DHCP lease if original conflicting instance is removed.
+  lxc delete -f foo
+  ! stat "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/foo.eth0" || false
+  lxc import foo.tar.gz
+  rm foo.tar.gz
+  ! lxc start foo || false
+  lxc delete "${ctName}" -f
+  lxc start foo
+  grep -F "192.0.2.232" "${LXD_DIR}/networks/${brName}/dnsmasq.hosts/foo.eth0"
+  lxc delete -f foo
+
   # Check we haven't left any NICS lying around.
   endNicCount=$(find /sys/class/net | wc -l)
   if [ "$startNicCount" != "$endNicCount" ]; then
@@ -543,7 +643,6 @@ test_container_devices_nic_bridged() {
   fi
 
   # Cleanup.
-  lxc delete "${ctName}" -f
   lxc profile delete "${ctName}"
   lxc network delete "${brName}"
 }

@@ -10,9 +10,11 @@ import (
 
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/operations"
+	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/units"
 	"github.com/lxc/lxd/shared/validate"
 	"github.com/lxc/lxd/shared/version"
@@ -22,8 +24,11 @@ var zfsVersion string
 var zfsLoaded bool
 var zfsDirectIO bool
 var zfsTrim bool
+var zfsRaw bool
 
 var zfsDefaultSettings = map[string]string{
+	"atime":      "off",
+	"relatime":   "on",
 	"mountpoint": "legacy",
 	"setuid":     "on",
 	"exec":       "on",
@@ -40,12 +45,8 @@ type zfs struct {
 func (d *zfs) load() error {
 	// Register the patches.
 	d.patches = map[string]func() error{
-		"storage_create_vm":                        d.patchStorageCreateVM,
-		"storage_zfs_mount":                        d.patchStorageZFSMount,
-		"storage_create_vm_again":                  nil,
-		"storage_zfs_volmode":                      d.patchStorageZFSVolMode,
-		"storage_rename_custom_volume_add_project": nil,
-		"storage_lvm_skipactivation":               nil,
+		"storage_lvm_skipactivation":       nil,
+		"storage_missing_snapshot_records": nil,
 	}
 
 	// Done if previously loaded.
@@ -94,6 +95,16 @@ func (d *zfs) load() error {
 		zfsTrim = true
 	}
 
+	ver080, err := version.Parse("0.8.0")
+	if err != nil {
+		return err
+	}
+
+	// If running 0.8.0 or newer, we can use the raw flag.
+	if ourVer.Compare(ver080) >= 0 {
+		zfsRaw = true
+	}
+
 	zfsLoaded = true
 	return nil
 }
@@ -107,14 +118,64 @@ func (d *zfs) Info() Info {
 		OptimizedBackups:  true,
 		PreservesInodes:   true,
 		Remote:            d.isRemote(),
-		VolumeTypes:       []VolumeType{VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		VolumeTypes:       []VolumeType{VolumeTypeBucket, VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
 		BlockBacking:      false,
 		RunningCopyFreeze: false,
 		DirectIO:          zfsDirectIO,
 		MountedRoot:       false,
+		Buckets:           true,
 	}
 
 	return info
+}
+
+// ensureInitialDatasets creates missing initial datasets or configures existing ones with current policy.
+// Accepts warnOnExistingPolicyApplyError argument, if true will warn rather than fail if applying current policy
+// to an existing dataset fails.
+func (d zfs) ensureInitialDatasets(warnOnExistingPolicyApplyError bool) error {
+	args := make([]string, 0, len(zfsDefaultSettings))
+	for k, v := range zfsDefaultSettings {
+		args = append(args, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	err := d.setDatasetProperties(d.config["zfs.pool_name"], args...)
+	if err != nil {
+		if warnOnExistingPolicyApplyError {
+			d.logger.Warn("Failed applying policy to existing dataset", logger.Ctx{"dataset": d.config["zfs.pool_name"], "err": err})
+		} else {
+			return fmt.Errorf("Failed applying policy to existing dataset %q: %w", d.config["zfs.pool_name"], err)
+		}
+	}
+
+	for _, dataset := range d.initialDatasets() {
+		properties := []string{"mountpoint=legacy"}
+		if shared.StringInSlice(dataset, []string{"virtual-machines", "deleted/virtual-machines"}) {
+			if len(zfsVersion) >= 3 && zfsVersion[0:3] == "0.6" {
+				d.logger.Warn("Unable to set volmode on parent virtual-machines datasets due to ZFS being too old")
+			} else {
+				properties = append(properties, "volmode=none")
+			}
+		}
+
+		datasetPath := filepath.Join(d.config["zfs.pool_name"], dataset)
+		if d.checkDataset(datasetPath) {
+			err = d.setDatasetProperties(datasetPath, properties...)
+			if err != nil {
+				if warnOnExistingPolicyApplyError {
+					d.logger.Warn("Failed applying policy to existing dataset", logger.Ctx{"dataset": datasetPath, "err": err})
+				} else {
+					return fmt.Errorf("Failed applying policy to existing dataset %q: %w", datasetPath, err)
+				}
+			}
+		} else {
+			err = d.createDataset(datasetPath, properties...)
+			if err != nil {
+				return fmt.Errorf("Failed creating dataset %q: %w", datasetPath, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 // Create is called during pool creation and is effectively using an empty driver struct.
@@ -136,6 +197,16 @@ func (d *zfs) Create() error {
 		// Validate pool_name.
 		if strings.Contains(d.config["zfs.pool_name"], "/") {
 			return fmt.Errorf("zfs.pool_name can't point to a dataset when source isn't set")
+		}
+
+		// Pick a default size of the loop file if not specified.
+		if d.config["size"] == "" {
+			defaultSize, err := loopFileSizeDefault()
+			if err != nil {
+				return err
+			}
+
+			d.config["size"] = fmt.Sprintf("%dGiB", defaultSize)
 		}
 
 		// Create the loop file itself.
@@ -221,7 +292,7 @@ func (d *zfs) Create() error {
 			}
 		} else {
 			// Ensure that the pool is available.
-			_, err := d.Mount()
+			_, err := d.importPool()
 			if err != nil {
 				return err
 			}
@@ -239,45 +310,18 @@ func (d *zfs) Create() error {
 	}
 
 	// Setup revert in case of problems
-	revertPool := true
-	defer func() {
-		if !revertPool {
-			return
-		}
+	revert := revert.New()
+	defer revert.Fail()
 
-		d.Delete(nil)
-	}()
+	revert.Add(func() { _ = d.Delete(nil) })
 
 	// Apply our default configuration.
-	args := []string{}
-	for k, v := range zfsDefaultSettings {
-		args = append(args, fmt.Sprintf("%s=%s", k, v))
-	}
-
-	err := d.setDatasetProperties(d.config["zfs.pool_name"], args...)
+	err := d.ensureInitialDatasets(false)
 	if err != nil {
 		return err
 	}
 
-	// Create the initial datasets.
-	for _, dataset := range d.initialDatasets() {
-
-		properties := []string{"mountpoint=legacy"}
-		if shared.StringInSlice(dataset, []string{"virtual-machines", "deleted/virtual-machines"}) {
-			if len(zfsVersion) >= 3 && zfsVersion[0:3] == "0.6" {
-				d.logger.Warn("Unable to set volmode on parent virtual-machines datasets due to ZFS being too old")
-			} else {
-				properties = append(properties, "volmode=none")
-			}
-		}
-
-		err := d.createDataset(filepath.Join(d.config["zfs.pool_name"], dataset), properties...)
-		if err != nil {
-			return err
-		}
-	}
-
-	revertPool = false
+	revert.Success()
 	return nil
 }
 
@@ -339,6 +383,7 @@ func (d *zfs) Delete(op *operations.Operation) error {
 // Validate checks that all provide keys are supported and that no conflicting or missing configuration is present.
 func (d *zfs) Validate(config map[string]string) error {
 	rules := map[string]func(value string) error{
+		"size":          validate.Optional(validate.IsSize),
 		"zfs.pool_name": validate.IsAny,
 		"zfs.clone_copy": validate.Optional(func(value string) error {
 			if value == "rebase" {
@@ -347,14 +392,10 @@ func (d *zfs) Validate(config map[string]string) error {
 
 			return validate.IsBool(value)
 		}),
-		"zfs.export":                  validate.Optional(validate.IsBool),
-		"volume.zfs.blocksize":        validate.Optional(ValidateZfsBlocksize),
-		"volume.zfs.remove_snapshots": validate.Optional(validate.IsBool),
-		"volume.zfs.use_refquota":     validate.Optional(validate.IsBool),
-		"volume.zfs.reserve_space":    validate.Optional(validate.IsBool),
+		"zfs.export": validate.Optional(validate.IsBool),
 	}
 
-	return d.validatePool(config, rules)
+	return d.validatePool(config, rules, d.commonVolumeRules())
 }
 
 // Update applies any driver changes required from a configuration change.
@@ -367,8 +408,8 @@ func (d *zfs) Update(changedConfig map[string]string) error {
 	return nil
 }
 
-// Mount mounts the storage pool.
-func (d *zfs) Mount() (bool, error) {
+// importPool the storage pool.
+func (d *zfs) importPool() (bool, error) {
 	if d.config["zfs.pool_name"] == "" {
 		return false, fmt.Errorf("Cannot mount pool as %q is not specified", "zfs.pool_name")
 	}
@@ -404,6 +445,23 @@ func (d *zfs) Mount() (bool, error) {
 	}
 
 	return false, fmt.Errorf("ZFS zpool exists but dataset is missing")
+}
+
+// Mount mounts the storage pool.
+func (d *zfs) Mount() (bool, error) {
+	// Import the pool if not already imported.
+	imported, err := d.importPool()
+	if err != nil {
+		return false, err
+	}
+
+	// Apply our default configuration.
+	err = d.ensureInitialDatasets(true)
+	if err != nil {
+		return false, err
+	}
+
+	return imported, nil
 }
 
 // Unmount unmounts the storage pool.
@@ -477,28 +535,9 @@ func (d *zfs) MigrationTypes(contentType ContentType, refresh bool) []migration.
 		rsyncFeatures = []string{"xattrs", "delete", "compress", "bidirectional"}
 	}
 
-	// When performing a refresh, always use rsync. Using zfs send/receive
-	// here doesn't make sense since it would need to send everything again
-	// which defeats the purpose of a refresh.
-	if refresh {
-		var transportType migration.MigrationFSType
-
-		if contentType == ContentTypeBlock {
-			transportType = migration.MigrationFSType_BLOCK_AND_RSYNC
-		} else {
-			transportType = migration.MigrationFSType_RSYNC
-		}
-
-		return []migration.Type{
-			{
-				FSType:   transportType,
-				Features: rsyncFeatures,
-			},
-		}
-	}
-
 	// Detect ZFS features.
-	features := []string{}
+	features := []string{migration.ZFSFeatureMigrationHeader}
+
 	if len(zfsVersion) >= 3 && zfsVersion[0:3] != "0.6" {
 		features = append(features, "compress")
 	}

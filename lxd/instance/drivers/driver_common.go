@@ -1,18 +1,20 @@
 package drivers
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/pborman/uuid"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/lxd/backup"
-	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
 	dbCluster "github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/db/query"
@@ -33,8 +35,22 @@ import (
 	"github.com/lxc/lxd/shared/logger"
 )
 
+// ErrExecCommandNotFound indicates the command is not found.
+var ErrExecCommandNotFound = fmt.Errorf("Command not found")
+
+// ErrExecCommandNotExecutable indicates the command is not executable.
+var ErrExecCommandNotExecutable = fmt.Errorf("Command not executable")
+
 // ErrInstanceIsStopped indicates that the instance is stopped.
 var ErrInstanceIsStopped error = fmt.Errorf("The instance is already stopped")
+
+// deviceManager is an interface that allows managing device lifecycle.
+type deviceManager interface {
+	deviceAdd(dev device.Device, instanceRunning bool) error
+	deviceRemove(dev device.Device, instanceRunning bool) error
+	deviceStart(dev device.Device, instanceRunning bool) (*deviceConfig.RunConfig, error)
+	deviceStop(dev device.Device, instanceRunning bool, stopHookNetnsPath string) error
+}
 
 // common provides structure common to all instance types.
 type common struct {
@@ -45,7 +61,6 @@ type common struct {
 	creationDate    time.Time
 	dbType          instancetype.Type
 	description     string
-	devPaths        []string
 	ephemeral       bool
 	expandedConfig  map[string]string
 	expandedDevices deviceConfig.Devices
@@ -57,8 +72,8 @@ type common struct {
 	logger          logger.Logger
 	name            string
 	node            string
-	profiles        []string
-	project         string
+	profiles        []api.Profile
+	project         api.Project
 	snapshot        bool
 	stateful        bool
 
@@ -90,14 +105,6 @@ func (d *common) Type() instancetype.Type {
 // Description returns the instance's description.
 func (d *common) Description() string {
 	return d.description
-}
-
-// DevPaths() returns a list of /dev devices which the instance requires access to.
-// This is function is only safe to call from within the security
-// packages as called during instance startup, the rest of the time this
-// will likely return nil.
-func (d *common) DevPaths() []string {
-	return d.devPaths
 }
 
 // IsEphemeral returns whether the instanc is ephemeral or not.
@@ -166,12 +173,12 @@ func (d *common) Location() string {
 }
 
 // Profiles returns the instance's profiles.
-func (d *common) Profiles() []string {
+func (d *common) Profiles() []api.Profile {
 	return d.profiles
 }
 
 // Project returns instance's project.
-func (d *common) Project() string {
+func (d *common) Project() api.Project {
 	return d.project
 }
 
@@ -197,7 +204,7 @@ func (d *common) Operation() *operations.Operation {
 // Backups returns a list of backups.
 func (d *common) Backups() ([]backup.InstanceBackup, error) {
 	// Get all the backups
-	backupNames, err := d.state.Cluster.GetInstanceBackups(d.project, d.name)
+	backupNames, err := d.state.DB.Cluster.GetInstanceBackups(d.project.Name, d.name)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +212,7 @@ func (d *common) Backups() ([]backup.InstanceBackup, error) {
 	// Build the backup list
 	backups := []backup.InstanceBackup{}
 	for _, backupName := range backupNames {
-		backup, err := instance.BackupLoadByName(d.state, d.project, backupName)
+		backup, err := instance.BackupLoadByName(d.state, d.project.Name, backupName)
 		if err != nil {
 			return nil, err
 		}
@@ -238,16 +245,30 @@ func (d *common) SetOperation(op *operations.Operation) {
 
 // Snapshots returns a list of snapshots.
 func (d *common) Snapshots() ([]instance.Instance, error) {
-	var snaps []db.Instance
-
 	if d.snapshot {
 		return []instance.Instance{}, nil
 	}
 
-	// Get all the snapshots
-	err := d.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		var err error
-		snaps, err = tx.GetInstanceSnapshotsWithName(d.project, d.name)
+	var snapshotArgs map[int]db.InstanceArgs
+
+	// Get all the snapshots for instance.
+	err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		filter := dbCluster.InstanceSnapshotFilter{
+			Project:  &d.project.Name,
+			Instance: &d.name,
+		}
+
+		dbSnapshots, err := dbCluster.GetInstanceSnapshots(ctx, tx.Tx(), filter)
+		if err != nil {
+			return err
+		}
+
+		dbInstances := make([]dbCluster.Instance, len(dbSnapshots))
+		for i, s := range dbSnapshots {
+			dbInstances[i] = s.ToInstance(d.name, d.node, d.dbType, d.architecture)
+		}
+
+		snapshotArgs, err = tx.InstancesToInstanceArgs(ctx, false, dbInstances...)
 		if err != nil {
 			return err
 		}
@@ -258,18 +279,37 @@ func (d *common) Snapshots() ([]instance.Instance, error) {
 		return nil, err
 	}
 
-	// Build the snapshot list
-	snapshots, err := instance.LoadAllInternal(d.state, snaps)
-	if err != nil {
-		return nil, err
+	snapshots := make([]instance.Instance, 0, len(snapshotArgs))
+	for _, snapshotArg := range snapshotArgs {
+		// Populate profile info that was already loaded.
+		snapshotArg.Profiles = d.profiles
+
+		snapInst, err := instance.Load(d.state, snapshotArg, d.project)
+		if err != nil {
+			return nil, err
+		}
+
+		snapshots = append(snapshots, instance.Instance(snapInst))
 	}
 
-	instances := make([]instance.Instance, len(snapshots))
-	for k, v := range snapshots {
-		instances[k] = instance.Instance(v)
-	}
+	sort.SliceStable(snapshots, func(i, j int) bool {
+		iCreation := snapshots[i].CreationDate()
+		jCreation := snapshots[j].CreationDate()
 
-	return instances, nil
+		// Prefer sorting by creation date.
+		if iCreation.Before(jCreation) {
+			return true
+		}
+
+		// But if creation date is the same, then sort by ID.
+		if iCreation.Equal(jCreation) && snapshots[i].ID() < snapshots[j].ID() {
+			return true
+		}
+
+		return false
+	})
+
+	return snapshots, nil
 }
 
 // VolatileSet sets one or more volatile config keys.
@@ -284,14 +324,15 @@ func (d *common) VolatileSet(changes map[string]string) error {
 	// Update the database.
 	var err error
 	if d.snapshot {
-		err = d.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			return tx.UpdateInstanceSnapshotConfig(d.id, changes)
 		})
 	} else {
-		err = d.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			return tx.UpdateInstanceConfig(d.id, changes)
 		})
 	}
+
 	if err != nil {
 		return fmt.Errorf("Failed to set volatile config: %w", err)
 	}
@@ -322,19 +363,19 @@ func (d *common) ConsoleBufferLogPath() string {
 
 // DevicesPath returns the instance's devices path.
 func (d *common) DevicesPath() string {
-	name := project.Instance(d.project, d.name)
+	name := project.Instance(d.project.Name, d.name)
 	return shared.VarPath("devices", name)
 }
 
 // LogPath returns the instance's log path.
 func (d *common) LogPath() string {
-	name := project.Instance(d.project, d.name)
+	name := project.Instance(d.project.Name, d.name)
 	return shared.LogPath(name)
 }
 
 // Path returns the instance's path.
 func (d *common) Path() string {
-	return storagePools.InstancePath(d.dbType, d.project, d.name, d.snapshot)
+	return storagePools.InstancePath(d.dbType, d.project.Name, d.name, d.snapshot)
 }
 
 // RootfsPath returns the instance's rootfs path.
@@ -344,7 +385,7 @@ func (d *common) RootfsPath() string {
 
 // ShmountsPath returns the instance's shared mounts path.
 func (d *common) ShmountsPath() string {
-	name := project.Instance(d.project, d.name)
+	name := project.Instance(d.project.Name, d.name)
 	return shared.VarPath("shmounts", name)
 }
 
@@ -358,6 +399,16 @@ func (d *common) TemplatesPath() string {
 	return filepath.Join(d.Path(), "templates")
 }
 
+// StoragePool returns the storage pool name.
+func (d *common) StoragePool() (string, error) {
+	pool, err := d.getStoragePool()
+	if err != nil {
+		return "", err
+	}
+
+	return pool.Name(), nil
+}
+
 //
 // SECTION: internal functions
 //
@@ -368,12 +419,12 @@ func (d *common) deviceVolatileReset(devName string, oldConfig, newConfig device
 	volatileClear := make(map[string]string)
 	devicePrefix := fmt.Sprintf("volatile.%s.", devName)
 
-	newNICType, err := nictype.NICType(d.state, d.project, newConfig)
+	newNICType, err := nictype.NICType(d.state, d.project.Name, newConfig)
 	if err != nil {
 		return err
 	}
 
-	oldNICType, err := nictype.NICType(d.state, d.project, oldConfig)
+	oldNICType, err := nictype.NICType(d.state, d.project.Name, oldConfig)
 	if err != nil {
 		return err
 	}
@@ -402,7 +453,8 @@ func (d *common) deviceVolatileReset(devName string, oldConfig, newConfig device
 		}
 
 		devKey := strings.TrimPrefix(k, devicePrefix)
-		if _, found := newConfig[devKey]; found {
+		_, found := newConfig[devKey]
+		if found {
 			volatileClear[k] = ""
 		}
 	}
@@ -439,17 +491,9 @@ func (d *common) deviceVolatileSetFunc(devName string) func(save map[string]stri
 }
 
 // expandConfig applies the config of each profile in order, followed by the local config.
-func (d *common) expandConfig(profiles []api.Profile) error {
-	if profiles == nil && len(d.profiles) > 0 {
-		var err error
-		profiles, err = d.state.Cluster.GetProfiles(d.project, d.profiles)
-		if err != nil {
-			return err
-		}
-	}
-
-	d.expandedConfig = db.ExpandInstanceConfig(d.localConfig, profiles)
-	d.expandedDevices = db.ExpandInstanceDevices(d.localDevices, profiles)
+func (d *common) expandConfig() error {
+	d.expandedConfig = db.ExpandInstanceConfig(d.localConfig, d.profiles)
+	d.expandedDevices = db.ExpandInstanceDevices(d.localDevices, d.profiles)
 
 	return nil
 }
@@ -457,7 +501,7 @@ func (d *common) expandConfig(profiles []api.Profile) error {
 // restartCommon handles the common part of instance restarts.
 func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) error {
 	// Setup a new operation for the stop/shutdown phase.
-	op, err := operationlock.Create(d.Project(), d.Name(), operationlock.ActionRestart, true, true)
+	op, err := operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestart, true, true)
 	if err != nil {
 		return fmt.Errorf("Create restart operation: %w", err)
 	}
@@ -473,7 +517,7 @@ func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) er
 			Devices:      inst.LocalDevices(),
 			Ephemeral:    false,
 			Profiles:     inst.Profiles(),
-			Project:      inst.Project(),
+			Project:      inst.Project().Name,
 			Type:         inst.Type(),
 			Snapshot:     inst.IsSnapshot(),
 		}
@@ -486,7 +530,7 @@ func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) er
 		// On function return, set the flag back on
 		defer func() {
 			args.Ephemeral = ephemeral
-			inst.Update(args, false)
+			_ = inst.Update(args, false)
 		}()
 	}
 
@@ -511,7 +555,7 @@ func (d *common) restartCommon(inst instance.Instance, timeout time.Duration) er
 	}
 
 	// Setup a new operation for the start phase.
-	op, err = operationlock.Create(d.Project(), d.Name(), operationlock.ActionRestart, true, true)
+	op, err = operationlock.Create(d.Project().Name, d.Name(), operationlock.ActionRestart, true, true)
 	if err != nil {
 		return fmt.Errorf("Create restart (for start) operation: %w", err)
 	}
@@ -545,7 +589,7 @@ func (d *common) snapshotCommon(inst instance.Instance, name string, expiry time
 
 	// Setup the arguments.
 	args := db.InstanceArgs{
-		Project:      inst.Project(),
+		Project:      inst.Project().Name,
 		Architecture: inst.Architecture(),
 		Config:       inst.LocalConfig(),
 		Type:         inst.Type(),
@@ -559,13 +603,15 @@ func (d *common) snapshotCommon(inst instance.Instance, name string, expiry time
 	}
 
 	// Create the snapshot.
-	snap, snapInstOp, err := instance.CreateInternal(d.state, args, true, nil, revert)
+	snap, snapInstOp, cleanup, err := instance.CreateInternal(d.state, args, true)
 	if err != nil {
 		return fmt.Errorf("Failed creating instance snapshot record %q: %w", name, err)
 	}
+
+	revert.Add(cleanup)
 	defer snapInstOp.Done(err)
 
-	pool, err := storagePools.GetPoolByInstance(d.state, snap)
+	pool, err := storagePools.LoadByInstance(d.state, snap)
 	if err != nil {
 		return err
 	}
@@ -575,14 +621,15 @@ func (d *common) snapshotCommon(inst instance.Instance, name string, expiry time
 		return fmt.Errorf("Create instance snapshot: %w", err)
 	}
 
-	revert.Add(func() { snap.Delete(true) })
+	revert.Add(func() { _ = snap.Delete(true) })
 
 	// Mount volume for backup.yaml writing.
 	_, err = pool.MountInstance(inst, d.op)
 	if err != nil {
 		return fmt.Errorf("Create instance snapshot (mount source): %w", err)
 	}
-	defer pool.UnmountInstance(inst, d.op)
+
+	defer func() { _ = pool.UnmountInstance(inst, d.op) }()
 
 	// Attempt to update backup.yaml for instance.
 	err = inst.UpdateBackupFile()
@@ -602,12 +649,12 @@ func (d *common) updateProgress(progress string) {
 
 	meta := d.op.Metadata()
 	if meta == nil {
-		meta = make(map[string]interface{})
+		meta = make(map[string]any)
 	}
 
 	if meta["container_progress"] != progress {
 		meta["container_progress"] = progress
-		d.op.UpdateMetadata(meta)
+		_ = d.op.UpdateMetadata(meta)
 	}
 }
 
@@ -617,12 +664,12 @@ func (d *common) updateProgress(progress string) {
 // If the insert succeeds or the key is found to have been populated then the value of the key is returned.
 func (d *common) insertConfigkey(key string, value string) (string, error) {
 	err := query.Retry(func() error {
-		err := query.Transaction(d.state.Cluster.DB(), func(tx *sql.Tx) error {
+		err := query.Transaction(context.TODO(), d.state.DB.Cluster.DB(), func(ctx context.Context, tx *sql.Tx) error {
 			return db.CreateInstanceConfig(tx, d.id, map[string]string{key: value})
 		})
 		if err != nil {
 			// Check if something else filled it in behind our back.
-			existingValue, errCheckExists := d.state.Cluster.GetInstanceConfig(d.id, key)
+			existingValue, errCheckExists := d.state.DB.Cluster.GetInstanceConfig(d.id, key)
 			if errCheckExists != nil {
 				return err
 			}
@@ -671,7 +718,7 @@ func (d *common) startupSnapshot(inst instance.Instance) error {
 		return nil
 	}
 
-	expiry, err := shared.GetSnapshotExpiry(time.Now(), d.expandedConfig["snapshots.expiry"])
+	expiry, err := shared.GetExpiry(time.Now(), d.expandedConfig["snapshots.expiry"])
 	if err != nil {
 		return err
 	}
@@ -687,10 +734,7 @@ func (d *common) startupSnapshot(inst instance.Instance) error {
 // Internal MAAS handling.
 func (d *common) maasUpdate(inst instance.Instance, oldDevices map[string]map[string]string) error {
 	// Check if MAAS is configured
-	maasURL, err := cluster.ConfigGetString(d.state.Cluster, "maas.api.url")
-	if err != nil {
-		return err
-	}
+	maasURL, _ := d.state.GlobalConfig.MAASController()
 
 	if maasURL == "" {
 		return nil
@@ -786,10 +830,7 @@ func (d *common) maasInterfaces(inst instance.Instance, devices map[string]map[s
 }
 
 func (d *common) maasRename(inst instance.Instance, newName string) error {
-	maasURL, err := cluster.ConfigGetString(d.state.Cluster, "maas.api.url")
-	if err != nil {
-		return err
-	}
+	maasURL, _ := d.state.GlobalConfig.MAASController()
 
 	if maasURL == "" {
 		return nil
@@ -821,10 +862,7 @@ func (d *common) maasRename(inst instance.Instance, newName string) error {
 }
 
 func (d *common) maasDelete(inst instance.Instance) error {
-	maasURL, err := cluster.ConfigGetString(d.state.Cluster, "maas.api.url")
-	if err != nil {
-		return err
-	}
+	maasURL, _ := d.state.GlobalConfig.MAASController()
 
 	if maasURL == "" {
 		return nil
@@ -865,17 +903,17 @@ func (d *common) onStopOperationSetup(target string) (*operationlock.InstanceOpe
 	// Pick up the existing stop operation lock created in Stop() function.
 	// If there is another ongoing operation (such as start), wait until that has finished before proceeding
 	// to run the hook (this should be quick as it will fail showing instance is already running).
-	op := operationlock.Get(d.Project(), d.Name())
+	op := operationlock.Get(d.Project().Name, d.Name())
 	if op != nil && !op.ActionMatch(operationlock.ActionStop, operationlock.ActionRestart, operationlock.ActionRestore) {
-		d.logger.Debug("Waiting for existing operation lock to finish before running hook", log.Ctx{"action": op.Action()})
-		op.Wait()
+		d.logger.Debug("Waiting for existing operation lock to finish before running hook", logger.Ctx{"action": op.Action()})
+		_ = op.Wait()
 		op = nil
 	}
 
 	instanceInitiated := false
 
 	if op == nil {
-		d.logger.Debug("Instance initiated stop", log.Ctx{"action": target})
+		d.logger.Debug("Instance initiated stop", logger.Ctx{"action": target})
 		instanceInitiated = true
 
 		action := operationlock.ActionStop
@@ -883,7 +921,7 @@ func (d *common) onStopOperationSetup(target string) (*operationlock.InstanceOpe
 			action = operationlock.ActionRestart
 		}
 
-		op, err = operationlock.Create(d.Project(), d.Name(), action, false, false)
+		op, err = operationlock.Create(d.Project().Name, d.Name(), action, false, false)
 		if err != nil {
 			return nil, false, fmt.Errorf("Failed creating %q operation: %w", action, err)
 		}
@@ -894,8 +932,8 @@ func (d *common) onStopOperationSetup(target string) (*operationlock.InstanceOpe
 
 // warningsDelete deletes any persistent warnings for the instance.
 func (d *common) warningsDelete() error {
-	err := d.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		return tx.DeleteWarnings(dbCluster.TypeInstance, d.ID())
+	err := d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		return dbCluster.DeleteWarnings(ctx, tx.Tx(), dbCluster.TypeInstance, d.ID())
 	})
 	if err != nil {
 		return fmt.Errorf("Failed deleting persistent warnings: %w", err)
@@ -958,7 +996,7 @@ func (d *common) recordLastState() error {
 	d.expandedConfig["volatile.last_state.power"] = "RUNNING"
 
 	// Database updates
-	return d.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+	return d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		// Record power state.
 		err = tx.UpdateInstancePowerState(d.id, "RUNNING")
 		if err != nil {
@@ -999,13 +1037,14 @@ func (d *common) setCoreSched(pids []int) error {
 func (d *common) getRootDiskDevice() (string, map[string]string, error) {
 	devices := d.ExpandedDevices()
 	if d.IsSnapshot() {
-		parentName, _, _ := shared.InstanceGetParentAndSnapshotName(d.name)
+		parentName, _, _ := api.GetParentAndSnapshotName(d.name)
 
 		// Load the parent.
-		storageInstance, err := instance.LoadByProjectAndName(d.state, d.project, parentName)
+		storageInstance, err := instance.LoadByProjectAndName(d.state, d.project.Name, parentName)
 		if err != nil {
 			return "", nil, err
 		}
+
 		devices = storageInstance.ExpandedDevices()
 	}
 
@@ -1086,4 +1125,318 @@ func (d *common) needsNewInstanceID(changedConfig []string, oldExpandedDevices d
 	}
 
 	return false
+}
+
+// getStoragePool returns the current storage pool handle. To avoid a DB lookup each time this
+// function is called, the handle is cached internally in the struct.
+func (d *common) getStoragePool() (storagePools.Pool, error) {
+	if d.storagePool != nil {
+		return d.storagePool, nil
+	}
+
+	poolName, err := d.state.DB.Cluster.GetInstancePool(d.Project().Name, d.Name())
+	if err != nil {
+		return nil, err
+	}
+
+	pool, err := storagePools.LoadByName(d.state, poolName)
+	if err != nil {
+		return nil, err
+	}
+
+	d.storagePool = pool
+
+	return d.storagePool, nil
+}
+
+// deviceLoad instantiates and validates a new device and returns it along with enriched config.
+func (d *common) deviceLoad(inst instance.Instance, deviceName string, rawConfig deviceConfig.Device) (device.Device, error) {
+	var configCopy deviceConfig.Device
+	var err error
+
+	// Create copy of config and load some fields from volatile if device is nic or infiniband.
+	if shared.StringInSlice(rawConfig["type"], []string{"nic", "infiniband"}) {
+		configCopy, err = inst.FillNetworkDevice(deviceName, rawConfig)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Othewise copy the config so it cannot be modified by device.
+		configCopy = rawConfig.Clone()
+	}
+
+	dev, err := device.New(inst, d.state, deviceName, configCopy, d.deviceVolatileGetFunc(deviceName), d.deviceVolatileSetFunc(deviceName))
+
+	// If validation fails with unsupported device type then don't return the device for use.
+	if errors.Is(err, device.ErrUnsupportedDevType) {
+		return nil, err
+	}
+
+	// Return device even if error occurs as caller may still attempt to use device for stop and remove.
+	return dev, err
+}
+
+// deviceAdd loads a new device and calls its Add() function.
+func (d *common) deviceAdd(dev device.Device, instanceRunning bool) error {
+	l := d.logger.AddContext(logger.Ctx{"device": dev.Name(), "type": dev.Config()["type"]})
+	l.Debug("Adding device")
+
+	if instanceRunning && !dev.CanHotPlug() {
+		return fmt.Errorf("Device cannot be added when instance is running")
+	}
+
+	return dev.Add()
+}
+
+// deviceRemove loads a new device and calls its Remove() function.
+func (d *common) deviceRemove(dev device.Device, instanceRunning bool) error {
+	l := d.logger.AddContext(logger.Ctx{"device": dev.Name(), "type": dev.Config()["type"]})
+	l.Debug("Removing device")
+
+	if instanceRunning && !dev.CanHotPlug() {
+		return fmt.Errorf("Device cannot be removed when instance is running")
+	}
+
+	return dev.Remove()
+}
+
+// devicesAdd adds devices to instance and registers with MAAS.
+func (d *common) devicesAdd(inst instance.Instance, instanceRunning bool) (revert.Hook, error) {
+	revert := revert.New()
+	defer revert.Fail()
+
+	for _, entry := range d.expandedDevices.Sorted() {
+		dev, err := d.deviceLoad(inst, entry.Name, entry.Config)
+		if err != nil {
+			if errors.Is(err, device.ErrUnsupportedDevType) {
+				continue // Skip unsupported device (allows for mixed instance type profiles).
+			}
+
+			// If device conflicts with another device then do not call the deviceAdd function below
+			// as this could cause the original device to be disrupted (such as allowing conflicting
+			// static NIC DHCP leases to be created). Instead just log an error.
+			// This will allow instances to be created with conflicting devices (such as when copying
+			// or restoring a backup) and allows the user to manually fix the conflicts in order to
+			// allow the the instance to start.
+			if api.StatusErrorCheck(err, http.StatusConflict) {
+				d.logger.Error("Failed add validation for device, skipping add action", logger.Ctx{"device": entry.Name, "err": err})
+
+				continue
+			}
+
+			return nil, fmt.Errorf("Failed add validation for device %q: %w", entry.Name, err)
+		}
+
+		err = d.deviceAdd(dev, instanceRunning)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to add device %q: %w", dev.Name(), err)
+		}
+
+		revert.Add(func() { _ = d.deviceRemove(dev, instanceRunning) })
+	}
+
+	// Update MAAS (must run after the MAC addresses have been generated).
+	err := d.maasUpdate(inst, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	revert.Add(func() { _ = d.maasDelete(inst) })
+
+	cleanup := revert.Clone().Fail
+	revert.Success()
+	return cleanup, nil
+}
+
+// devicesRegister calls the Register() function on all of the instance's devices.
+func (d *common) devicesRegister(inst instance.Instance) {
+	for _, entry := range d.ExpandedDevices().Sorted() {
+		dev, err := d.deviceLoad(inst, entry.Name, entry.Config)
+		if err != nil {
+			if errors.Is(err, device.ErrUnsupportedDevType) {
+				continue // Skip unsupported device (allows for mixed instance type profiles).
+			}
+
+			d.logger.Error("Failed register validation for device", logger.Ctx{"err": err, "device": entry.Name})
+			continue
+		}
+
+		// Check whether device wants to register for any events.
+		err = dev.Register()
+		if err != nil {
+			d.logger.Error("Failed to register device", logger.Ctx{"err": err, "device": entry.Name})
+			continue
+		}
+	}
+}
+
+// devicesUpdate applies device changes to an instance.
+func (d *common) devicesUpdate(inst instance.Instance, removeDevices deviceConfig.Devices, addDevices deviceConfig.Devices, updateDevices deviceConfig.Devices, oldExpandedDevices deviceConfig.Devices, instanceRunning bool, userRequested bool) error {
+	revert := revert.New()
+	defer revert.Fail()
+
+	dm, ok := inst.(deviceManager)
+	if !ok {
+		return fmt.Errorf("Instance is not compatible with deviceManager interface")
+	}
+
+	// Remove devices in reverse order to how they were added.
+	for _, entry := range removeDevices.Reversed() {
+		l := d.logger.AddContext(logger.Ctx{"device": entry.Name, "userRequested": userRequested})
+		dev, err := d.deviceLoad(inst, entry.Name, entry.Config)
+		if err != nil {
+			if errors.Is(err, device.ErrUnsupportedDevType) {
+				continue // Skip unsupported device (allows for mixed instance type profiles).
+			}
+
+			// Just log an error, but still allow the device to be removed if usable device returned.
+			l.Error("Failed remove validation for device", logger.Ctx{"err": err})
+		}
+
+		// If a device was returned from deviceLoad even if validation fails, then try to stop and remove.
+		if dev != nil {
+			if instanceRunning {
+				err = dm.deviceStop(dev, instanceRunning, "")
+				if err != nil {
+					return fmt.Errorf("Failed to stop device %q: %w", dev.Name(), err)
+				}
+			}
+
+			err = d.deviceRemove(dev, instanceRunning)
+			if err != nil && err != device.ErrUnsupportedDevType {
+				return fmt.Errorf("Failed to remove device %q: %w", dev.Name(), err)
+			}
+		}
+
+		// Check whether we are about to add the same device back with updated config and
+		// if not, or if the device type has changed, then remove all volatile keys for
+		// this device (as its an actual removal or a device type change).
+		err = d.deviceVolatileReset(entry.Name, entry.Config, addDevices[entry.Name])
+		if err != nil {
+			return fmt.Errorf("Failed to reset volatile data for device %q: %w", entry.Name, err)
+		}
+	}
+
+	// Add devices in sorted order, this ensures that device mounts are added in path order.
+	for _, entry := range addDevices.Sorted() {
+		l := d.logger.AddContext(logger.Ctx{"device": entry.Name, "userRequested": userRequested})
+		dev, err := d.deviceLoad(inst, entry.Name, entry.Config)
+		if err != nil {
+			if errors.Is(err, device.ErrUnsupportedDevType) {
+				continue // Skip unsupported device (allows for mixed instance type profiles).
+			}
+
+			if userRequested {
+				return fmt.Errorf("Failed add validation for device %q: %w", entry.Name, err)
+			}
+
+			// If update is non-user requested (i.e from a snapshot restore), there's nothing we can
+			// do to fix the config and we don't want to prevent the snapshot restore so log and allow.
+			l.Error("Failed add validation for device, skipping as non-user requested", logger.Ctx{"err": err})
+
+			continue
+		}
+
+		err = d.deviceAdd(dev, instanceRunning)
+		if err != nil {
+			if userRequested {
+				return fmt.Errorf("Failed to add device %q: %w", dev.Name(), err)
+			}
+
+			// If update is non-user requested (i.e from a snapshot restore), there's nothing we can
+			// do to fix the config and we don't want to prevent the snapshot restore so log and allow.
+			l.Error("Failed to add device, skipping as non-user requested", logger.Ctx{"err": err})
+		}
+
+		revert.Add(func() { _ = d.deviceRemove(dev, instanceRunning) })
+
+		if instanceRunning {
+			err = dev.PreStartCheck()
+			if err != nil {
+				return fmt.Errorf("Failed pre-start check for device %q: %w", dev.Name(), err)
+			}
+
+			_, err := dm.deviceStart(dev, instanceRunning)
+			if err != nil && err != device.ErrUnsupportedDevType {
+				return fmt.Errorf("Failed to start device %q: %w", dev.Name(), err)
+			}
+
+			revert.Add(func() { _ = dm.deviceStop(dev, instanceRunning, "") })
+		}
+	}
+
+	for _, entry := range updateDevices.Sorted() {
+		l := d.logger.AddContext(logger.Ctx{"device": entry.Name, "userRequested": userRequested})
+		dev, err := d.deviceLoad(inst, entry.Name, entry.Config)
+		if err != nil {
+			if errors.Is(err, device.ErrUnsupportedDevType) {
+				continue // Skip unsupported device (allows for mixed instance type profiles).
+			}
+
+			if userRequested {
+				return fmt.Errorf("Failed update validation for device %q: %w", entry.Name, err)
+			}
+
+			// If update is non-user requested (i.e from a snapshot restore), there's nothing we can
+			// do to fix the config and we don't want to prevent the snapshot restore so log and allow.
+			// By not calling dev.Update on validation error we avoid potentially disrupting another
+			// existing device if this device conflicts with it (such as allowing conflicting static
+			// NIC DHCP leases to be created).
+			l.Error("Failed update validation for device, removing device", logger.Ctx{"err": err})
+
+			// If a device was returned from deviceLoad when validation fails, then try to stop and
+			// remove it. This is to prevent devices being left in a state that is different to the
+			// invalid non-user requested config that has been applied to DB. The safest thing to do
+			// is to cleanup the device and wait for the config to be corrected.
+			if dev != nil {
+				if instanceRunning {
+					err = dm.deviceStop(dev, instanceRunning, "")
+					if err != nil {
+						l.Error("Failed to stop device after update validation failed", logger.Ctx{"err": err})
+					}
+				}
+
+				err = d.deviceRemove(dev, instanceRunning)
+				if err != nil && err != device.ErrUnsupportedDevType {
+					l.Error("Failed to remove device after update validation failed", logger.Ctx{"err": err})
+				}
+			}
+
+			continue
+		}
+
+		err = dev.Update(oldExpandedDevices, instanceRunning)
+		if err != nil {
+			return fmt.Errorf("Failed to update device %q: %w", dev.Name(), err)
+		}
+	}
+
+	revert.Success()
+	return nil
+}
+
+// devicesRemove runs device removal function for each device.
+func (d *common) devicesRemove(inst instance.Instance) {
+	for _, entry := range d.expandedDevices.Reversed() {
+		dev, err := d.deviceLoad(inst, entry.Name, entry.Config)
+		if err != nil {
+			if errors.Is(err, device.ErrUnsupportedDevType) {
+				continue // Skip unsupported device (allows for mixed instance type profiles).
+			}
+
+			// Just log an error, but still allow the device to be removed if usable device returned.
+			d.logger.Error("Failed remove validation for device", logger.Ctx{"device": entry.Name, "err": err})
+		}
+
+		// If a usable device was returned from deviceLoad try to remove anyway, even if validation fails.
+		// This allows for the scenario where a new version of LXD has additional validation restrictions
+		// than older versions and we still need to allow previously valid devices to be stopped even if
+		// they are no longer considered valid.
+		if dev != nil {
+			err = d.deviceRemove(dev, false)
+			if err != nil {
+				d.logger.Error("Failed to remove device", logger.Ctx{"device": dev.Name(), "err": err})
+			}
+		}
+	}
 }

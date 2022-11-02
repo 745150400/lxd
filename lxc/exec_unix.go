@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package main
 
@@ -36,7 +35,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 		unix.SIGCONT)
 
 	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-	defer control.WriteMessage(websocket.CloseMessage, closeMsg)
+	defer func() { _ = control.WriteMessage(websocket.CloseMessage, closeMsg) }()
 
 	for {
 		sig := <-ch
@@ -54,6 +53,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("error setting term size %s", err)
 				return
 			}
+
 		case unix.SIGTERM:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGTERM)
@@ -61,20 +61,23 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", unix.SIGTERM)
 				return
 			}
+
 		case unix.SIGHUP:
 			file, err := os.OpenFile("/dev/tty", os.O_RDONLY|unix.O_NOCTTY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0666)
 			if err == nil {
-				file.Close()
+				_ = file.Close()
 				err = c.forwardSignal(control, unix.SIGHUP)
 			} else {
 				err = c.forwardSignal(control, unix.SIGTERM)
 				sig = unix.SIGTERM
 			}
+
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			if err != nil {
 				logger.Debugf("Failed to forward signal '%s'.", sig)
 				return
 			}
+
 		case unix.SIGINT:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGINT)
@@ -82,6 +85,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", unix.SIGINT)
 				return
 			}
+
 		case unix.SIGQUIT:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGQUIT)
@@ -89,6 +93,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", unix.SIGQUIT)
 				return
 			}
+
 		case unix.SIGABRT:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGABRT)
@@ -96,6 +101,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", unix.SIGABRT)
 				return
 			}
+
 		case unix.SIGTSTP:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGTSTP)
@@ -103,6 +109,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", unix.SIGTSTP)
 				return
 			}
+
 		case unix.SIGTTIN:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGTTIN)
@@ -110,6 +117,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", unix.SIGTTIN)
 				return
 			}
+
 		case unix.SIGTTOU:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGTTOU)
@@ -117,6 +125,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", unix.SIGTTOU)
 				return
 			}
+
 		case unix.SIGUSR1:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGUSR1)
@@ -124,6 +133,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", unix.SIGUSR1)
 				return
 			}
+
 		case unix.SIGUSR2:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGUSR2)
@@ -131,6 +141,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", unix.SIGUSR2)
 				return
 			}
+
 		case unix.SIGSEGV:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGSEGV)
@@ -138,6 +149,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", unix.SIGSEGV)
 				return
 			}
+
 		case unix.SIGCONT:
 			logger.Debugf("Received '%s signal', forwarding to executing program.", sig)
 			err := c.forwardSignal(control, unix.SIGCONT)

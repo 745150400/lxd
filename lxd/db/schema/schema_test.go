@@ -1,9 +1,9 @@
 package schema_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -15,16 +15,21 @@ import (
 	"github.com/lxc/lxd/shared"
 )
 
-// WriteTempFile creates a temp file with the specified content
+// WriteTempFile creates a temp file with the specified content.
 func WriteTempFile(dir string, prefix string, content string) (string, error) {
-	f, err := ioutil.TempFile(dir, prefix)
+	f, err := os.CreateTemp(dir, prefix)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+
+	defer func() { _ = f.Close() }()
 
 	_, err = f.WriteString(content)
-	return f.Name(), err
+	if err != nil {
+		return "", err
+	}
+
+	return f.Name(), f.Close()
 }
 
 // Create a new Schema by specifying an explicit map from versions to Update
@@ -105,7 +110,7 @@ func TestSchemaEnsure_ZeroUpdates(t *testing.T) {
 	tx, err := db.Begin()
 	assert.NoError(t, err)
 
-	versions, err := query.SelectIntegers(tx, "SELECT version FROM SCHEMA")
+	versions, err := query.SelectIntegers(context.Background(), tx, "SELECT version FROM SCHEMA")
 	assert.NoError(t, err)
 	assert.Equal(t, []int{}, versions)
 }
@@ -125,12 +130,12 @@ func TestSchemaEnsure_ApplyAllUpdates(t *testing.T) {
 	assert.NoError(t, err)
 
 	// THe update version is recorded.
-	versions, err := query.SelectIntegers(tx, "SELECT version FROM SCHEMA")
+	versions, err := query.SelectIntegers(context.Background(), tx, "SELECT version FROM SCHEMA")
 	assert.NoError(t, err)
 	assert.Equal(t, []int{1, 2}, versions)
 
 	// The two updates have been applied in order.
-	ids, err := query.SelectIntegers(tx, "SELECT id FROM test")
+	ids, err := query.SelectIntegers(context.Background(), tx, "SELECT id FROM test")
 	assert.NoError(t, err)
 	assert.Equal(t, []int{1}, ids)
 }
@@ -162,7 +167,7 @@ func TestSchemaEnsure_ApplyAfterInitialDumpCreation(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Only updates starting from the initial dump are recorded.
-	versions, err := query.SelectIntegers(tx, "SELECT version FROM SCHEMA")
+	versions, err := query.SelectIntegers(context.Background(), tx, "SELECT version FROM SCHEMA")
 	assert.NoError(t, err)
 	assert.Equal(t, []int{2, 3}, versions)
 }
@@ -184,12 +189,12 @@ func TestSchemaEnsure_OnlyApplyMissing(t *testing.T) {
 	assert.NoError(t, err)
 
 	// All update versions are recorded.
-	versions, err := query.SelectIntegers(tx, "SELECT version FROM SCHEMA")
+	versions, err := query.SelectIntegers(context.Background(), tx, "SELECT version FROM SCHEMA")
 	assert.NoError(t, err)
 	assert.Equal(t, []int{1, 2}, versions)
 
 	// The two updates have been applied in order.
-	ids, err := query.SelectIntegers(tx, "SELECT id FROM test")
+	ids, err := query.SelectIntegers(context.Background(), tx, "SELECT id FROM test")
 	assert.NoError(t, err)
 	assert.Equal(t, []int{1}, ids)
 }
@@ -207,7 +212,7 @@ func TestSchemaEnsure_FailingUpdate(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Not update was applied.
-	tables, err := query.SelectStrings(tx, "SELECT name FROM sqlite_master WHERE type = 'table'")
+	tables, err := query.SelectStrings(context.Background(), tx, "SELECT name FROM sqlite_master WHERE type = 'table'")
 	assert.NoError(t, err)
 	assert.NotContains(t, tables, "schema")
 	assert.NotContains(t, tables, "test")
@@ -218,7 +223,7 @@ func TestSchemaEnsure_FailingUpdate(t *testing.T) {
 func TestSchemaEnsure_FailingHook(t *testing.T) {
 	schema, db := newSchemaAndDB(t)
 	schema.Add(updateCreateTable)
-	schema.Hook(func(int, *sql.Tx) error { return fmt.Errorf("boom") })
+	schema.Hook(func(context.Context, int, *sql.Tx) error { return fmt.Errorf("boom") })
 	_, err := schema.Ensure(db)
 	assert.EqualError(t, err, "failed to execute hook (version 0): boom")
 
@@ -226,7 +231,7 @@ func TestSchemaEnsure_FailingHook(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Not update was applied.
-	tables, err := query.SelectStrings(tx, "SELECT name FROM sqlite_master WHERE type = 'table'")
+	tables, err := query.SelectStrings(context.Background(), tx, "SELECT name FROM sqlite_master WHERE type = 'table'")
 	assert.NoError(t, err)
 	assert.NotContains(t, tables, "schema")
 	assert.NotContains(t, tables, "test")
@@ -235,7 +240,7 @@ func TestSchemaEnsure_FailingHook(t *testing.T) {
 // If the schema check callback returns ErrGracefulAbort, the process is
 // aborted, although every change performed so far gets still committed.
 func TestSchemaEnsure_CheckGracefulAbort(t *testing.T) {
-	check := func(current int, tx *sql.Tx) error {
+	check := func(ctx context.Context, current int, tx *sql.Tx) error {
 		_, err := tx.Exec("CREATE TABLE test (n INTEGER)")
 		require.NoError(t, err)
 		return schema.ErrGracefulAbort
@@ -253,7 +258,7 @@ func TestSchemaEnsure_CheckGracefulAbort(t *testing.T) {
 
 	// The table created by the check function still got committed.
 	// to insert the row was not.
-	ids, err := query.SelectIntegers(tx, "SELECT n FROM test")
+	ids, err := query.SelectIntegers(context.Background(), tx, "SELECT n FROM test")
 	assert.NoError(t, err)
 	assert.Equal(t, []int{}, ids)
 }
@@ -279,7 +284,7 @@ func TestSchemaDump(t *testing.T) {
 	assert.NoError(t, err)
 
 	// All update versions are in place.
-	versions, err := query.SelectIntegers(tx, "SELECT version FROM schema")
+	versions, err := query.SelectIntegers(context.Background(), tx, "SELECT version FROM schema")
 	assert.NoError(t, err)
 	assert.Equal(t, []int{2}, versions)
 
@@ -308,6 +313,7 @@ func TestSchema_Trim(t *testing.T) {
 		2: updateInsertValue,
 		3: updateAddColumn,
 	}
+
 	schema := schema.NewFromMap(updates)
 	trimmed := schema.Trim(2)
 	assert.Len(t, trimmed, 1)
@@ -319,7 +325,7 @@ func TestSchema_Trim(t *testing.T) {
 	tx, err := db.Begin()
 	require.NoError(t, err)
 
-	versions, err := query.SelectIntegers(tx, "SELECT version FROM schema")
+	versions, err := query.SelectIntegers(context.Background(), tx, "SELECT version FROM schema")
 	require.NoError(t, err)
 	assert.Equal(t, []int{1, 2}, versions)
 }
@@ -340,12 +346,12 @@ func TestSchema_ExeciseUpdate(t *testing.T) {
 	require.NoError(t, err)
 
 	// Update 2 has been applied.
-	ids, err := query.SelectIntegers(tx, "SELECT id FROM test")
+	ids, err := query.SelectIntegers(context.Background(), tx, "SELECT id FROM test")
 	require.NoError(t, err)
 	assert.Equal(t, []int{1}, ids)
 
 	// Update 3 has not been applied.
-	_, err = query.SelectStrings(tx, "SELECT name FROM test")
+	_, err = query.SelectStrings(context.Background(), tx, "SELECT name FROM test")
 	require.EqualError(t, err, "no such column: name")
 }
 
@@ -367,7 +373,7 @@ func TestSchema_File_Garbage(t *testing.T) {
 
 	path, err := WriteTempFile("", "lxd-db-schema-", "SELECT FROM baz")
 	require.NoError(t, err)
-	defer os.Remove(path)
+	defer func() { _ = os.Remove(path) }()
 
 	schema.File(path)
 
@@ -390,7 +396,7 @@ func TestSchema_File(t *testing.T) {
 INSERT INTO test VALUES (2);
 `)
 	require.NoError(t, err)
-	defer os.Remove(path)
+	defer func() { _ = os.Remove(path) }()
 
 	schema.File(path)
 
@@ -404,7 +410,7 @@ INSERT INTO test VALUES (2);
 	tx, err := db.Begin()
 	require.NoError(t, err)
 
-	ids, err := query.SelectIntegers(tx, "SELECT id FROM test ORDER BY id")
+	ids, err := query.SelectIntegers(context.Background(), tx, "SELECT id FROM test ORDER BY id")
 	require.NoError(t, err)
 	assert.Equal(t, []int{1, 2}, ids)
 }
@@ -421,17 +427,18 @@ func TestSchema_File_Hook(t *testing.T) {
 	// non-existing table.
 	path, err := WriteTempFile("", "lxd-db-schema-", "INSERT INTO test VALUES (2)")
 	require.NoError(t, err)
-	defer os.Remove(path)
+	defer func() { _ = os.Remove(path) }()
 
 	schema.File(path)
 
 	// Add a hook that takes care of creating the test table, this shows
 	// that it's run before anything else.
-	schema.Hook(func(version int, tx *sql.Tx) error {
+	schema.Hook(func(ctx context.Context, version int, tx *sql.Tx) error {
 		if version == -1 {
 			_, err := tx.Exec("CREATE TABLE test (id INTEGER)")
 			return err
 		}
+
 		return nil
 	})
 
@@ -442,7 +449,7 @@ func TestSchema_File_Hook(t *testing.T) {
 	tx, err := db.Begin()
 	require.NoError(t, err)
 
-	ids, err := query.SelectIntegers(tx, "SELECT id FROM test ORDER BY id")
+	ids, err := query.SelectIntegers(context.Background(), tx, "SELECT id FROM test ORDER BY id")
 	require.NoError(t, err)
 	assert.Equal(t, []int{1, 2}, ids)
 }
@@ -460,29 +467,29 @@ func newSchemaAndDB(t *testing.T) (*schema.Schema, *sql.DB) {
 }
 
 // An update that does nothing.
-func updateNoop(*sql.Tx) error {
+func updateNoop(context.Context, *sql.Tx) error {
 	return nil
 }
 
 // An update that creates a test table.
-func updateCreateTable(tx *sql.Tx) error {
+func updateCreateTable(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("CREATE TABLE test (id INTEGER)")
 	return err
 }
 
 // An update that inserts a value into the test table.
-func updateInsertValue(tx *sql.Tx) error {
+func updateInsertValue(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("INSERT INTO test VALUES (1)")
 	return err
 }
 
 // An update that adds a column to the test tabble.
-func updateAddColumn(tx *sql.Tx) error {
+func updateAddColumn(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("ALTER TABLE test ADD COLUMN name TEXT")
 	return err
 }
 
 // An update that unconditionally fails with an error.
-func updateBoom(tx *sql.Tx) error {
+func updateBoom(ctx context.Context, tx *sql.Tx) error {
 	return fmt.Errorf("boom")
 }

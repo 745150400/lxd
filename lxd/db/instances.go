@@ -1,116 +1,23 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/db/query"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 )
-
-// Code generation directives.
-//
-//go:generate -command mapper lxd-generate db mapper -t instances.mapper.go
-//go:generate mapper reset
-//
-//go:generate mapper stmt -p db -e instance objects
-//go:generate mapper stmt -p db -e instance objects-by-ID
-//go:generate mapper stmt -p db -e instance objects-by-Project
-//go:generate mapper stmt -p db -e instance objects-by-Project-and-Type
-//go:generate mapper stmt -p db -e instance objects-by-Project-and-Type-and-Node
-//go:generate mapper stmt -p db -e instance objects-by-Project-and-Type-and-Node-and-Name
-//go:generate mapper stmt -p db -e instance objects-by-Project-and-Type-and-Name
-//go:generate mapper stmt -p db -e instance objects-by-Project-and-Name
-//go:generate mapper stmt -p db -e instance objects-by-Project-and-Name-and-Node
-//go:generate mapper stmt -p db -e instance objects-by-Project-and-Node
-//go:generate mapper stmt -p db -e instance objects-by-Type
-//go:generate mapper stmt -p db -e instance objects-by-Type-and-Name
-//go:generate mapper stmt -p db -e instance objects-by-Type-and-Name-and-Node
-//go:generate mapper stmt -p db -e instance objects-by-Type-and-Node
-//go:generate mapper stmt -p db -e instance objects-by-Node
-//go:generate mapper stmt -p db -e instance objects-by-Node-and-Name
-//go:generate mapper stmt -p db -e instance objects-by-Name
-//go:generate mapper stmt -p db -e instance id
-//go:generate mapper stmt -p db -e instance create struct=Instance
-//go:generate mapper stmt -p db -e instance rename
-//go:generate mapper stmt -p db -e instance delete-by-Project-and-Name
-//go:generate mapper stmt -p db -e instance update struct=Instance
-//
-//go:generate mapper method -p db -e instance GetMany
-//go:generate mapper method -p db -e instance GetOne
-//go:generate mapper method -p db -e instance URIs
-//go:generate mapper method -p db -e instance ID struct=Instance
-//go:generate mapper method -p db -e instance Exists struct=Instance
-//go:generate mapper method -p db -e instance Create struct=Instance
-//go:generate mapper method -p db -e instance Rename
-//go:generate mapper method -p db -e instance DeleteOne-by-Project-and-Name
-//go:generate mapper method -p db -e instance Update struct=Instance
-
-// Instance is a value object holding db-related details about an instance.
-type Instance struct {
-	ID           int
-	Project      string `db:"primary=yes&join=projects.name"`
-	Name         string `db:"primary=yes"`
-	Node         string `db:"join=nodes.name"`
-	Type         instancetype.Type
-	Snapshot     bool `db:"ignore"`
-	Architecture int
-	Ephemeral    bool
-	CreationDate time.Time
-	Stateful     bool
-	LastUseDate  sql.NullTime
-	Description  string `db:"coalesce=''"`
-	Config       map[string]string
-	Devices      map[string]Device
-	Profiles     []string
-	ExpiryDate   sql.NullTime
-}
-
-// InstanceFilter specifies potential query parameter fields.
-type InstanceFilter struct {
-	ID      *int
-	Project *string
-	Name    *string
-	Node    *string
-	Type    *instancetype.Type
-}
-
-// InstanceToArgs is a convenience to convert an Instance db struct into the legacy InstanceArgs.
-func InstanceToArgs(inst *Instance) InstanceArgs {
-	args := InstanceArgs{
-		ID:           inst.ID,
-		Project:      inst.Project,
-		Name:         inst.Name,
-		Node:         inst.Node,
-		Type:         inst.Type,
-		Snapshot:     inst.Snapshot,
-		Architecture: inst.Architecture,
-		Ephemeral:    inst.Ephemeral,
-		CreationDate: inst.CreationDate,
-		Stateful:     inst.Stateful,
-		LastUsedDate: inst.LastUseDate.Time,
-		Description:  inst.Description,
-		Config:       inst.Config,
-		Devices:      deviceConfig.NewDevices(DevicesToAPI(inst.Devices)),
-		Profiles:     inst.Profiles,
-		ExpiryDate:   inst.ExpiryDate.Time,
-	}
-
-	if args.Devices == nil {
-		args.Devices = deviceConfig.Devices{}
-	}
-
-	return args
-}
 
 // InstanceArgs is a value object holding all db-related details about an instance.
 type InstanceArgs struct {
@@ -132,38 +39,29 @@ type InstanceArgs struct {
 	Ephemeral    bool
 	LastUsedDate time.Time
 	Name         string
-	Profiles     []string
+	Profiles     []api.Profile
 	Stateful     bool
 	ExpiryDate   time.Time
 }
 
-// InstanceTypeFilter returns an InstanceFilter populated with a valid instance type,
-// or an empty filter if instance type is 'Any'.
-func InstanceTypeFilter(instanceType instancetype.Type) InstanceFilter {
-	if instanceType != instancetype.Any {
-		return InstanceFilter{Type: &instanceType}
-	}
-	return InstanceFilter{}
-}
-
 // GetInstanceNames returns the names of all containers the given project.
-func (c *ClusterTx) GetInstanceNames(project string) ([]string, error) {
+func (c *ClusterTx) GetInstanceNames(ctx context.Context, project string) ([]string, error) {
 	stmt := `
 SELECT instances.name FROM instances
   JOIN projects ON projects.id = instances.project_id
   WHERE projects.name = ? AND instances.type = ?
 `
-	return query.SelectStrings(c.tx, stmt, project, instancetype.Any)
+	return query.SelectStrings(ctx, c.tx, stmt, project, instancetype.Any)
 }
 
 // GetNodeAddressOfInstance returns the address of the node hosting the
 // instance with the given name in the given project.
 //
 // It returns the empty string if the container is hosted on this node.
-func (c *ClusterTx) GetNodeAddressOfInstance(project string, name string, filter InstanceFilter) (string, error) {
+func (c *ClusterTx) GetNodeAddressOfInstance(ctx context.Context, project string, name string, instType instancetype.Type) (string, error) {
 	var stmt string
 
-	args := make([]interface{}, 0, 4) // Expect up to 4 filters.
+	args := make([]any, 0, 4) // Expect up to 4 filters.
 	var filters strings.Builder
 
 	// Project filter.
@@ -171,9 +69,9 @@ func (c *ClusterTx) GetNodeAddressOfInstance(project string, name string, filter
 	args = append(args, project)
 
 	// Instance type filter.
-	if filter.Type != nil {
+	if instType != instancetype.Any {
 		filters.WriteString(" AND instances.type = ?")
-		args = append(args, *filter.Type)
+		args = append(args, instType)
 	}
 
 	if strings.Contains(name, shared.SnapshotDelimiter) {
@@ -211,14 +109,15 @@ SELECT nodes.id, nodes.address
 
 	var address string
 	var id int64
-	rows, err := c.tx.Query(stmt, args...)
+	rows, err := c.tx.QueryContext(ctx, stmt, args...)
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
+
+	defer func() { _ = rows.Close() }()
 
 	if !rows.Next() {
-		return "", ErrNoSuchObject
+		return "", api.StatusErrorf(http.StatusNotFound, "Instance not found")
 	}
 
 	err = rows.Scan(&id, &address)
@@ -227,7 +126,7 @@ SELECT nodes.id, nodes.address
 	}
 
 	if rows.Next() {
-		return "", fmt.Errorf("More than one node associated with instance")
+		return "", fmt.Errorf("More than one cluster member associated with instance")
 	}
 
 	err = rows.Err()
@@ -246,29 +145,29 @@ SELECT nodes.id, nodes.address
 // cluster node address. Each node address has a slice of instances, where each instance is represented
 // as an array of length 2 in which element 0 is the project and element 1 is the instance name.
 //
-// The node address of instances running on the local node is set to the empty
+// The node address of instances running on the local member is set to the empty
 // string, to distinguish it from remote nodes.
 //
 // Instances whose node is down are added to the special address "0.0.0.0".
-func (c *ClusterTx) GetProjectAndInstanceNamesByNodeAddress(projects []string, filter InstanceFilter) (map[string][][2]string, error) {
-	offlineThreshold, err := c.GetNodeOfflineThreshold()
+func (c *ClusterTx) GetProjectAndInstanceNamesByNodeAddress(ctx context.Context, projects []string, instType instancetype.Type) (map[string][][2]string, error) {
+	offlineThreshold, err := c.GetNodeOfflineThreshold(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	args := make([]interface{}, 0, 2) // Expect up to 2 filters.
+	args := make([]any, 0, 2) // Expect up to 2 filters.
 	var filters strings.Builder
 
 	// Project filter.
-	filters.WriteString(fmt.Sprintf("projects.name IN (%s)", generateInClauseParams(len(projects))))
+	filters.WriteString(fmt.Sprintf("projects.name IN %s", query.Params(len(projects))))
 	for _, project := range projects {
 		args = append(args, project)
 	}
 
 	// Instance type filter.
-	if filter.Type != nil {
+	if instType != instancetype.Any {
 		filters.WriteString(" AND instances.type = ?")
-		args = append(args, *filter.Type)
+		args = append(args, instType)
 	}
 
 	stmt := fmt.Sprintf(`
@@ -280,11 +179,12 @@ SELECT instances.name, nodes.id, nodes.address, nodes.heartbeat, projects.name
   ORDER BY instances.id
 `, filters.String())
 
-	rows, err := c.tx.Query(stmt, args...)
+	rows, err := c.tx.QueryContext(ctx, stmt, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+
+	defer func() { _ = rows.Close() }()
 
 	result := map[string][][2]string{}
 
@@ -298,11 +198,13 @@ SELECT instances.name, nodes.id, nodes.address, nodes.heartbeat, projects.name
 		if err != nil {
 			return nil, err
 		}
+
 		if nodeID == c.nodeID {
 			nodeAddress = ""
 		} else if nodeIsOffline(offlineThreshold, nodeHeartbeat) {
 			nodeAddress = "0.0.0.0"
 		}
+
 		result[nodeAddress] = append(result[nodeAddress], [2]string{projectName, instanceName})
 	}
 
@@ -310,6 +212,7 @@ SELECT instances.name, nodes.id, nodes.address, nodes.heartbeat, projects.name
 	if err != nil {
 		return nil, err
 	}
+
 	return result, nil
 }
 
@@ -317,49 +220,64 @@ SELECT instances.name, nodes.id, nodes.address, nodes.heartbeat, projects.name
 var ErrInstanceListStop = fmt.Errorf("search stopped")
 
 // InstanceList loads all instances across all projects and for each instance runs the instanceFunc passing in the
-// instance and it's project and profiles. Accepts optional filter argument to specify a subset of instances.
-func (c *Cluster) InstanceList(filter *InstanceFilter, instanceFunc func(inst Instance, project Project, profiles []api.Profile) error) error {
-	var instances []Instance
-	projectMap := map[string]Project{}
-	projectHasProfiles := map[string]bool{}
-	profilesByProjectAndName := map[string]map[string]Profile{}
+// instance and it's project and profiles. Accepts optional filter arguments to specify a subset of instances.
+func (c *Cluster) InstanceList(instanceFunc func(inst InstanceArgs, project api.Project) error, filters ...cluster.InstanceFilter) error {
+	projectsByName := make(map[string]*api.Project)
+	var instances map[int]InstanceArgs
 
-	if filter == nil {
-		filter = &InstanceFilter{}
+	emptyFilter := cluster.InstanceFilter{}
+	validFilters := []cluster.InstanceFilter{}
+	for _, filter := range filters {
+		if filter.Type != nil && *filter.Type == instancetype.Any {
+			filter.Type = nil
+		}
+
+		if filter != emptyFilter {
+			validFilters = append(validFilters, filter)
+		}
 	}
 
 	// Retrieve required info from the database in single transaction for performance.
-	err := c.Transaction(func(tx *ClusterTx) error {
-		var err error
-		instances, err = tx.GetInstances(*filter)
-		if err != nil {
-			return fmt.Errorf("Failed loading instances: %w", err)
-		}
-
-		projects, err := tx.GetProjects(ProjectFilter{})
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		// Get all projects.
+		projects, err := cluster.GetProjects(ctx, tx.tx)
 		if err != nil {
 			return fmt.Errorf("Failed loading projects: %w", err)
 		}
 
-		// Index of all projects by name and record which projects have the profiles feature.
-		for i, project := range projects {
-			projectMap[project.Name] = projects[i]
-			projectHasProfiles[project.Name] = shared.IsTrue(project.Config["features.profiles"])
-		}
-
-		profiles, err := tx.GetProfiles(ProfileFilter{})
+		// Get all instances using supplied filter.
+		dbInstances, err := cluster.GetInstances(ctx, tx.tx, validFilters...)
 		if err != nil {
-			return fmt.Errorf("Failed loading profiles: %w", err)
+			return fmt.Errorf("Failed loading instances: %w", err)
 		}
 
-		// Index of all profiles by project and name.
-		for _, profile := range profiles {
-			profilesByName, ok := profilesByProjectAndName[profile.Project]
+		// Fill instances with config, devices and profiles.
+		instances, err = tx.InstancesToInstanceArgs(ctx, true, dbInstances...)
+		if err != nil {
+			return err
+		}
+
+		// Record which projects are referenced by at least one instance in the list.
+		for _, instance := range instances {
+			_, ok := projectsByName[instance.Project]
 			if !ok {
-				profilesByName = map[string]Profile{}
-				profilesByProjectAndName[profile.Project] = profilesByName
+				projectsByName[instance.Project] = nil
 			}
-			profilesByName[profile.Name] = profile
+		}
+
+		// Populate projectsByName map entry for referenced projects.
+		// This way we only call ToAPI() on the projects actually referenced by the instances in
+		// the list, which can reduce the number of queries run.
+		for _, project := range projects {
+			_, ok := projectsByName[project.Name]
+			if !ok {
+				continue
+			}
+
+			projectsByName[project.Name], err = project.ToAPI(ctx, tx.tx)
+			if err != nil {
+				return err
+			}
 		}
 
 		return nil
@@ -371,21 +289,12 @@ func (c *Cluster) InstanceList(filter *InstanceFilter, instanceFunc func(inst In
 	// Call the instanceFunc provided for each instance after the transaction has ended, as we don't know if
 	// the instanceFunc will be slow or may need to make additional DB queries.
 	for _, instance := range instances {
-		profiles := make([]api.Profile, len(instance.Profiles))
-
-		// If the instance's project does not have the profiles feature enabled,
-		// we fall back to the default project.
-		profilesProject := instance.Project
-		if !projectHasProfiles[profilesProject] {
-			profilesProject = "default" // Equivalent to project.Default constant.
+		project := projectsByName[instance.Project]
+		if project == nil {
+			return fmt.Errorf("Instance references %d project %q that isn't loaded", instance.ID, instance.Project)
 		}
 
-		for j, name := range instance.Profiles {
-			profile := profilesByProjectAndName[profilesProject][name]
-			profiles[j] = *ProfileToAPI(&profile)
-		}
-
-		err = instanceFunc(instance, projectMap[instance.Project], profiles)
+		err = instanceFunc(instance, *project)
 		if err != nil {
 			return err
 		}
@@ -394,22 +303,357 @@ func (c *Cluster) InstanceList(filter *InstanceFilter, instanceFunc func(inst In
 	return nil
 }
 
+// instanceConfigFill function loads config for all specified instances in a single query and then updates
+// the entries in the instances map.
+func (c *ClusterTx) instanceConfigFill(ctx context.Context, snapshotsMode bool, instanceArgs *map[int]InstanceArgs) error {
+	instances := *instanceArgs
+
+	// Don't use query parameters for the IN statement to workaround an issue in Dqlite (apparently)
+	// that means that >255 query parameters causes partial result sets. See #10705
+	// This is safe as the inputs are ints.
+	var q strings.Builder
+
+	if snapshotsMode {
+		q.WriteString(`SELECT
+			instance_snapshot_id,
+			key,
+			value
+		FROM instances_snapshots_config
+		WHERE instance_snapshot_id IN (`)
+	} else {
+		q.WriteString(`SELECT
+			instance_id,
+			key,
+			value
+		FROM instances_config
+		WHERE instance_id IN (`)
+	}
+
+	q.Grow(len(instances) * 2) // We know the minimum length of the separators and integers.
+
+	first := true
+	for instanceID := range instances {
+		if !first {
+			q.WriteString(",")
+		}
+
+		first = false
+
+		q.WriteString(fmt.Sprintf("%d", instanceID))
+	}
+
+	q.WriteString(`)`)
+
+	return query.Scan(ctx, c.Tx(), q.String(), func(scan func(dest ...any) error) error {
+		var instanceID int
+		var key, value string
+
+		err := scan(&instanceID, &key, &value)
+		if err != nil {
+			return err
+		}
+
+		_, found := instances[instanceID]
+		if !found {
+			return fmt.Errorf("Failed loading instance config, referenced instance %d not loaded", instanceID)
+		}
+
+		if instances[instanceID].Config == nil {
+			inst := instances[instanceID]
+			inst.Config = make(map[string]string)
+			instances[instanceID] = inst
+		}
+
+		_, found = instances[instanceID].Config[key]
+		if found {
+			return fmt.Errorf("Duplicate config row found for key %q for instance ID %d", key, instanceID)
+		}
+
+		instances[instanceID].Config[key] = value
+
+		return nil
+	})
+}
+
+// instanceDevicesFill loads the device config for all instances specified in a single query and then updates
+// the entries in the instances map.
+func (c *ClusterTx) instanceDevicesFill(ctx context.Context, snapshotsMode bool, instanceArgs *map[int]InstanceArgs) error {
+	instances := *instanceArgs
+
+	// Don't use query parameters for the IN statement to workaround an issue in Dqlite (apparently)
+	// that means that >255 query parameters causes partial result sets. See #10705
+	// This is safe as the inputs are ints.
+	var q strings.Builder
+
+	if snapshotsMode {
+		q.WriteString(`
+		SELECT
+			instances_snapshots_devices.instance_snapshot_id AS instance_snapshot_id,
+			instances_snapshots_devices.name AS device_name,
+			instances_snapshots_devices.type AS device_type,
+			instances_snapshots_devices_config.key,
+			instances_snapshots_devices_config.value
+		FROM instances_snapshots_devices_config
+		JOIN instances_snapshots_devices ON instances_snapshots_devices.id = instances_snapshots_devices_config.instance_snapshot_device_id
+		WHERE instances_snapshots_devices.instance_snapshot_id IN (`)
+	} else {
+		q.WriteString(`
+		SELECT
+			instances_devices.instance_id AS instance_id,
+			instances_devices.name AS device_name,
+			instances_devices.type AS device_type,
+			instances_devices_config.key,
+			instances_devices_config.value
+		FROM instances_devices_config
+		JOIN instances_devices ON instances_devices.id = instances_devices_config.instance_device_id
+		WHERE instances_devices.instance_id IN (`)
+	}
+
+	q.Grow(len(instances) * 2) // We know the minimum length of the separators and integers.
+
+	first := true
+	for instanceID := range instances {
+		if !first {
+			q.WriteString(",")
+		}
+
+		first = false
+
+		q.WriteString(fmt.Sprintf("%d", instanceID))
+	}
+
+	q.WriteString(`)`)
+
+	return query.Scan(ctx, c.Tx(), q.String(), func(scan func(dest ...any) error) error {
+		var instanceID int
+		var deviceType cluster.DeviceType
+		var deviceName, key, value string
+
+		err := scan(&instanceID, &deviceName, &deviceType, &key, &value)
+		if err != nil {
+			return err
+		}
+
+		_, found := instances[instanceID]
+		if !found {
+			return fmt.Errorf("Failed loading instance device, referenced instance %d not loaded", instanceID)
+		}
+
+		if instances[instanceID].Devices == nil {
+			inst := instances[instanceID]
+			inst.Devices = make(deviceConfig.Devices)
+			instances[instanceID] = inst
+		}
+
+		_, found = instances[instanceID].Devices[deviceName]
+		if !found {
+			instances[instanceID].Devices[deviceName] = deviceConfig.Device{
+				"type": deviceType.String(), // Map instances_devices type to config field.
+			}
+		}
+
+		_, found = instances[instanceID].Devices[deviceName][key]
+		if found && key != "type" {
+			// For legacy reasons the type value is in both the instances_devices and
+			// instances_devices_config tables. We use the one from the instances_devices.
+			return fmt.Errorf("Duplicate device row found for device %q key %q for instance ID %d", deviceName, key, instanceID)
+		}
+
+		instances[instanceID].Devices[deviceName][key] = value
+
+		return nil
+	})
+}
+
+// instanceProfiles loads the profile IDs to apply to an instance (in the application order) for all
+// instanceIDs in a single query and then updates the instanceApplyProfileIDs and profilesByID maps.
+func (c *ClusterTx) instanceProfilesFill(ctx context.Context, snapshotsMode bool, instanceArgs *map[int]InstanceArgs) error {
+	instances := *instanceArgs
+
+	// Get profiles referenced by instances.
+	// Don't use query parameters for the IN statement to workaround an issue in Dqlite (apparently)
+	// that means that >255 query parameters causes partial result sets. See #10705
+	// This is safe as the inputs are ints.
+	var q strings.Builder
+
+	if snapshotsMode {
+		q.WriteString(`
+		SELECT
+			instances_snapshots.id AS snapshot_id,
+			instances_profiles.profile_id AS profile_id
+		FROM instances_profiles
+		JOIN instances_snapshots ON instances_snapshots.instance_id = instances_profiles.instance_id
+		WHERE instances_snapshots.id IN (`)
+	} else {
+		q.WriteString(`
+		SELECT
+			instances_profiles.instance_id AS instance_id,
+			instances_profiles.profile_id AS profile_id
+		FROM instances_profiles
+		WHERE instances_profiles.instance_id IN (`)
+	}
+
+	q.Grow(len(instances) * 2) // We know the minimum length of the separators and integers.
+
+	first := true
+	for instanceID := range instances {
+		if !first {
+			q.WriteString(",")
+		}
+
+		first = false
+
+		q.WriteString(fmt.Sprintf("%d", instanceID))
+	}
+
+	q.WriteString(`)
+		ORDER BY instances_profiles.instance_id, instances_profiles.apply_order`)
+
+	profilesByID := make(map[int]*api.Profile)
+	instanceApplyProfileIDs := make(map[int64][]int, len(instances))
+
+	err := query.Scan(ctx, c.Tx(), q.String(), func(scan func(dest ...any) error) error {
+		var instanceID int64
+		var profileID int
+
+		err := scan(&instanceID, &profileID)
+		if err != nil {
+			return err
+		}
+
+		instanceApplyProfileIDs[instanceID] = append(instanceApplyProfileIDs[instanceID], profileID)
+
+		// Record that this profile is referenced by at least one instance in the list.
+		_, ok := profilesByID[profileID]
+		if !ok {
+			profilesByID[profileID] = nil
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Get all profiles.
+	profiles, err := cluster.GetProfiles(context.TODO(), c.Tx())
+	if err != nil {
+		return fmt.Errorf("Failed loading profiles: %w", err)
+	}
+
+	// Populate profilesByID map entry for referenced profiles.
+	// This way we only call ToAPI() on the profiles actually referenced by the instances in
+	// the list, which can reduce the number of queries run.
+	for _, profile := range profiles {
+		_, ok := profilesByID[profile.ID]
+		if !ok {
+			continue
+		}
+
+		profilesByID[profile.ID], err = profile.ToAPI(context.TODO(), c.tx)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Populate instance profiles list in apply order.
+	for instanceID := range instances {
+		inst := instances[instanceID]
+
+		inst.Profiles = make([]api.Profile, 0, len(inst.Profiles))
+		for _, applyProfileID := range instanceApplyProfileIDs[int64(inst.ID)] {
+			profile := profilesByID[applyProfileID]
+			if profile == nil {
+				return fmt.Errorf("Instance %d references profile %d that isn't loaded", inst.ID, applyProfileID)
+			}
+
+			inst.Profiles = append(inst.Profiles, *profile)
+		}
+
+		instances[instanceID] = inst
+	}
+
+	return nil
+}
+
+// InstancesToInstanceArgs converts many cluster.Instance to a map of InstanceArgs in as few queries as possible.
+// Accepts fillProfiles argument that controls whether or not the returned InstanceArgs have their Profiles field
+// populated. This avoids the need to load profile info from the database if it is already available in the
+// caller's context and can be populated afterwards.
+func (c *ClusterTx) InstancesToInstanceArgs(ctx context.Context, fillProfiles bool, instances ...cluster.Instance) (map[int]InstanceArgs, error) {
+	var instanceCount, snapshotCount uint
+
+	// Convert instances to partial InstanceArgs slice (Config, Devices and Profiles not populated yet).
+	instanceArgs := make(map[int]InstanceArgs, len(instances))
+	for _, instance := range instances {
+		if instance.Snapshot {
+			snapshotCount++
+		} else {
+			instanceCount++
+		}
+
+		args := InstanceArgs{
+			ID:           instance.ID,
+			Project:      instance.Project,
+			Name:         instance.Name,
+			Node:         instance.Node,
+			Type:         instance.Type,
+			Snapshot:     instance.Snapshot,
+			Architecture: instance.Architecture,
+			Ephemeral:    instance.Ephemeral,
+			CreationDate: instance.CreationDate,
+			Stateful:     instance.Stateful,
+			LastUsedDate: instance.LastUseDate.Time,
+			Description:  instance.Description,
+			ExpiryDate:   instance.ExpiryDate.Time,
+		}
+
+		instanceArgs[instance.ID] = args
+	}
+
+	if instanceCount > 0 && snapshotCount > 0 {
+		return nil, fmt.Errorf("Cannot use InstancesToInstanceArgs with mixed instance and instance snapshots")
+	}
+
+	// Populate instance config.
+	err := c.instanceConfigFill(ctx, snapshotCount > 0, &instanceArgs)
+	if err != nil {
+		return nil, fmt.Errorf("Failed loading instance config: %w", err)
+	}
+
+	// Populate instance devices.
+	err = c.instanceDevicesFill(ctx, snapshotCount > 0, &instanceArgs)
+	if err != nil {
+		return nil, fmt.Errorf("Failed loading instance devices: %w", err)
+	}
+
+	// Populate instance profiles if requested.
+	if fillProfiles {
+		err = c.instanceProfilesFill(ctx, snapshotCount > 0, &instanceArgs)
+		if err != nil {
+			return nil, fmt.Errorf("Failed loading instance profiles: %w", err)
+		}
+	}
+
+	return instanceArgs, nil
+}
+
 // GetProjectInstanceToNodeMap returns a map associating the project (key element 0) and name (key element 1) of each
 // instance in the given projects to the name of the node hosting the instance.
-func (c *ClusterTx) GetProjectInstanceToNodeMap(projects []string, filter InstanceFilter) (map[[2]string]string, error) {
-	args := make([]interface{}, 0, 2) // Expect up to 2 filters.
+func (c *ClusterTx) GetProjectInstanceToNodeMap(ctx context.Context, projects []string, instType instancetype.Type) (map[[2]string]string, error) {
+	args := make([]any, 0, 2) // Expect up to 2 filters.
 	var filters strings.Builder
 
 	// Project filter.
-	filters.WriteString(fmt.Sprintf("projects.name IN (%s)", generateInClauseParams(len(projects))))
+	filters.WriteString(fmt.Sprintf("projects.name IN %s", query.Params(len(projects))))
 	for _, project := range projects {
 		args = append(args, project)
 	}
 
 	// Instance type filter.
-	if filter.Type != nil {
+	if instType != instancetype.Any {
 		filters.WriteString(" AND instances.type = ?")
-		args = append(args, *filter.Type)
+		args = append(args, instType)
 	}
 
 	stmt := fmt.Sprintf(`
@@ -420,11 +664,12 @@ SELECT instances.name, nodes.name, projects.name
   WHERE %s
 `, filters.String())
 
-	rows, err := c.tx.Query(stmt, args...)
+	rows, err := c.tx.QueryContext(ctx, stmt, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+
+	defer func() { _ = rows.Close() }()
 
 	result := map[[2]string]string{}
 
@@ -436,6 +681,7 @@ SELECT instances.name, nodes.name, projects.name
 		if err != nil {
 			return nil, err
 		}
+
 		result[[2]string{projectName, instanceName}] = nodeName
 	}
 
@@ -443,25 +689,26 @@ SELECT instances.name, nodes.name, projects.name
 	if err != nil {
 		return nil, err
 	}
+
 	return result, nil
 }
 
 // UpdateInstanceNode changes the name of an instance and the cluster member hosting it.
 // It's meant to be used when moving a non-running instance backed by ceph from one cluster node to another.
-func (c *ClusterTx) UpdateInstanceNode(project, oldName string, newName string, newNode string, volumeType int) error {
+func (c *ClusterTx) UpdateInstanceNode(ctx context.Context, project, oldName string, newName string, newNode string, volumeType int) error {
 	// First check that the container to be moved is backed by a ceph
 	// volume.
-	poolName, err := c.GetInstancePool(project, oldName)
+	poolName, err := c.GetInstancePool(ctx, project, oldName)
 	if err != nil {
 		return fmt.Errorf("Failed to get instance's storage pool name: %w", err)
 	}
 
-	poolID, err := c.GetStoragePoolID(poolName)
+	poolID, err := c.GetStoragePoolID(ctx, poolName)
 	if err != nil {
 		return fmt.Errorf("Failed to get instance's storage pool ID: %w", err)
 	}
 
-	poolDriver, err := c.GetStoragePoolDriver(poolID)
+	poolDriver, err := c.GetStoragePoolDriver(ctx, poolID)
 	if err != nil {
 		return fmt.Errorf("Failed to get instance's storage pool driver: %w", err)
 	}
@@ -472,12 +719,12 @@ func (c *ClusterTx) UpdateInstanceNode(project, oldName string, newName string, 
 
 	// Update the name of the container and of its snapshots, and the node
 	// ID they are associated with.
-	containerID, err := c.GetInstanceID(project, oldName)
+	containerID, err := cluster.GetInstanceID(ctx, c.tx, project, oldName)
 	if err != nil {
 		return fmt.Errorf("Failed to get instance's ID: %w", err)
 	}
 
-	node, err := c.GetNodeByName(newNode)
+	node, err := c.GetNodeByName(ctx, newNode)
 	if err != nil {
 		return fmt.Errorf("Failed to get new node's info: %w", err)
 	}
@@ -520,10 +767,10 @@ func (c *ClusterTx) UpdateInstanceNode(project, oldName string, newName string, 
 	return nil
 }
 
-// GetLocalInstancesInProject retuurns all instances of the given type on the local node within the given project.
+// GetLocalInstancesInProject retuurns all instances of the given type on the local member in the given project.
 // If projectName is empty then all instances in all projects are returned.
-func (c *ClusterTx) GetLocalInstancesInProject(filter InstanceFilter) ([]Instance, error) {
-	node, err := c.GetLocalNodeName()
+func (c *ClusterTx) GetLocalInstancesInProject(ctx context.Context, filter cluster.InstanceFilter) ([]cluster.Instance, error) {
+	node, err := c.GetLocalNodeName(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("Local node name: %w", err)
 	}
@@ -532,7 +779,7 @@ func (c *ClusterTx) GetLocalInstancesInProject(filter InstanceFilter) ([]Instanc
 		filter.Node = &node
 	}
 
-	return c.GetInstances(filter)
+	return cluster.GetInstances(ctx, c.tx, filter)
 }
 
 // CreateInstanceConfig inserts a new config for the container with the given ID.
@@ -540,9 +787,9 @@ func (c *ClusterTx) CreateInstanceConfig(id int, config map[string]string) error
 	return CreateInstanceConfig(c.tx, id, config)
 }
 
-// UpdateInstanceConfig inserts/updates/deletes the provided keys
+// UpdateInstanceConfig inserts/updates/deletes the provided keys.
 func (c *ClusterTx) UpdateInstanceConfig(id int, values map[string]string) error {
-	insertSQL := fmt.Sprintf("INSERT OR REPLACE INTO instances_config (instance_id, key, value) VALUES")
+	insertSQL := "INSERT OR REPLACE INTO instances_config (instance_id, key, value) VALUES"
 	deleteSQL := "DELETE FROM instances_config WHERE key IN %s AND instance_id=?"
 	return c.configUpdate(id, values, insertSQL, deleteSQL)
 }
@@ -557,6 +804,7 @@ func (c *ClusterTx) configUpdate(id int, values map[string]string, insertSQL, de
 			deletes = append(deletes, key)
 			continue
 		}
+
 		changes[key] = value
 	}
 
@@ -564,10 +812,10 @@ func (c *ClusterTx) configUpdate(id int, values map[string]string, insertSQL, de
 	if len(changes) > 0 {
 		query := insertSQL
 		exprs := []string{}
-		params := []interface{}{}
+		params := []any{}
 		for key, value := range changes {
 			exprs = append(exprs, "(?, ?, ?)")
-			params = append(params, []interface{}{id, key, value}...)
+			params = append(params, []any{id, key, value}...)
 		}
 
 		query += strings.Join(exprs, ",")
@@ -580,7 +828,7 @@ func (c *ClusterTx) configUpdate(id int, values map[string]string, insertSQL, de
 	// Delete keys
 	if len(deletes) > 0 {
 		query := fmt.Sprintf(deleteSQL, query.Params(len(deletes)))
-		params := []interface{}{}
+		params := []any{}
 		for _, key := range deletes {
 			params = append(params, key)
 		}
@@ -606,14 +854,8 @@ func (c *ClusterTx) DeleteInstanceConfigKey(id int64, key string) error {
 // UpdateInstancePowerState sets the the power state of the container with the given ID.
 func (c *ClusterTx) UpdateInstancePowerState(id int, state string) error {
 	// Set the new value
-	str := fmt.Sprintf("INSERT OR REPLACE INTO instances_config (instance_id, key, value) VALUES (?, 'volatile.last_state.power', ?)")
-	stmt, err := c.tx.Prepare(str)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec(id, state)
+	str := "INSERT OR REPLACE INTO instances_config (instance_id, key, value) VALUES (?, 'volatile.last_state.power', ?)"
+	_, err := c.tx.Exec(str, id, state)
 	if err != nil {
 		return err
 	}
@@ -625,13 +867,7 @@ func (c *ClusterTx) UpdateInstancePowerState(id int, state string) error {
 // with the given ID.
 func (c *ClusterTx) UpdateInstanceLastUsedDate(id int, date time.Time) error {
 	str := `UPDATE instances SET last_use_date=? WHERE id=?`
-	stmt, err := c.tx.Prepare(str)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	_, err = stmt.Exec(date, id)
+	_, err := c.tx.Exec(str, date, id)
 	if err != nil {
 		return err
 	}
@@ -640,36 +876,62 @@ func (c *ClusterTx) UpdateInstanceLastUsedDate(id int, date time.Time) error {
 }
 
 // GetInstanceSnapshotsWithName returns all snapshots of a given instance in date created order, oldest first.
-func (c *ClusterTx) GetInstanceSnapshotsWithName(project string, name string) ([]Instance, error) {
-	instance, err := c.GetInstance(project, name)
+func (c *ClusterTx) GetInstanceSnapshotsWithName(ctx context.Context, project string, name string) ([]cluster.Instance, error) {
+	instance, err := cluster.GetInstance(ctx, c.tx, project, name)
 	if err != nil {
 		return nil, err
 	}
-	filter := InstanceSnapshotFilter{
+
+	filter := cluster.InstanceSnapshotFilter{
 		Project:  &project,
 		Instance: &name,
 	}
 
-	snapshots, err := c.GetInstanceSnapshots(filter)
+	snapshots, err := cluster.GetInstanceSnapshots(ctx, c.tx, filter)
 	if err != nil {
 		return nil, err
 	}
 
-	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].CreationDate.Before(snapshots[j].CreationDate) })
+	sort.SliceStable(snapshots, func(i, j int) bool {
+		return snapshots[i].CreationDate.Before(snapshots[j].CreationDate)
+	})
 
-	instances := make([]Instance, len(snapshots))
+	instances := make([]cluster.Instance, len(snapshots))
 	for i, snapshot := range snapshots {
-		instances[i] = InstanceSnapshotToInstance(instance, &snapshot)
+		instances[i] = snapshot.ToInstance(instance.Name, instance.Node, instance.Type, instance.Architecture)
 	}
 
 	return instances, nil
 }
 
+// GetLocalInstanceWithVsockID returns all available instances with the given config key and value.
+func (c *ClusterTx) GetLocalInstanceWithVsockID(ctx context.Context, vsockID int) (*cluster.Instance, error) {
+	q := `
+SELECT instances.id, projects.name AS project, instances.name, nodes.name AS node, instances.type, instances.architecture, instances.ephemeral, instances.creation_date, instances.stateful, instances.last_use_date, coalesce(instances.description, ''), instances.expiry_date
+  FROM instances JOIN projects ON instances.project_id = projects.id JOIN nodes ON instances.node_id = nodes.id JOIN instances_config ON instances.id = instances_config.instance_id
+  WHERE instances.node_id = ? AND instances.type = ? AND instances_config.key = "volatile.vsock_id" AND instances_config.value = ? LIMIT 1
+  `
+
+	inargs := []any{c.nodeID, instancetype.VM, vsockID}
+	inst := cluster.Instance{}
+
+	err := c.tx.QueryRowContext(ctx, q, inargs...).Scan(&inst.ID, &inst.Project, &inst.Name, &inst.Node, &inst.Type, &inst.Architecture, &inst.Ephemeral, &inst.CreationDate, &inst.Stateful, &inst.LastUseDate, &inst.Description, &inst.ExpiryDate)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, api.StatusErrorf(http.StatusNotFound, "Instance not found")
+		}
+
+		return nil, err
+	}
+
+	return &inst, nil
+}
+
 // GetInstancePool returns the storage pool of a given instance (or snapshot).
-func (c *ClusterTx) GetInstancePool(projectName string, instanceName string) (string, error) {
+func (c *ClusterTx) GetInstancePool(ctx context.Context, projectName string, instanceName string) (string, error) {
 	// Strip snapshot name if supplied in instanceName, and lookup the storage pool of the parent instance
 	// as that must always be the same as the snapshot's storage pool.
-	instanceName, _, _ = shared.InstanceGetParentAndSnapshotName(instanceName)
+	instanceName, _, _ = api.GetParentAndSnapshotName(instanceName)
 
 	remoteDrivers := StorageRemoteDriverNames()
 
@@ -684,20 +946,20 @@ SELECT storage_pools.name FROM storage_pools
   JOIN projects ON projects.id=instances.project_id
  WHERE projects.name=?
    AND storage_volumes_all.name=?
-   AND storage_volumes_all.type IN(?,?)
+   AND storage_volumes_all.type IN (?,?)
    AND storage_volumes_all.project_id = instances.project_id
    AND (storage_volumes_all.node_id=? OR storage_volumes_all.node_id IS NULL AND storage_pools.driver IN %s)`, query.Params(len(remoteDrivers)))
-	inargs := []interface{}{projectName, instanceName, StoragePoolVolumeTypeContainer, StoragePoolVolumeTypeVM, c.nodeID}
-	outargs := []interface{}{&poolName}
+	inargs := []any{projectName, instanceName, StoragePoolVolumeTypeContainer, StoragePoolVolumeTypeVM, c.nodeID}
+	outargs := []any{&poolName}
 
 	for _, driver := range remoteDrivers {
 		inargs = append(inargs, driver)
 	}
 
-	err := c.tx.QueryRow(query, inargs...).Scan(outargs...)
+	err := c.tx.QueryRowContext(ctx, query, inargs...).Scan(outargs...)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return "", ErrNoSuchObject
+			return "", api.StatusErrorf(http.StatusNotFound, "Instance storage pool not found")
 		}
 
 		return "", err
@@ -710,12 +972,13 @@ SELECT storage_pools.name FROM storage_pools
 func (c *Cluster) DeleteInstance(project, name string) error {
 	if strings.Contains(name, shared.SnapshotDelimiter) {
 		parts := strings.SplitN(name, shared.SnapshotDelimiter, 2)
-		return c.Transaction(func(tx *ClusterTx) error {
-			return tx.DeleteInstanceSnapshot(project, parts[0], parts[1])
+		return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+			return cluster.DeleteInstanceSnapshot(ctx, tx.tx, project, parts[0], parts[1])
 		})
 	}
-	return c.Transaction(func(tx *ClusterTx) error {
-		return tx.DeleteInstance(project, name)
+
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return cluster.DeleteInstance(ctx, tx.tx, project, name)
 	})
 }
 
@@ -730,13 +993,12 @@ SELECT projects.name, instances.name
   JOIN projects ON projects.id = instances.project_id
 WHERE instances.id=?
 `
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.tx.QueryRow(q, id).Scan(&project, &name)
-
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return tx.tx.QueryRowContext(ctx, q, id).Scan(&project, &name)
 	})
 
 	if err == sql.ErrNoRows {
-		return "", "", ErrNoSuchObject
+		return "", "", api.StatusErrorf(http.StatusNotFound, "Instance not found")
 	}
 
 	return project, name, err
@@ -745,9 +1007,9 @@ WHERE instances.id=?
 // GetInstanceID returns the ID of the instance with the given name.
 func (c *Cluster) GetInstanceID(project, name string) (int, error) {
 	var id int64
-	err := c.Transaction(func(tx *ClusterTx) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		var err error
-		id, err = tx.GetInstanceID(project, name)
+		id, err = cluster.GetInstanceID(ctx, tx.tx, project, name)
 		return err
 	})
 	return int(id), err
@@ -758,11 +1020,11 @@ func (c *Cluster) GetInstanceID(project, name string) (int, error) {
 func (c *Cluster) GetInstanceConfig(id int, key string) (string, error) {
 	q := "SELECT value FROM instances_config WHERE instance_id=? AND key=?"
 	value := ""
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.tx.QueryRow(q, id, key).Scan(&value)
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return tx.tx.QueryRowContext(ctx, q, id, key).Scan(&value)
 	})
 	if err == sql.ErrNoRows {
-		return "", ErrNoSuchObject
+		return "", api.StatusErrorf(http.StatusNotFound, "Instance config not found")
 	}
 
 	return value, err
@@ -771,7 +1033,7 @@ func (c *Cluster) GetInstanceConfig(id int, key string) (string, error) {
 // DeleteInstanceConfigKey removes the given key from the config of the instance
 // with the given ID.
 func (c *Cluster) DeleteInstanceConfigKey(id int, key string) error {
-	return c.Transaction(func(tx *ClusterTx) error {
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		return tx.DeleteInstanceConfigKey(int64(id), key)
 	})
 }
@@ -783,59 +1045,11 @@ func (c *Cluster) UpdateInstanceStatefulFlag(id int, stateful bool) error {
 	if stateful {
 		statefulInt = 1
 	}
-	return c.Transaction(func(tx *ClusterTx) error {
+
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		_, err := tx.tx.Exec("UPDATE instances SET stateful=? WHERE id=?", statefulInt, id)
 		return err
 	})
-}
-
-// LegacyContainersList returns the names of all the containers.
-//
-// NOTE: this is a pre-projects legacy API that is used only by patches. Don't
-// use it for new code.
-func (c *Cluster) LegacyContainersList() ([]string, error) {
-	q := fmt.Sprintf("SELECT name FROM instances WHERE type=? ORDER BY name")
-
-	var ret []string
-
-	err := c.Transaction(func(tx *ClusterTx) error {
-		var err error
-		ret, err = query.SelectStrings(tx.tx, q, instancetype.Container)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return ret, nil
-}
-
-// LegacySnapshotsList returns the names of all the snapshots.
-//
-// NOTE: this is a pre-projects legacy API that is used only by patches. Don't
-// use it for new code.
-func (c *Cluster) LegacySnapshotsList() ([]string, error) {
-	q := fmt.Sprintf(`
-SELECT instances.name, instances_snapshots.name
-FROM instances_snapshots
-JOIN instances ON instances.id = instances_snapshots.instance_id
-WHERE type=? ORDER BY instances.name, instances_snapshots.name
-`)
-	inargs := []interface{}{instancetype.Container}
-	var container string
-	var snapshot string
-	outfmt := []interface{}{container, snapshot}
-	result, err := queryScan(c, q, inargs, outfmt)
-	if err != nil {
-		return nil, err
-	}
-
-	var ret []string
-	for _, r := range result {
-		ret = append(ret, r[0].(string)+shared.SnapshotDelimiter+r[1].(string))
-	}
-
-	return ret, nil
 }
 
 // UpdateInstanceSnapshotCreationDate updates the creation_date field of the instance snapshot with ID.
@@ -858,8 +1072,8 @@ SELECT instances_snapshots.name
 WHERE projects.name=? AND instances.name=?
 ORDER BY date(instances_snapshots.creation_date)
 `
-	inargs := []interface{}{project, name}
-	outfmt := []interface{}{name}
+	inargs := []any{project, name}
+	outfmt := []any{name}
 	dbResults, err := queryScan(c, q, inargs, outfmt)
 	if err != nil {
 		return result, err
@@ -882,12 +1096,13 @@ SELECT instances_snapshots.name
   JOIN projects ON projects.id = instances.project_id
 WHERE projects.name=? AND instances.name=?`
 	var numstr string
-	inargs := []interface{}{project, name}
-	outfmt := []interface{}{numstr}
+	inargs := []any{project, name}
+	outfmt := []any{numstr}
 	results, err := queryScan(c, q, inargs, outfmt)
 	if err != nil {
 		return 0
 	}
+
 	max := 0
 
 	for _, r := range results {
@@ -899,6 +1114,7 @@ WHERE projects.name=? AND instances.name=?`
 		if err != nil || count != 1 {
 			continue
 		}
+
 		if num >= max {
 			max = num + 1
 		}
@@ -912,28 +1128,44 @@ WHERE projects.name=? AND instances.name=?`
 // This is a non-transactional variant of ClusterTx.GetInstancePool().
 func (c *Cluster) GetInstancePool(project, instanceName string) (string, error) {
 	var poolName string
-	err := c.Transaction(func(tx *ClusterTx) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		var err error
-		poolName, err = tx.GetInstancePool(project, instanceName)
+		poolName, err = tx.GetInstancePool(ctx, project, instanceName)
 		return err
 	})
 	return poolName, err
 }
 
+// DeleteReadyStateFromLocalInstances deletes the volatile.last_state.ready config key
+// from all local instances.
+func (c *Cluster) DeleteReadyStateFromLocalInstances() error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		nodeID := tx.GetNodeID()
+
+		_, err := tx.Tx().Exec(`
+DELETE FROM instances_config
+WHERE instances_config.id IN (
+	SELECT instances_config.id FROM instances_config
+	JOIN instances ON instances_config.instance_id=instances.id
+	JOIN nodes ON instances.node_id=nodes.id
+	WHERE key="volatile.last_state.ready" AND nodes.id=?
+)`, nodeID)
+
+		return err
+	})
+
+	return err
+}
+
 // CreateInstanceConfig inserts a new config for the instance with the given ID.
 func CreateInstanceConfig(tx *sql.Tx, id int, config map[string]string) error {
-	stmt, err := tx.Prepare("INSERT INTO instances_config (instance_id, key, value) values (?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
+	sql := "INSERT INTO instances_config (instance_id, key, value) values (?, ?, ?)"
 	for k, v := range config {
 		if v == "" {
 			continue
 		}
 
-		_, err := stmt.Exec(id, k, v)
+		_, err := tx.Exec(sql, id, k, v)
 		if err != nil {
 			return fmt.Errorf("Error adding configuration item %q = %q to instance %d: %w", k, v, id, err)
 		}
@@ -946,35 +1178,22 @@ func CreateInstanceConfig(tx *sql.Tx, id int, config map[string]string) error {
 // the instance with the given ID.
 func UpdateInstance(tx *sql.Tx, id int, description string, architecture int, ephemeral bool,
 	expiryDate time.Time) error {
-	str := fmt.Sprintf("UPDATE instances SET description=?, architecture=?, ephemeral=?, expiry_date=? WHERE id=?")
-	stmt, err := tx.Prepare(str)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
+	str := "UPDATE instances SET description=?, architecture=?, ephemeral=?, expiry_date=? WHERE id=?"
 	ephemeralInt := 0
 	if ephemeral {
 		ephemeralInt = 1
 	}
 
+	var err error
 	if expiryDate.IsZero() {
-		_, err = stmt.Exec(description, architecture, ephemeralInt, "", id)
+		_, err = tx.Exec(str, description, architecture, ephemeralInt, "", id)
 	} else {
-		_, err = stmt.Exec(description, architecture, ephemeralInt, expiryDate, id)
+		_, err = tx.Exec(str, description, architecture, ephemeralInt, expiryDate, id)
 	}
+
 	if err != nil {
 		return err
 	}
 
 	return nil
-}
-
-// Generates '?' signs for sql IN clause.
-func generateInClauseParams(length int) string {
-	result := []string{}
-	for i := 0; i < length; i++ {
-		result = append(result, "?")
-	}
-	return strings.Join(result, ",")
 }

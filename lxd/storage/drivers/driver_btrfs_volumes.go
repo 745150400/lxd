@@ -1,19 +1,20 @@
 package drivers
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	log "gopkg.in/inconshreveable/log15.v2"
+	"github.com/pborman/uuid"
 	"gopkg.in/yaml.v2"
 
 	"github.com/lxc/lxd/lxd/archive"
@@ -23,8 +24,10 @@ import (
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/storage/filesystem"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/instancewriter"
 	"github.com/lxc/lxd/shared/ioprogress"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/units"
 )
 
@@ -41,9 +44,10 @@ func (d *btrfs) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.Op
 	if err != nil {
 		return err
 	}
+
 	revert.Add(func() {
-		d.deleteSubvolume(volPath, false)
-		os.Remove(volPath)
+		_ = d.deleteSubvolume(volPath, false)
+		_ = os.Remove(volPath)
 	})
 
 	// Create sparse loopback file if volume is block.
@@ -70,7 +74,7 @@ func (d *btrfs) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.Op
 		}
 	}
 
-	err = d.runFiller(vol, rootBlockPath, filler)
+	err = d.runFiller(vol, rootBlockPath, filler, false)
 	if err != nil {
 		return err
 	}
@@ -152,17 +156,21 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 		for _, snapName := range srcBackup.Snapshots {
 			fullSnapshotName := GetSnapshotVolumeName(vol.name, snapName)
 			snapVol := NewVolume(d, d.name, vol.volType, vol.contentType, fullSnapshotName, vol.config, vol.poolConfig)
-			d.DeleteVolumeSnapshot(snapVol, op)
+			_ = d.DeleteVolumeSnapshot(snapVol, op)
 		}
 
 		// And lastly the main volume.
-		d.DeleteVolume(vol, op)
+		_ = d.DeleteVolume(vol, op)
 	}
 	// Only execute the revert function if we have had an error internally.
 	revert.Add(revertHook)
 
 	// Find the compression algorithm used for backup source data.
-	srcData.Seek(0, 0)
+	_, err := srcData.Seek(0, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	_, _, unpacker, err := shared.DetectCompressionFile(srcData)
 	if err != nil {
 		return nil, nil, err
@@ -197,11 +205,12 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 	}
 
 	// Create a temporary directory to unpack the backup into.
-	tmpUnpackDir, err := ioutil.TempDir(GetVolumeMountPath(d.name, vol.volType, ""), "backup.")
+	tmpUnpackDir, err := os.MkdirTemp(GetVolumeMountPath(d.name, vol.volType, ""), "backup.")
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to create temporary directory %q: %w", tmpUnpackDir, err)
 	}
-	defer os.RemoveAll(tmpUnpackDir)
+
+	defer func() { _ = os.RemoveAll(tmpUnpackDir) }()
 
 	err = os.Chmod(tmpUnpackDir, 0100)
 	if err != nil {
@@ -214,6 +223,7 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 		if err != nil {
 			return "", err
 		}
+
 		defer cancelFunc()
 
 		for {
@@ -221,6 +231,7 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 			if err == io.EOF {
 				break // End of archive.
 			}
+
 			if err != nil {
 				return "", err
 			}
@@ -239,9 +250,16 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 		return "", fmt.Errorf("Could not find %q", srcFile)
 	}
 
+	type btrfsCopyOp struct {
+		src  string
+		dest string
+	}
+
+	var copyOps []btrfsCopyOp
+
 	// unpackVolume unpacks all subvolumes in a LXD volume from a backup tarball file.
 	unpackVolume := func(v Volume, srcFilePrefix string) error {
-		_, snapName, _ := shared.InstanceGetParentAndSnapshotName(v.name)
+		_, snapName, _ := api.GetParentAndSnapshotName(v.name)
 
 		for _, subVol := range optimizedHeader.Subvolumes {
 			if subVol.Snapshot != snapName {
@@ -259,7 +277,14 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 			// Define where we will move the subvolume after it is unpacked.
 			subVolTargetPath := filepath.Join(v.MountPath(), subVol.Path)
 
-			d.Logger().Debug("Unpacking optimized volume", log.Ctx{"name": v.name, "source": srcFilePath, "unpackPath": tmpUnpackDir, "path": subVolTargetPath})
+			tmpUnpackDir := filepath.Join(tmpUnpackDir, snapName)
+
+			err := os.MkdirAll(tmpUnpackDir, 0100)
+			if err != nil {
+				return fmt.Errorf("Failed creating directory %q: %w", tmpUnpackDir, err)
+			}
+
+			d.Logger().Debug("Unpacking optimized volume", logger.Ctx{"name": v.name, "source": srcFilePath, "unpackPath": tmpUnpackDir, "path": subVolTargetPath})
 
 			// Unpack the volume into the temporary unpackDir.
 			unpackedSubVolPath, err := unpackSubVolume(srcData, unpacker, srcFilePath, tmpUnpackDir)
@@ -267,14 +292,10 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 				return err
 			}
 
-			// Clear the target for the subvol to use.
-			os.Remove(subVolTargetPath)
-
-			// Move unpacked subvolume into its final location.
-			err = os.Rename(unpackedSubVolPath, subVolTargetPath)
-			if err != nil {
-				return err
-			}
+			copyOps = append(copyOps, btrfsCopyOp{
+				src:  unpackedSubVolPath,
+				dest: subVolTargetPath,
+			})
 		}
 
 		return nil
@@ -326,6 +347,22 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 		return nil, nil, err
 	}
 
+	for _, copyOp := range copyOps {
+		err = d.setSubvolumeReadonlyProperty(copyOp.src, false)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// Clear the target for the subvol to use.
+		_ = os.Remove(copyOp.dest)
+
+		// Move unpacked subvolume into its final location.
+		err = os.Rename(copyOp.src, copyOp.dest)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
 	// Restore readonly property on subvolumes that need it.
 	for _, subVol := range optimizedHeader.Subvolumes {
 		if !subVol.Readonly {
@@ -338,7 +375,7 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 		}
 
 		path := filepath.Join(v.MountPath(), subVol.Path)
-		d.logger.Debug("Setting subvolume readonly", log.Ctx{"name": v.name, "path": path})
+		d.logger.Debug("Setting subvolume readonly", logger.Ctx{"name": v.name, "path": path})
 		err = d.setSubvolumeReadonlyProperty(path, true)
 		if err != nil {
 			return nil, nil, err
@@ -350,7 +387,7 @@ func (d *btrfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDat
 }
 
 // CreateVolumeFromCopy provides same-pool volume copying functionality.
-func (d *btrfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, op *operations.Operation) error {
+func (d *btrfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, allowInconsistent bool, op *operations.Operation) error {
 	revert := revert.New()
 	defer revert.Fail()
 
@@ -368,7 +405,7 @@ func (d *btrfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bo
 		return err
 	}
 
-	revert.Add(func() { d.deleteSubvolume(target, true) })
+	revert.Add(func() { _ = d.deleteSubvolume(target, true) })
 
 	// Restore readonly property on subvolumes in reverse order (except root which should be left writable).
 	subVolCount := len(subVols)
@@ -431,7 +468,7 @@ func (d *btrfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bo
 				return err
 			}
 
-			revert.Add(func() { d.deleteSubvolume(dstSnapshot, true) })
+			revert.Add(func() { _ = d.deleteSubvolume(dstSnapshot, true) })
 		}
 	}
 
@@ -448,24 +485,24 @@ func (d *btrfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, v
 		return ErrNotSupported
 	}
 
-	revert := revert.New()
-	defer revert.Fail()
-
 	var migrationHeader BTRFSMetaDataHeader
+
+	// List of subvolumes to be synced. This is sent back to the source.
+	var syncSubvolumes []BTRFSSubVolume
 
 	// Inspect negotiated features to see if we are expecting to get a metadata migration header frame.
 	if shared.StringInSlice(migration.BTRFSFeatureMigrationHeader, volTargetArgs.MigrationType.Features) {
-		buf, err := ioutil.ReadAll(conn)
+		buf, err := io.ReadAll(conn)
 		if err != nil {
-			return fmt.Errorf("Failed reading migration header: %w", err)
+			return fmt.Errorf("Failed reading BTRFS migration header: %w", err)
 		}
 
 		err = json.Unmarshal(buf, &migrationHeader)
 		if err != nil {
-			return fmt.Errorf("Failed decoding migration header: %w", err)
+			return fmt.Errorf("Failed decoding BTRFS migration header: %w", err)
 		}
 
-		d.logger.Debug("Received migration meta data header", log.Ctx{"name": vol.name})
+		d.logger.Debug("Received BTRFS migration meta data header", logger.Ctx{"name": vol.name})
 	} else {
 		// Populate the migrationHeader subvolumes with root volumes only to support older LXD sources.
 		for _, snapName := range volTargetArgs.Snapshots {
@@ -483,30 +520,123 @@ func (d *btrfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, v
 		})
 	}
 
+	if volTargetArgs.Refresh && shared.StringInSlice(migration.BTRFSFeatureSubvolumeUUIDs, volTargetArgs.MigrationType.Features) {
+		snapshots, err := d.volumeSnapshotsSorted(vol, op)
+		if err != nil {
+			return err
+		}
+
+		// Reset list of snapshots which are to be received.
+		volTargetArgs.Snapshots = []string{}
+
+		// Map of local subvolumes with their received UUID.
+		localSubvolumes := make(map[string]string)
+
+		for _, snap := range snapshots {
+			snapVol, _ := vol.NewSnapshot(snap)
+
+			receivedUUID, err := d.getSubVolumeReceivedUUID(snapVol)
+			if err != nil {
+				return err
+			}
+
+			localSubvolumes[snap] = receivedUUID
+		}
+
+		// Figure out which snapshots need to be copied by comparing the UUIDs and received UUIDs from the migration header.
+		for _, migrationSnap := range migrationHeader.Subvolumes {
+			receivedUUID, ok := localSubvolumes[migrationSnap.Snapshot]
+			// Skip this snapshot as it exists on both the source and target, and has the same GUID.
+			if ok && receivedUUID == migrationSnap.UUID {
+				continue
+			}
+
+			if migrationSnap.Path == "/" && migrationSnap.Snapshot != "" {
+				volTargetArgs.Snapshots = append(volTargetArgs.Snapshots, migrationSnap.Snapshot)
+			}
+
+			syncSubvolumes = append(syncSubvolumes, BTRFSSubVolume{Path: migrationSnap.Path, Snapshot: migrationSnap.Snapshot, UUID: migrationSnap.UUID})
+		}
+
+		migrationHeader = BTRFSMetaDataHeader{Subvolumes: syncSubvolumes}
+
+		headerJSON, err := json.Marshal(migrationHeader)
+		if err != nil {
+			return fmt.Errorf("Failed encoding BTRFS migration header: %w", err)
+		}
+
+		_, err = conn.Write(headerJSON)
+		if err != nil {
+			return fmt.Errorf("Failed sending BTRFS migration header: %w", err)
+		}
+
+		err = conn.Close() //End the frame.
+		if err != nil {
+			return fmt.Errorf("Failed closing BTRFS migration header frame: %w", err)
+		}
+
+		d.logger.Debug("Sent BTRFS migration meta data header", logger.Ctx{"name": vol.name, "header": migrationHeader})
+	} else {
+		syncSubvolumes = migrationHeader.Subvolumes
+	}
+
+	return d.createVolumeFromMigrationOptimized(vol, conn, volTargetArgs, preFiller, syncSubvolumes, op)
+}
+
+func (d *btrfs) createVolumeFromMigrationOptimized(vol Volume, conn io.ReadWriteCloser, volTargetArgs migration.VolumeTargetArgs, preFiller *VolumeFiller, subvolumes []BTRFSSubVolume, op *operations.Operation) error {
+	revert := revert.New()
+	defer revert.Fail()
+
+	type btrfsCopyOp struct {
+		src          string
+		dest         string
+		receivedUUID string
+	}
+
+	// copyOps represents copy operations which need to take place once *all* subvolumes have been
+	// received. We don't use a map as the order should be kept.
+	copyOps := []btrfsCopyOp{}
+
 	// receiveVolume receives all subvolumes in a LXD volume from the source.
 	receiveVolume := func(v Volume, receivePath string) error {
-		_, snapName, _ := shared.InstanceGetParentAndSnapshotName(v.name)
+		_, snapName, _ := api.GetParentAndSnapshotName(v.name)
 
-		for _, subVol := range migrationHeader.Subvolumes {
+		for _, subVol := range subvolumes {
 			if subVol.Snapshot != snapName {
 				continue // Skip any subvolumes that dont belong to our volume (empty for main).
 			}
 
+			receivePath := filepath.Join(receivePath, snapName)
+
+			err := os.MkdirAll(receivePath, 0100)
+			if err != nil {
+				return fmt.Errorf("Failed creating %q: %w", receivePath, err)
+			}
+
 			subVolTargetPath := filepath.Join(v.MountPath(), subVol.Path)
-			d.logger.Debug("Receiving volume", log.Ctx{"name": v.name, "receivePath": receivePath, "path": subVolTargetPath})
+			d.logger.Debug("Receiving volume", logger.Ctx{"name": v.name, "receivePath": receivePath, "path": subVolTargetPath})
+
 			subVolRecvPath, err := d.receiveSubVolume(conn, receivePath)
 			if err != nil {
 				return err
 			}
 
-			// Clear the target for the subvol to use.
-			os.Remove(subVolTargetPath)
-
-			// And move it to the target path.
-			err = os.Rename(subVolRecvPath, subVolTargetPath)
-			if err != nil {
-				return fmt.Errorf("Failed to rename '%s' to '%s': %w", subVolRecvPath, subVolTargetPath, err)
+			receivedVol := Volume{
+				pool:            d.name,
+				mountCustomPath: subVolRecvPath,
 			}
+
+			UUID, err := d.getSubVolumeReceivedUUID(receivedVol)
+			if err != nil {
+				return fmt.Errorf("Failed getting UUID: %w", err)
+			}
+
+			// Record the copy operations we need to do after having received all subvolumes.
+			copyOps = append(copyOps, btrfsCopyOp{
+				src:          subVolRecvPath,
+				dest:         subVolTargetPath,
+				receivedUUID: UUID,
+			})
 		}
 
 		return nil
@@ -516,11 +646,12 @@ func (d *btrfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, v
 	instancesPath := GetVolumeMountPath(d.name, vol.volType, "")
 
 	// Create a temporary directory which will act as the parent directory of the received ro snapshot.
-	tmpVolumesMountPoint, err := ioutil.TempDir(instancesPath, "migration.")
+	tmpVolumesMountPoint, err := os.MkdirTemp(instancesPath, "migration.")
 	if err != nil {
 		return fmt.Errorf("Failed to create temporary directory under %q: %w", instancesPath, err)
 	}
-	defer os.RemoveAll(tmpVolumesMountPoint)
+
+	defer func() { _ = os.RemoveAll(tmpVolumesMountPoint) }()
 
 	err = os.Chmod(tmpVolumesMountPoint, 0100)
 	if err != nil {
@@ -528,13 +659,14 @@ func (d *btrfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, v
 	}
 
 	// Handle btrfs send/receive migration.
-	if len(volTargetArgs.Snapshots) > 0 {
+	if !volTargetArgs.VolumeOnly && len(volTargetArgs.Snapshots) > 0 {
 		// Create the parent directory.
 		err := createParentSnapshotDirIfMissing(d.name, vol.volType, vol.name)
 		if err != nil {
 			return err
 		}
-		revert.Add(func() { deleteParentSnapshotDirIfEmpty(d.name, vol.volType, vol.name) })
+
+		revert.Add(func() { _ = deleteParentSnapshotDirIfEmpty(d.name, vol.volType, vol.name) })
 
 		// Transfer the snapshots.
 		for _, snapName := range volTargetArgs.Snapshots {
@@ -552,8 +684,43 @@ func (d *btrfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, v
 		return err
 	}
 
+	if volTargetArgs.Refresh {
+		// Delete main volume after receiving it.
+		err = d.deleteSubvolume(vol.MountPath(), true)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Make all received subvolumes read-write and move them to their final destination
+	for _, op := range copyOps {
+		err = d.setSubvolumeReadonlyProperty(op.src, false)
+		if err != nil {
+			return err
+		}
+
+		// Clear the target for the subvol to use.
+		_ = os.Remove(op.dest)
+
+		err = os.Rename(op.src, op.dest)
+		if err != nil {
+			return err
+		}
+
+		// This sets the "Received UUID" field on the subvolume.
+		// When making the received subvolume read-write before moving it to its final location,
+		// this information is lost (by design). However, this causes issues when performing
+		// incremental streams (error: "cannot find parent subvolume").
+		// Setting the "Received UUID" field to the value of the received subvolume (before making
+		// it rw) solves this issue.
+		err = setReceivedUUID(op.dest, op.receivedUUID)
+		if err != nil {
+			return fmt.Errorf("Failed setting received UUID: %w", err)
+		}
+	}
+
 	// Restore readonly property on subvolumes that need it.
-	for _, subVol := range migrationHeader.Subvolumes {
+	for _, subVol := range subvolumes {
 		if !subVol.Readonly {
 			continue // All subvolumes are made writable during receive process so we can skip these.
 		}
@@ -564,7 +731,7 @@ func (d *btrfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, v
 		}
 
 		path := filepath.Join(v.MountPath(), subVol.Path)
-		d.logger.Debug("Setting subvolume readonly", log.Ctx{"name": v.name, "path": path})
+		d.logger.Debug("Setting subvolume readonly", logger.Ctx{"name": v.name, "path": path})
 		err = d.setSubvolumeReadonlyProperty(path, true)
 		if err != nil {
 			return err
@@ -584,8 +751,138 @@ func (d *btrfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, v
 }
 
 // RefreshVolume provides same-pool volume and specific snapshots syncing functionality.
-func (d *btrfs) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, op *operations.Operation) error {
-	return genericVFSCopyVolume(d, nil, vol, srcVol, srcSnapshots, true, op)
+func (d *btrfs) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, allowInconsistent bool, op *operations.Operation) error {
+	// Get target snapshots
+	targetSnapshots, err := d.volumeSnapshotsSorted(vol, op)
+	if err != nil {
+		return fmt.Errorf("Failed to get target snapshots: %w", err)
+	}
+
+	srcSnapshotsAll, err := d.volumeSnapshotsSorted(srcVol, op)
+	if err != nil {
+		return fmt.Errorf("Failed to get source snapshots: %w", err)
+	}
+
+	// Optimized refresh only makes sense if the source and target have at least one identical snapshot,
+	// as btrfs can then use an incremental streams instead of just copying the datasets.
+	if len(targetSnapshots) == 0 || len(srcSnapshotsAll) == 0 {
+		d.logger.Debug("Performing generic volume refresh")
+		return genericVFSCopyVolume(d, nil, vol, srcVol, srcSnapshots, true, false, op)
+	}
+
+	d.logger.Debug("Performing optimized volume refresh")
+
+	transfer := func(src Volume, target Volume, origin Volume) error {
+		var sender *exec.Cmd
+
+		srcSubvolPath := filepath.Join(GetPoolMountPath(src.pool), fmt.Sprintf("%s-snapshots/%s", src.volType, src.name))
+		targetSubvolPath := filepath.Join(GetPoolMountPath(target.pool), fmt.Sprintf("%s-snapshots/%s", target.volType, target.name))
+		originSubvolPath := filepath.Join(GetPoolMountPath(origin.pool), fmt.Sprintf("%s-snapshots/%s", origin.volType, origin.name))
+
+		receiver := exec.Command("btrfs", "receive", targetSubvolPath)
+		sender = exec.Command("btrfs", "send", "-p", originSubvolPath, srcSubvolPath)
+
+		// Configure the pipes.
+		receiver.Stdin, _ = sender.StdoutPipe()
+		receiver.Stdout = os.Stdout
+		receiver.Stderr = os.Stderr
+
+		// Run the transfer.
+		err = receiver.Start()
+		if err != nil {
+			return fmt.Errorf("Failed to receive stream: %w", err)
+		}
+
+		err = sender.Run()
+		if err != nil {
+			return fmt.Errorf("Failed to send stream %q: %w", sender.String(), err)
+		}
+
+		err = receiver.Wait()
+		if err != nil {
+			return fmt.Errorf("Failed to wait for receiver: %w", err)
+		}
+
+		return nil
+	}
+
+	// Before refreshing a volume, all extra snapshots (those which exist on the target but
+	// not on the source) are removed. Therefore, the last entry in targetSnapshots represents the
+	// most recent identical snapshot of the source volume and target volume.
+	lastIdenticalSnapshot := targetSnapshots[len(targetSnapshots)-1]
+
+	for i, snap := range srcSnapshots {
+		var srcSnap Volume
+
+		if i == 0 {
+			srcSnap, err = srcVol.NewSnapshot(lastIdenticalSnapshot)
+			if err != nil {
+				return fmt.Errorf("Failed to create new snapshot volume: %w", err)
+			}
+		} else {
+			srcSnap = srcSnapshots[i-1]
+		}
+
+		err = transfer(snap, vol, srcSnap)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Create temporary snapshot of the source volume.
+	snapUUID := uuid.New()
+
+	srcSnap, err := srcVol.NewSnapshot(snapUUID)
+	if err != nil {
+		return err
+	}
+
+	err = d.CreateVolumeSnapshot(srcSnap, op)
+	if err != nil {
+		return err
+	}
+
+	// Transfer temporary snapshot to target; this creates a new snapshot for target.
+	parentSnap, err := srcVol.NewSnapshot(srcSnapshotsAll[len(srcSnapshotsAll)-1])
+	if err != nil {
+		return err
+	}
+
+	err = transfer(srcSnap, vol, parentSnap)
+	if err != nil {
+		return err
+	}
+
+	err = d.DeleteVolumeSnapshot(srcSnap, op)
+	if err != nil {
+		return err
+	}
+
+	err = d.deleteSubvolume(vol.MountPath(), false)
+	if err != nil {
+		return err
+	}
+
+	targetSnap, err := vol.NewSnapshot(snapUUID)
+	if err != nil {
+		return err
+	}
+
+	// Set readonly to false on the temporary snapshot, otherwise moving/renaming it won't be
+	// possible.
+	err = d.setSubvolumeReadonlyProperty(targetSnap.MountPath(), false)
+	if err != nil {
+		return err
+	}
+
+	// Rename temporary target snapshot to the actual target,
+	// e.g. containers-snapshots/c2/<uuid> -> containers/c2.
+	err = os.Rename(targetSnap.MountPath(), vol.MountPath())
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // DeleteVolume deletes a volume of the storage device. If any snapshots of the volume remain then
@@ -778,7 +1075,7 @@ func (d *btrfs) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, 
 
 			// Add that to the requested filesystem size (to ignore it from the quota).
 			sizeBytes += blockSize
-			d.logger.Debug("Accounting for VM image file size", "sizeBytes", sizeBytes)
+			d.logger.Debug("Accounting for VM image file size", logger.Ctx{"sizeBytes": sizeBytes})
 		}
 
 		// Apply the limit to referenced data in qgroup.
@@ -844,7 +1141,7 @@ func (d *btrfs) UnmountVolume(vol Volume, keepBlockDev bool, op *operations.Oper
 
 	refCount := vol.MountRefCountDecrement()
 	if refCount > 0 {
-		d.logger.Debug("Skipping unmount as in use", log.Ctx{"volName": vol.name, "refCount": refCount})
+		d.logger.Debug("Skipping unmount as in use", logger.Ctx{"volName": vol.name, "refCount": refCount})
 		return false, ErrInUse
 	}
 
@@ -856,19 +1153,21 @@ func (d *btrfs) RenameVolume(vol Volume, newVolName string, op *operations.Opera
 	return genericVFSRenameVolume(d, vol, newVolName, op)
 }
 
-func (d *btrfs) readonlySnapshot(vol Volume) (string, *revert.Reverter, error) {
-	reverter := revert.New()
-	defer reverter.Fail()
+// readonlySnapshot creates a readonly snapshot.
+// Returns a revert fail function that can be used to undo this function if a subsequent step fails.
+func (d *btrfs) readonlySnapshot(vol Volume) (string, revert.Hook, error) {
+	revert := revert.New()
+	defer revert.Fail()
 
 	sourcePath := vol.MountPath()
 	poolPath := GetPoolMountPath(d.name)
-	tmpDir, err := ioutil.TempDir(poolPath, "backup.")
+	tmpDir, err := os.MkdirTemp(poolPath, "backup.")
 	if err != nil {
 		return "", nil, err
 	}
 
-	reverter.Add(func() {
-		os.RemoveAll(tmpDir)
+	revert.Add(func() {
+		_ = os.RemoveAll(tmpDir)
 	})
 
 	err = os.Chmod(tmpDir, 0100)
@@ -883,8 +1182,8 @@ func (d *btrfs) readonlySnapshot(vol Volume) (string, *revert.Reverter, error) {
 		return "", nil, err
 	}
 
-	reverter.Add(func() {
-		d.deleteSubvolume(mountPath, true)
+	revert.Add(func() {
+		_ = d.deleteSubvolume(mountPath, true)
 	})
 
 	err = d.setSubvolumeReadonlyProperty(mountPath, true)
@@ -892,10 +1191,11 @@ func (d *btrfs) readonlySnapshot(vol Volume) (string, *revert.Reverter, error) {
 		return "", nil, err
 	}
 
-	d.logger.Debug("Created read-only backup snapshot", log.Ctx{"sourcePath": sourcePath, "path": mountPath})
+	d.logger.Debug("Created read-only backup snapshot", logger.Ctx{"sourcePath": sourcePath, "path": mountPath})
 
-	defer reverter.Success()
-	return mountPath, reverter.Clone(), nil
+	cleanup := revert.Clone().Fail
+	revert.Success()
+	return mountPath, cleanup, nil
 }
 
 // MigrateVolume sends a volume for migration.
@@ -904,13 +1204,13 @@ func (d *btrfs) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *m
 	if volSrcArgs.MigrationType.FSType == migration.MigrationFSType_RSYNC || volSrcArgs.MigrationType.FSType == migration.MigrationFSType_BLOCK_AND_RSYNC {
 		// If volume is filesystem type and is not already a snapshot, create a fast snapshot to ensure migration is consistent.
 		if vol.contentType == ContentTypeFS && !vol.IsSnapshot() {
-			snapshotPath, reverter, err := d.readonlySnapshot(vol)
+			snapshotPath, cleanup, err := d.readonlySnapshot(vol)
 			if err != nil {
 				return err
 			}
 
 			// Clean up the snapshot.
-			defer reverter.Fail()
+			defer cleanup()
 
 			// Set the path of the volume to the path of the fast snapshot so the migration reads from there instead.
 			vol.mountCustomPath = snapshotPath
@@ -927,8 +1227,18 @@ func (d *btrfs) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *m
 		return nil
 	}
 
-	// Generate restoration header, containing info on the subvolumes and how they should be restored.
-	migrationHeader, err := d.restorationHeader(vol, volSrcArgs.Snapshots)
+	var snapshots []string
+	var err error
+
+	if !volSrcArgs.VolumeOnly {
+		// Generate restoration header, containing info on the subvolumes and how they should be restored.
+		snapshots, err = d.volumeSnapshotsSorted(vol, op)
+		if err != nil {
+			return err
+		}
+	}
+
+	migrationHeader, err := d.restorationHeader(vol, snapshots)
 	if err != nil {
 		return err
 	}
@@ -947,22 +1257,51 @@ func (d *btrfs) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *m
 	if shared.StringInSlice(migration.BTRFSFeatureMigrationHeader, volSrcArgs.MigrationType.Features) {
 		headerJSON, err := json.Marshal(migrationHeader)
 		if err != nil {
-			return fmt.Errorf("Failed encoding migration header: %w", err)
+			return fmt.Errorf("Failed encoding BTRFS migration header: %w", err)
 		}
 
 		_, err = conn.Write(headerJSON)
 		if err != nil {
-			return fmt.Errorf("Failed sending migration header: %w", err)
+			return fmt.Errorf("Failed sending BTRFS migration header: %w", err)
 		}
 
 		err = conn.Close() //End the frame.
 		if err != nil {
-			return fmt.Errorf("Failed closing migration header frame: %w", err)
+			return fmt.Errorf("Failed closing BTRFS migration header frame: %w", err)
 		}
 
-		d.logger.Debug("Sent migration meta data header", log.Ctx{"name": vol.name})
+		d.logger.Debug("Sent migration meta data header", logger.Ctx{"name": vol.name})
 	}
 
+	if volSrcArgs.Refresh && shared.StringInSlice(migration.BTRFSFeatureSubvolumeUUIDs, volSrcArgs.MigrationType.Features) {
+		migrationHeader = &BTRFSMetaDataHeader{}
+
+		buf, err := io.ReadAll(conn)
+		if err != nil {
+			return fmt.Errorf("Failed reading BTRFS migration header: %w", err)
+		}
+
+		err = json.Unmarshal(buf, &migrationHeader)
+		if err != nil {
+			return fmt.Errorf("Failed decoding BTRFS migration header: %w", err)
+		}
+
+		d.logger.Debug("Received BTRFS migration meta data header", logger.Ctx{"name": vol.name})
+
+		volSrcArgs.Snapshots = []string{}
+
+		// Override volSrcArgs.Snapshots to only include snapshots which need to be sent.
+		for _, snap := range migrationHeader.Subvolumes {
+			if snap.Path == "/" && snap.Snapshot != "" {
+				volSrcArgs.Snapshots = append(volSrcArgs.Snapshots, snap.Snapshot)
+			}
+		}
+	}
+
+	return d.migrateVolumeOptimized(vol, conn, volSrcArgs, migrationHeader.Subvolumes, op)
+}
+
+func (d *btrfs) migrateVolumeOptimized(vol Volume, conn io.ReadWriteCloser, volSrcArgs *migration.VolumeSourceArgs, subvolumes []BTRFSSubVolume, op *operations.Operation) error {
 	// sendVolume sends a volume and its subvolumes (if negotiated subvolumes feature) to recipient.
 	sendVolume := func(v Volume, sourcePrefix string, parentPrefix string) error {
 		snapName := "" // Default to empty (sending main volume) from migrationHeader.Subvolumes.
@@ -970,7 +1309,7 @@ func (d *btrfs) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *m
 		// Detect if we are sending a snapshot by comparing to main volume name.
 		// We can't only use IsSnapshot() as the main vol may itself be a snapshot.
 		if v.IsSnapshot() && v.name != vol.name {
-			_, snapName, _ = shared.InstanceGetParentAndSnapshotName(v.name)
+			_, snapName, _ = api.GetParentAndSnapshotName(v.name)
 		}
 
 		// Setup progress tracking.
@@ -982,7 +1321,7 @@ func (d *btrfs) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *m
 		sentVols := 0
 
 		// Send volume (and any subvolumes if supported) to target.
-		for _, subVolume := range migrationHeader.Subvolumes {
+		for _, subVolume := range subvolumes {
 			if subVolume.Snapshot != snapName {
 				continue // Only sending subvolumes related to snapshot name (empty for main vol).
 			}
@@ -998,29 +1337,32 @@ func (d *btrfs) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *m
 
 				// Set parent subvolume readonly if needed so we can send the subvolume.
 				if !BTRFSSubVolumeIsRo(parentPath) {
-					err = d.setSubvolumeReadonlyProperty(parentPath, true)
+					err := d.setSubvolumeReadonlyProperty(parentPath, true)
 					if err != nil {
 						return err
 					}
-					defer d.setSubvolumeReadonlyProperty(parentPath, false)
+
+					defer func() { _ = d.setSubvolumeReadonlyProperty(parentPath, false) }()
 				}
 			}
 
 			// Set subvolume readonly if needed so we can send it.
 			sourcePath := filepath.Join(sourcePrefix, subVolume.Path)
 			if !BTRFSSubVolumeIsRo(sourcePath) {
-				err = d.setSubvolumeReadonlyProperty(sourcePath, true)
+				err := d.setSubvolumeReadonlyProperty(sourcePath, true)
 				if err != nil {
 					return err
 				}
-				defer d.setSubvolumeReadonlyProperty(sourcePath, false)
+
+				defer func() { _ = d.setSubvolumeReadonlyProperty(sourcePath, false) }()
 			}
 
-			d.logger.Debug("Sending subvolume", log.Ctx{"name": v.name, "source": sourcePath, "parent": parentPath, "path": subVolume.Path})
-			err = d.sendSubvolume(sourcePath, parentPath, conn, wrapper)
+			d.logger.Debug("Sending subvolume", logger.Ctx{"name": v.name, "source": sourcePath, "parent": parentPath, "path": subVolume.Path})
+			err := d.sendSubvolume(sourcePath, parentPath, conn, wrapper)
 			if err != nil {
 				return fmt.Errorf("Failed sending volume %v:%s: %w", v.name, subVolume.Path, err)
 			}
+
 			sentVols++
 		}
 
@@ -1034,25 +1376,49 @@ func (d *btrfs) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *m
 
 	// Transfer the snapshots (and any subvolumes if supported) to target first.
 	lastVolPath := "" // Used as parent for differential transfers.
-	for _, snapName := range volSrcArgs.Snapshots {
-		snapVol, _ := vol.NewSnapshot(snapName)
-		err = sendVolume(snapVol, snapVol.MountPath(), lastVolPath)
+
+	if volSrcArgs.Refresh && !volSrcArgs.VolumeOnly {
+		snapshots, err := vol.Snapshots(op)
 		if err != nil {
 			return err
 		}
 
-		lastVolPath = snapVol.MountPath()
+		for i, snap := range snapshots {
+			if i == 0 {
+				continue
+			}
+
+			_, snapName, _ := api.GetParentAndSnapshotName(snap.name)
+
+			if len(volSrcArgs.Snapshots) > 0 && snapName == volSrcArgs.Snapshots[0] {
+				lastVolPath = snapshots[i-1].MountPath()
+				break
+			}
+		}
+	}
+
+	if !volSrcArgs.VolumeOnly {
+		for _, snapName := range volSrcArgs.Snapshots {
+			snapVol, _ := vol.NewSnapshot(snapName)
+			err := sendVolume(snapVol, snapVol.MountPath(), lastVolPath)
+			if err != nil {
+				return err
+			}
+
+			lastVolPath = snapVol.MountPath()
+		}
 	}
 
 	// Get instances directory (e.g. /var/lib/lxd/storage-pools/btrfs/containers).
 	instancesPath := GetVolumeMountPath(d.name, vol.volType, "")
 
 	// Create a temporary directory which will act as the parent directory of the read-only snapshot.
-	tmpVolumesMountPoint, err := ioutil.TempDir(instancesPath, "migration.")
+	tmpVolumesMountPoint, err := os.MkdirTemp(instancesPath, "migration.")
 	if err != nil {
 		return fmt.Errorf("Failed to create temporary directory under %q: %w", instancesPath, err)
 	}
-	defer os.RemoveAll(tmpVolumesMountPoint)
+
+	defer func() { _ = os.RemoveAll(tmpVolumesMountPoint) }()
 
 	err = os.Chmod(tmpVolumesMountPoint, 0100)
 	if err != nil {
@@ -1065,7 +1431,8 @@ func (d *btrfs) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *m
 	if err != nil {
 		return err
 	}
-	defer d.deleteSubvolume(migrationSendSnapshotPrefix, true)
+
+	defer func() { _ = d.deleteSubvolume(migrationSendSnapshotPrefix, true) }()
 
 	// Send main volume (and any subvolumes if supported) to target.
 	return sendVolume(vol, migrationSendSnapshotPrefix, lastVolPath)
@@ -1080,13 +1447,13 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 		// as they are copied to the tarball, as BTRFS allows us to take a quick snapshot without impacting
 		// the parent volume we do so here to ensure the backup taken is consistent.
 		if vol.contentType == ContentTypeFS {
-			snapshotPath, reverter, err := d.readonlySnapshot(vol)
+			snapshotPath, cleanup, err := d.readonlySnapshot(vol)
 			if err != nil {
 				return err
 			}
 
 			// Clean up the snapshot.
-			defer reverter.Fail()
+			defer cleanup()
 
 			// Set the path of the volume to the path of the fast snapshot so the migration reads from there instead.
 			vol.mountCustomPath = snapshotPath
@@ -1116,6 +1483,7 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 	if err != nil {
 		return err
 	}
+
 	r := bytes.NewReader(optimizedHeaderYAML)
 
 	indexFileInfo := instancewriter.FileInfo{
@@ -1138,20 +1506,22 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 		if parent != "" {
 			args = append(args, "-p", parent)
 		}
+
 		args = append(args, path)
 
 		// Create temporary file to store output of btrfs send.
 		backupsPath := shared.VarPath("backups")
-		tmpFile, err := ioutil.TempFile(backupsPath, fmt.Sprintf("%s_btrfs", backup.WorkingDirPrefix))
+		tmpFile, err := os.CreateTemp(backupsPath, fmt.Sprintf("%s_btrfs", backup.WorkingDirPrefix))
 		if err != nil {
 			return fmt.Errorf("Failed to open temporary file for BTRFS backup: %w", err)
 		}
-		defer tmpFile.Close()
-		defer os.Remove(tmpFile.Name())
+
+		defer func() { _ = tmpFile.Close() }()
+		defer func() { _ = os.Remove(tmpFile.Name()) }()
 
 		// Write the subvolume to the file.
-		d.logger.Debug("Generating optimized volume file", log.Ctx{"sourcePath": path, "parent": parent, "file": tmpFile.Name(), "name": fileName})
-		err = shared.RunCommandWithFds(nil, tmpFile, "btrfs", args...)
+		d.logger.Debug("Generating optimized volume file", logger.Ctx{"sourcePath": path, "parent": parent, "file": tmpFile.Name(), "name": fileName})
+		err = shared.RunCommandWithFds(context.TODO(), nil, tmpFile, "btrfs", args...)
 		if err != nil {
 			return err
 		}
@@ -1177,7 +1547,7 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 		// Detect if we are adding a snapshot by comparing to main volume name.
 		// We can't only use IsSnapshot() as the main vol may itself be a snapshot.
 		if v.IsSnapshot() && v.name != vol.name {
-			_, snapName, _ = shared.InstanceGetParentAndSnapshotName(v.name)
+			_, snapName, _ = api.GetParentAndSnapshotName(v.name)
 		}
 
 		sentVols := 0
@@ -1199,7 +1569,8 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 					if err != nil {
 						return err
 					}
-					defer d.setSubvolumeReadonlyProperty(parentPath, false)
+
+					defer func() { _ = d.setSubvolumeReadonlyProperty(parentPath, false) }()
 				}
 			}
 
@@ -1210,7 +1581,8 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 				if err != nil {
 					return err
 				}
-				defer d.setSubvolumeReadonlyProperty(sourcePath, false)
+
+				defer func() { _ = d.setSubvolumeReadonlyProperty(sourcePath, false) }()
 			}
 
 			// Default to no subvolume name for root subvolume to maintain backwards compatibility
@@ -1270,11 +1642,12 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 	sourceVolume := vol.MountPath()
 	instancesPath := GetVolumeMountPath(d.name, vol.volType, "")
 
-	tmpInstanceMntPoint, err := ioutil.TempDir(instancesPath, "backup.")
+	tmpInstanceMntPoint, err := os.MkdirTemp(instancesPath, "backup.")
 	if err != nil {
 		return fmt.Errorf("Failed to create temporary directory under %q: %w", instancesPath, err)
 	}
-	defer os.RemoveAll(tmpInstanceMntPoint)
+
+	defer func() { _ = os.RemoveAll(tmpInstanceMntPoint) }()
 
 	err = os.Chmod(tmpInstanceMntPoint, 0100)
 	if err != nil {
@@ -1287,7 +1660,8 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 	if err != nil {
 		return err
 	}
-	defer d.deleteSubvolume(targetVolume, true)
+
+	defer func() { _ = d.deleteSubvolume(targetVolume, true) }()
 
 	err = d.setSubvolumeReadonlyProperty(targetVolume, true)
 	if err != nil {
@@ -1322,7 +1696,7 @@ func (d *btrfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWr
 
 // CreateVolumeSnapshot creates a snapshot of a volume.
 func (d *btrfs) CreateVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
-	parentName, _, _ := shared.InstanceGetParentAndSnapshotName(snapVol.name)
+	parentName, _, _ := api.GetParentAndSnapshotName(snapVol.name)
 	srcPath := GetVolumeMountPath(d.name, snapVol.volType, parentName)
 	snapPath := snapVol.MountPath()
 
@@ -1373,7 +1747,7 @@ func (d *btrfs) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) e
 	}
 
 	// Remove the parent snapshot directory if this is the last snapshot being removed.
-	parentName, _, _ := shared.InstanceGetParentAndSnapshotName(snapVol.name)
+	parentName, _, _ := api.GetParentAndSnapshotName(snapVol.name)
 	err = deleteParentSnapshotDirIfEmpty(d.name, snapVol.volType, parentName)
 	if err != nil {
 		return err
@@ -1383,7 +1757,7 @@ func (d *btrfs) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) e
 }
 
 // MountVolumeSnapshot sets up a read-only mount on top of the snapshot to avoid accidental modifications.
-func (d *btrfs) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
+func (d *btrfs) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
 	unlock := snapVol.MountLock()
 	defer unlock()
 
@@ -1394,17 +1768,29 @@ func (d *btrfs) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (b
 	if !shared.PathExists(snapPath) || snapVol.volType != VolumeTypeCustom {
 		err := snapVol.EnsureMountPath()
 		if err != nil {
-			return false, err
+			return err
 		}
 	}
 
-	return mountReadOnly(snapPath, snapPath)
+	_, err := mountReadOnly(snapPath, snapPath)
+	if err != nil {
+		return err
+	}
+
+	snapVol.MountRefCountIncrement() // From here on it is up to caller to call UnmountVolumeSnapshot() when done.
+	return nil
 }
 
 // UnmountVolumeSnapshot removes the read-only mount placed on top of a snapshot.
 func (d *btrfs) UnmountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
 	unlock := snapVol.MountLock()
 	defer unlock()
+
+	refCount := snapVol.MountRefCountDecrement()
+	if refCount > 0 {
+		d.logger.Debug("Skipping unmount as in use", logger.Ctx{"volName": snapVol.name, "refCount": refCount})
+		return false, ErrInUse
+	}
 
 	snapPath := snapVol.MountPath()
 	return forceUnmount(snapPath)
@@ -1413,6 +1799,43 @@ func (d *btrfs) UnmountVolumeSnapshot(snapVol Volume, op *operations.Operation) 
 // VolumeSnapshots returns a list of snapshots for the volume (in no particular order).
 func (d *btrfs) VolumeSnapshots(vol Volume, op *operations.Operation) ([]string, error) {
 	return genericVFSVolumeSnapshots(d, vol, op)
+}
+
+// volumeSnapshotsSorted returns a list of snapshots for the volume (ordered by subvolume ID).
+// Since the subvolume ID is incremental, this also represents the order of creation.
+func (d *btrfs) volumeSnapshotsSorted(vol Volume, op *operations.Operation) ([]string, error) {
+	stdout := bytes.Buffer{}
+
+	err := shared.RunCommandWithFds(context.TODO(), nil, &stdout, "btrfs", "subvolume", "list", GetPoolMountPath(vol.pool))
+	if err != nil {
+		return nil, err
+	}
+
+	var snapshotNames []string
+
+	snapshotPrefix := fmt.Sprintf("%s-snapshots/%s/", vol.volType, vol.name)
+	scanner := bufio.NewScanner(&stdout)
+
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+
+		if len(fields) != 9 {
+			continue
+		}
+
+		if !strings.HasPrefix(fields[8], snapshotPrefix) {
+			continue
+		}
+
+		// Exclude subvolumes of snapshots
+		if strings.Contains(strings.TrimPrefix(fields[8], snapshotPrefix), "/") {
+			continue
+		}
+
+		snapshotNames = append(snapshotNames, filepath.Base(fields[8]))
+	}
+
+	return snapshotNames, nil
 }
 
 // RestoreVolume restores a volume from a snapshot.
@@ -1436,14 +1859,16 @@ func (d *btrfs) RestoreVolume(vol Volume, snapshotName string, op *operations.Op
 	if err != nil {
 		return fmt.Errorf("Failed to rename %q to %q: %w", target, backupSubvolume, err)
 	}
-	revert.Add(func() { os.Rename(backupSubvolume, target) })
+
+	revert.Add(func() { _ = os.Rename(backupSubvolume, target) })
 
 	// Restore the snapshot.
 	err = d.snapshotSubvolume(srcVol.MountPath(), target, true)
 	if err != nil {
 		return err
 	}
-	revert.Add(func() { d.deleteSubvolume(target, true) })
+
+	revert.Add(func() { _ = d.deleteSubvolume(target, true) })
 
 	// Restore readonly property on subvolumes in reverse order (except root which should be left writable).
 	subVolCount := len(subVols)

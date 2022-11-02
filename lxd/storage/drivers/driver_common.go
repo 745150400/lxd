@@ -2,14 +2,19 @@ package drivers
 
 import (
 	"fmt"
+	"io"
+	"net/url"
 	"os/exec"
+	"regexp"
 	"strings"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
+	"github.com/lxc/lxd/lxd/backup"
 	"github.com/lxc/lxd/lxd/migration"
+	"github.com/lxc/lxd/lxd/operations"
+	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/instancewriter"
 	"github.com/lxc/lxd/shared/logger"
 )
 
@@ -38,7 +43,7 @@ func (d *common) isRemote() bool {
 }
 
 // validatePool validates a pool config against common rules and optional driver specific rules.
-func (d *common) validatePool(config map[string]string, driverRules map[string]func(value string) error) error {
+func (d *common) validatePool(config map[string]string, driverRules map[string]func(value string) error, volumeRules map[string]func(value string) error) error {
 	checkedFields := map[string]struct{}{}
 
 	// Get rules common for all drivers.
@@ -49,12 +54,18 @@ func (d *common) validatePool(config map[string]string, driverRules map[string]f
 		rules[field] = validator
 	}
 
+	// Add to pool volume configuration options as volume.* options.
+	// These will be used as default configuration options for volume.
+	for volRule, volValidator := range volumeRules {
+		rules[fmt.Sprintf("volume.%s", volRule)] = volValidator
+	}
+
 	// Run the validator against each field.
 	for k, validator := range rules {
 		checkedFields[k] = struct{}{} //Mark field as checked.
 		err := validator(config[k])
 		if err != nil {
-			return fmt.Errorf("Invalid value for pool %q option %q: %w", d.name, k, err)
+			return fmt.Errorf("Invalid value for option %q: %w", k, err)
 		}
 	}
 
@@ -70,7 +81,49 @@ func (d *common) validatePool(config map[string]string, driverRules map[string]f
 			continue
 		}
 
-		return fmt.Errorf("Invalid option for pool %q option %q", d.name, k)
+		return fmt.Errorf("Invalid option %q", k)
+	}
+
+	return nil
+}
+
+// fillVolumeConfig populates volume config with defaults from pool.
+// excludeKeys allow exclude some keys from copying to volume config.
+// Sometimes that can be useful when copying is dependant from specific conditions
+// and shouldn't be done in generic way.
+func (d *common) fillVolumeConfig(vol *Volume, excludedKeys ...string) error {
+	for k := range d.config {
+		if !strings.HasPrefix(k, "volume.") {
+			continue
+		}
+
+		volKey := strings.TrimPrefix(k, "volume.")
+
+		isExcluded := false
+		for _, excludedKey := range excludedKeys {
+			if excludedKey == volKey {
+				isExcluded = true
+				break
+			}
+		}
+
+		if isExcluded {
+			continue
+		}
+
+		// If volume type is not custom or bucket, don't copy "size" property to volume config.
+		if (vol.volType != VolumeTypeCustom && vol.volType != VolumeTypeBucket) && volKey == "size" {
+			continue
+		}
+
+		// security.shifted and security.unmapped are only relevant for custom filesystem volumes.
+		if (vol.Type() != VolumeTypeCustom || vol.ContentType() != ContentTypeFS) && (volKey == "security.shifted" || volKey == "security.unmapped") {
+			continue
+		}
+
+		if vol.config[volKey] == "" {
+			vol.config[volKey] = d.config[k]
+		}
 	}
 
 	return nil
@@ -78,7 +131,7 @@ func (d *common) validatePool(config map[string]string, driverRules map[string]f
 
 // FillVolumeConfig populate volume with default config.
 func (d *common) FillVolumeConfig(vol Volume) error {
-	return nil
+	return d.fillVolumeConfig(&vol)
 }
 
 // validateVolume validates a volume config against common rules and optional driver specific rules.
@@ -124,9 +177,9 @@ func (d *common) validateVolume(vol Volume, driverRules map[string]func(value st
 		}
 	}
 
-	// If volume type is not custom, don't allow "size" property.
-	if vol.volType != VolumeTypeCustom && vol.config["size"] != "" {
-		return fmt.Errorf("Volume %q property is only valid for custom volume types", "size")
+	// If volume type is not custom or bucket, don't allow "size" property.
+	if (vol.volType != VolumeTypeCustom && vol.volType != VolumeTypeBucket) && vol.config["size"] != "" {
+		return fmt.Errorf("Volume %q property is not valid for volume type", "size")
 	}
 
 	return nil
@@ -210,19 +263,19 @@ func (d *common) ApplyPatch(name string) error {
 func (d *common) moveGPTAltHeader(devPath string) error {
 	path, err := exec.LookPath("sgdisk")
 	if err != nil {
-		d.logger.Warn("Skipped moving GPT alternative header to end of disk as sgdisk command not found", log.Ctx{"dev": devPath})
+		d.logger.Warn("Skipped moving GPT alternative header to end of disk as sgdisk command not found", logger.Ctx{"dev": devPath})
 		return nil
 	}
 
 	_, err = shared.RunCommand(path, "--move-second-header", devPath)
 	if err == nil {
-		d.logger.Debug("Moved GPT alternative header to end of disk", log.Ctx{"dev": devPath})
+		d.logger.Debug("Moved GPT alternative header to end of disk", logger.Ctx{"dev": devPath})
 		return nil
 	}
 
 	runErr, ok := err.(shared.RunError)
 	if ok {
-		exitError, ok := runErr.Err.(*exec.ExitError)
+		exitError, ok := runErr.Unwrap().(*exec.ExitError)
 		if ok {
 			// sgdisk manpage says exit status 3 means:
 			// "Non-GPT disk detected and no -g option, but operation requires a write action".
@@ -236,30 +289,206 @@ func (d *common) moveGPTAltHeader(devPath string) error {
 }
 
 // runFiller runs the supplied filler, and setting the returned volume size back into filler.
-func (d *common) runFiller(vol Volume, devPath string, filler *VolumeFiller) error {
+func (d *common) runFiller(vol Volume, devPath string, filler *VolumeFiller, allowUnsafeResize bool) error {
 	if filler == nil || filler.Fill == nil {
 		return nil
 	}
 
-	allowUnsafeResize := false
-
-	// Allow filler to resize initial image volume as needed. Some storage drivers don't normally allow
-	// image volumes to be resized due to them having read-only snapshots that cannot be resized. However
-	// when creating the initial image volume and filling it before the snapshot is taken resizing can be
-	// allowed and is required in order to support unpacking images larger than the default volume size.
-	// The filler function is still expected to obey any volume size restrictions configured on the pool.
-	// Also needed allow unsafe resize to disable filesystem resize safety checks. This is safe because if for
-	// some reason an error occurs the volume will be discarded rather than leaving a corrupt filesystem.
-	if vol.Type() == VolumeTypeImage {
-		allowUnsafeResize = true
-	}
-
-	vol.driver.Logger().Debug("Running filler function", log.Ctx{"dev": devPath, "path": vol.MountPath()})
+	vol.driver.Logger().Debug("Running filler function", logger.Ctx{"dev": devPath, "path": vol.MountPath()})
 	volSize, err := filler.Fill(vol, devPath, allowUnsafeResize)
 	if err != nil {
 		return err
 	}
 
 	filler.Size = volSize
+
+	return nil
+}
+
+// CreateVolume creates a new storage volume on disk.
+func (d *common) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// CreateVolumeFromBackup re-creates a volume from its exported state.
+func (d *common) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcData io.ReadSeeker, op *operations.Operation) (VolumePostHook, revert.Hook, error) {
+	return nil, nil, ErrNotSupported
+}
+
+// CreateVolumeFromCopy copies an existing storage volume (with or without snapshots) into a new volume.
+func (d *common) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, allowInconsistent bool, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// CreateVolumeFromMigration creates a new volume (with or without snapshots) from a migration data stream.
+func (d *common) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, volTargetArgs migration.VolumeTargetArgs, preFiller *VolumeFiller, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// RefreshVolume updates an existing volume to match the state of another.
+func (d *common) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, allowInconsistent bool, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// DeleteVolume destroys the on-disk state of a volume.
+func (d *common) DeleteVolume(vol Volume, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// HasVolume indicates whether a specific volume exists on the storage pool.
+func (d *common) HasVolume(vol Volume) bool {
+	return false
+}
+
+// ValidateVolume validates the supplied volume config. Optionally removes invalid keys from the volume's config.
+func (d *common) ValidateVolume(vol Volume, removeUnknownKeys bool) error {
+	return ErrNotSupported
+}
+
+// UpdateVolume applies the driver specific changes of a volume configuration change.
+func (d *common) UpdateVolume(vol Volume, changedConfig map[string]string) error {
+	return ErrNotSupported
+}
+
+// GetVolumeUsage returns the disk space usage of a volume.
+func (d *common) GetVolumeUsage(vol Volume) (int64, error) {
+	return -1, ErrNotSupported
+}
+
+// SetVolumeQuota applies a size limit on volume.
+func (d *common) SetVolumeQuota(vol Volume, size string, allowUnsafeResize bool, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// GetVolumeDiskPath returns the location of a root disk block device.
+func (d *common) GetVolumeDiskPath(vol Volume) (string, error) {
+	return "", ErrNotSupported
+}
+
+// ListVolumes returns a list of LXD volumes in storage pool.
+func (d *common) ListVolumes() ([]Volume, error) {
+	return nil, ErrNotSupported
+}
+
+// MountVolume sets up the volume for use.
+func (d *common) MountVolume(vol Volume, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// UnmountVolume clears any runtime state for the volume.
+// As driver doesn't have volumes to unmount it returns false indicating the volume was already unmounted.
+func (d *common) UnmountVolume(vol Volume, keepBlockDev bool, op *operations.Operation) (bool, error) {
+	return false, ErrNotSupported
+}
+
+// RenameVolume renames the volume and all related filesystem entries.
+func (d *common) RenameVolume(vol Volume, newVolName string, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// MigrateVolume streams the volume (with or without snapshots).
+func (d *common) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *migration.VolumeSourceArgs, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// BackupVolume creates an exported version of a volume.
+func (d *common) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarWriter, optimized bool, snapshots []string, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// CreateVolumeSnapshot creates a new snapshot.
+func (d *common) CreateVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// DeleteVolumeSnapshot deletes a snapshot.
+func (d *common) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// MountVolumeSnapshot makes the snapshot available for use.
+func (d *common) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// UnmountVolumeSnapshot clears any runtime state for the snapshot.
+func (d *common) UnmountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
+	return false, ErrNotSupported
+}
+
+// VolumeSnapshots returns a list of snapshots for the volume (in no particular order).
+func (d *common) VolumeSnapshots(vol Volume, op *operations.Operation) ([]string, error) {
+	return nil, ErrNotSupported
+}
+
+// RestoreVolume resets a volume to its snapshotted state.
+func (d *common) RestoreVolume(vol Volume, snapshotName string, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// RenameVolumeSnapshot renames a snapshot.
+func (d *common) RenameVolumeSnapshot(snapVol Volume, newSnapshotName string, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// ValidateBucket validates the supplied bucket name.
+func (d *common) ValidateBucket(bucket Volume) error {
+	match, err := regexp.MatchString(`^[a-z0-9][\-\.a-z0-9]{2,62}$`, bucket.name)
+	if err != nil {
+		return err
+	}
+
+	if !match {
+		return fmt.Errorf("Bucket name must be between 3 and 63 lowercase letters, numbers, periods or hyphens and must start with a letter or number")
+	}
+
+	return nil
+}
+
+// GetBucketURL returns the URL of the specified bucket.
+func (d *common) GetBucketURL(bucketName string) *url.URL {
+	return nil
+}
+
+// CreateBucket creates a new bucket.
+func (d *common) CreateBucket(bucket Volume, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// DeleteBucket deletes an existing bucket.
+func (d *common) DeleteBucket(bucket Volume, op *operations.Operation) error {
+	return ErrNotSupported
+}
+
+// UpdateBucket updates an existing bucket.
+func (d *common) UpdateBucket(bucket Volume, changedConfig map[string]string) error {
+	return ErrNotSupported
+}
+
+// ValidateBucketKey validates the supplied bucket key config.
+func (d *common) ValidateBucketKey(keyName string, creds S3Credentials, roleName string) error {
+	if keyName == "" {
+		return fmt.Errorf("Key name is required")
+	}
+
+	validRoles := []string{"admin", "read-only"}
+	if !shared.StringInSlice(roleName, validRoles) {
+		return fmt.Errorf("Invalid key role")
+	}
+
+	return nil
+}
+
+// CreateBucketKey create bucket key.
+func (d *common) CreateBucketKey(bucket Volume, keyName string, creds S3Credentials, roleName string, op *operations.Operation) (*S3Credentials, error) {
+	return nil, ErrNotSupported
+}
+
+// UpdateBucketKey updates bucket key.
+func (d *common) UpdateBucketKey(bucket Volume, keyName string, creds S3Credentials, roleName string, op *operations.Operation) (*S3Credentials, error) {
+	return nil, ErrNotSupported
+}
+
+func (d *common) DeleteBucketKey(bucket Volume, keyName string, op *operations.Operation) error {
 	return nil
 }

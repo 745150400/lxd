@@ -1,12 +1,17 @@
 package main
 
 import (
+	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 
 	"github.com/gorilla/mux"
+
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/response"
+	"github.com/lxc/lxd/shared"
 )
 
 // swagger:operation GET /1.0/instances/{name} instances instance_get
@@ -99,7 +104,14 @@ func instanceGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Parse the recursion field
 	recursionStr := r.FormValue("recursion")
@@ -114,6 +126,7 @@ func instanceGet(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
@@ -123,13 +136,15 @@ func instanceGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	var state interface{}
-	var etag interface{}
+	var state any
+	var etag any
 	if recursion == 0 {
 		state, etag, err = c.Render()
 	} else {
-		state, etag, err = c.RenderFull()
+		hostInterfaces, _ := net.Interfaces()
+		state, etag, err = c.RenderFull(hostInterfaces)
 	}
+
 	if err != nil {
 		return response.SmartError(err)
 	}

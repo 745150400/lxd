@@ -38,11 +38,11 @@ func (c *cmdOperation) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Delete
+// Delete.
 type cmdOperationDelete struct {
 	global    *cmdGlobal
 	operation *cmdOperation
@@ -89,7 +89,7 @@ func (c *cmdOperationDelete) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// List
+// List.
 type cmdOperationList struct {
 	global    *cmdGlobal
 	operation *cmdOperation
@@ -155,6 +155,7 @@ func (c *cmdOperationList) Run(cmd *cobra.Command, args []string) error {
 
 		data = append(data, entry)
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -171,7 +172,7 @@ func (c *cmdOperationList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, operations)
 }
 
-// Show
+// Show.
 type cmdOperationShow struct {
 	global    *cmdGlobal
 	operation *cmdOperation

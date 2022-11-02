@@ -18,7 +18,6 @@ import (
 
 	"github.com/gorilla/websocket"
 	"google.golang.org/protobuf/proto"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
@@ -29,6 +28,12 @@ import (
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/tcp"
 )
+
+// migrationControlResponse encapsulates migration.MigrationControl with a receive error.
+type migrationControlResponse struct {
+	migration.MigrationControl
+	err error
+}
 
 type migrationFields struct {
 	controlSecret string
@@ -47,7 +52,8 @@ type migrationFields struct {
 	instance     instance.Instance
 
 	// storage specific fields
-	volumeOnly bool
+	volumeOnly        bool
+	allowInconsistent bool
 }
 
 func (c *migrationFields) send(m proto.Message) error {
@@ -82,10 +88,11 @@ func (c *migrationFields) disconnect() {
 
 	c.controlLock.Lock()
 	if c.controlConn != nil {
-		c.controlConn.WriteMessage(websocket.CloseMessage, closeMsg)
-		c.controlConn.Close()
+		_ = c.controlConn.WriteMessage(websocket.CloseMessage, closeMsg)
+		_ = c.controlConn.Close()
 		c.controlConn = nil /* don't close twice */
 	}
+
 	c.controlLock.Unlock()
 
 	/* Below we just Close(), which doesn't actually write to the
@@ -97,11 +104,11 @@ func (c *migrationFields) disconnect() {
 	 * anyway.
 	 */
 	if c.fsConn != nil {
-		c.fsConn.Close()
+		_ = c.fsConn.Close()
 	}
 
 	if c.criuConn != nil {
-		c.criuConn.Close()
+		_ = c.criuConn.Close()
 	}
 }
 
@@ -110,6 +117,7 @@ func (c *migrationFields) sendControl(err error) {
 	if c.controlConn != nil {
 		migration.ProtoSendControl(c.controlConn, err)
 	}
+
 	c.controlLock.Unlock()
 
 	if err != nil {
@@ -117,17 +125,19 @@ func (c *migrationFields) sendControl(err error) {
 	}
 }
 
-func (c *migrationFields) controlChannel() <-chan *migration.MigrationControl {
-	ch := make(chan *migration.MigrationControl)
+func (c *migrationFields) controlChannel() <-chan *migrationControlResponse {
+	ch := make(chan *migrationControlResponse)
 	go func() {
-		msg := migration.MigrationControl{}
-		err := c.recv(&msg)
+		resp := migrationControlResponse{}
+		err := c.recv(&resp.MigrationControl)
 		if err != nil {
-			logger.Debugf("Got error reading migration control socket %s", err)
-			close(ch)
+			resp.err = err
+			ch <- &resp
+
 			return
 		}
-		ch <- &msg
+
+		ch <- &resp
 	}()
 
 	return ch
@@ -139,7 +149,7 @@ type migrationSourceWs struct {
 	allConnected chan struct{}
 }
 
-func (s *migrationSourceWs) Metadata() interface{} {
+func (s *migrationSourceWs) Metadata() any {
 	secrets := shared.Jmap{
 		"control": s.controlSecret,
 		"fs":      s.fsSecret,
@@ -181,11 +191,11 @@ func (s *migrationSourceWs) Connect(op *operations.Operation, r *http.Request, w
 
 	remoteTCP, err := tcp.ExtractConn(c.UnderlyingConn())
 	if err != nil {
-		logger.Error("Failed extracting TCP connection from remote connection", log.Ctx{"err": err})
+		logger.Error("Failed extracting TCP connection from remote connection", logger.Ctx{"err": err})
 	} else {
-		err := tcp.SetTimeouts(remoteTCP)
+		err = tcp.SetTimeouts(remoteTCP)
 		if err != nil {
-			logger.Error("Failed setting TCP timeouts on remote connection", log.Ctx{"err": err})
+			logger.Error("Failed setting TCP timeouts on remote connection", logger.Ctx{"err": err})
 		}
 	}
 
@@ -232,7 +242,7 @@ func (s *migrationSourceWs) ConnectTarget(certificate string, operation string, 
 
 	dialer := websocket.Dialer{
 		TLSClientConfig:  config,
-		NetDial:          shared.RFC3493Dialer,
+		NetDialContext:   shared.RFC3493Dialer,
 		HandshakeTimeout: time.Second * 5,
 	}
 
@@ -253,9 +263,9 @@ func (s *migrationSourceWs) ConnectTarget(certificate string, operation string, 
 		query := url.Values{"secret": []string{secret}}
 
 		// The URL is a https URL to the operation, mangle to be a wss URL to the secret
-		wsUrl := fmt.Sprintf("wss://%s/websocket?%s", strings.TrimPrefix(operation, "https://"), query.Encode())
+		wsURL := fmt.Sprintf("wss://%s/websocket?%s", strings.TrimPrefix(operation, "https://"), query.Encode())
 
-		wsConn, _, err := dialer.Dial(wsUrl, http.Header{})
+		wsConn, _, err := dialer.Dial(wsURL, http.Header{})
 		if err != nil {
 			return err
 		}
@@ -283,12 +293,13 @@ type migrationSink struct {
 	refresh      bool
 }
 
+// MigrationSinkArgs arguments to configure migration sink.
 type MigrationSinkArgs struct {
 	// General migration fields
 	Dialer  websocket.Dialer
 	Push    bool
 	Secrets map[string]string
-	Url     string
+	URL     string
 
 	// Instance specific fields
 	Instance     instance.Instance
@@ -306,13 +317,13 @@ type MigrationSinkArgs struct {
 	RsyncFeatures []string
 }
 
-func (c *migrationSink) connectWithSecret(secret string) (*websocket.Conn, error) {
+func (s *migrationSink) connectWithSecret(secret string) (*websocket.Conn, error) {
 	query := url.Values{"secret": []string{secret}}
 
 	// The URL is a https URL to the operation, mangle to be a wss URL to the secret
-	wsUrl := fmt.Sprintf("wss://%s/websocket?%s", strings.TrimPrefix(c.url, "https://"), query.Encode())
+	wsURL := fmt.Sprintf("wss://%s/websocket?%s", strings.TrimPrefix(s.url, "https://"), query.Encode())
 
-	conn, _, err := c.dialer.Dial(wsUrl, http.Header{})
+	conn, _, err := s.dialer.Dial(wsURL, http.Header{})
 	if err != nil {
 		return nil, err
 	}
@@ -320,7 +331,8 @@ func (c *migrationSink) connectWithSecret(secret string) (*websocket.Conn, error
 	return conn, err
 }
 
-func (s *migrationSink) Metadata() interface{} {
+// Metadata returns metadata for the migration sink.
+func (s *migrationSink) Metadata() any {
 	secrets := shared.Jmap{
 		"control": s.dest.controlSecret,
 		"fs":      s.dest.fsSecret,
@@ -333,6 +345,7 @@ func (s *migrationSink) Metadata() interface{} {
 	return secrets
 }
 
+// Connect connects to the migration source.
 func (s *migrationSink) Connect(op *operations.Operation, r *http.Request, w http.ResponseWriter) error {
 	secret := r.FormValue("secret")
 	if secret == "" {

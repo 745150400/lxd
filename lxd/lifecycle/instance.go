@@ -1,8 +1,6 @@
 package lifecycle
 
 import (
-	"fmt"
-
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/version"
@@ -11,7 +9,7 @@ import (
 // Internal copy of the instance interface.
 type instance interface {
 	Name() string
-	Project() string
+	Project() api.Project
 	Operation() *operations.Operation
 }
 
@@ -20,30 +18,30 @@ type InstanceAction string
 
 // All supported lifecycle events for instances.
 const (
-	InstanceCreated          = InstanceAction("created")
-	InstanceStarted          = InstanceAction("started")
-	InstanceStopped          = InstanceAction("stopped")
-	InstanceShutdown         = InstanceAction("shutdown")
-	InstanceRestarted        = InstanceAction("restarted")
-	InstancePaused           = InstanceAction("paused")
-	InstanceResumed          = InstanceAction("resumed")
-	InstanceRestored         = InstanceAction("restored")
-	InstanceDeleted          = InstanceAction("deleted")
-	InstanceRenamed          = InstanceAction("renamed")
-	InstanceUpdated          = InstanceAction("updated")
-	InstanceExec             = InstanceAction("exec")
-	InstanceConsole          = InstanceAction("console")
-	InstanceConsoleRetrieved = InstanceAction("console-retrieved")
-	InstanceConsoleReset     = InstanceAction("console-reset")
-	InstanceFileRetrieved    = InstanceAction("file-retrieved")
-	InstanceFilePushed       = InstanceAction("file-pushed")
-	InstanceFileDeleted      = InstanceAction("file-deleted")
+	InstanceCreated          = InstanceAction(api.EventLifecycleInstanceCreated)
+	InstanceStarted          = InstanceAction(api.EventLifecycleInstanceStarted)
+	InstanceStopped          = InstanceAction(api.EventLifecycleInstanceStopped)
+	InstanceShutdown         = InstanceAction(api.EventLifecycleInstanceShutdown)
+	InstanceRestarted        = InstanceAction(api.EventLifecycleInstanceRestarted)
+	InstancePaused           = InstanceAction(api.EventLifecycleInstancePaused)
+	InstanceReady            = InstanceAction(api.EventLifecycleInstanceReady)
+	InstanceResumed          = InstanceAction(api.EventLifecycleInstanceResumed)
+	InstanceRestored         = InstanceAction(api.EventLifecycleInstanceRestored)
+	InstanceDeleted          = InstanceAction(api.EventLifecycleInstanceDeleted)
+	InstanceRenamed          = InstanceAction(api.EventLifecycleInstanceRenamed)
+	InstanceUpdated          = InstanceAction(api.EventLifecycleInstanceUpdated)
+	InstanceExec             = InstanceAction(api.EventLifecycleInstanceExec)
+	InstanceConsole          = InstanceAction(api.EventLifecycleInstanceConsole)
+	InstanceConsoleRetrieved = InstanceAction(api.EventLifecycleInstanceConsoleRetrieved)
+	InstanceConsoleReset     = InstanceAction(api.EventLifecycleInstanceConsoleReset)
+	InstanceFileRetrieved    = InstanceAction(api.EventLifecycleInstanceFileRetrieved)
+	InstanceFilePushed       = InstanceAction(api.EventLifecycleInstanceFilePushed)
+	InstanceFileDeleted      = InstanceAction(api.EventLifecycleInstanceFileDeleted)
 )
 
 // Event creates the lifecycle event for an action on an instance.
-func (a InstanceAction) Event(inst instance, ctx map[string]interface{}) api.EventLifecycle {
-	eventType := fmt.Sprintf("instance-%s", a)
-	url := api.NewURL().Path(version.APIVersion, "instances", inst.Name()).Project(inst.Project())
+func (a InstanceAction) Event(inst instance, ctx map[string]any) api.EventLifecycle {
+	url := api.NewURL().Path(version.APIVersion, "instances", inst.Name()).Project(inst.Project().Name)
 
 	var requestor *api.EventLifecycleRequestor
 	if inst.Operation() != nil {
@@ -51,7 +49,7 @@ func (a InstanceAction) Event(inst instance, ctx map[string]interface{}) api.Eve
 	}
 
 	return api.EventLifecycle{
-		Action:    eventType,
+		Action:    string(a),
 		Source:    url.String(),
 		Context:   ctx,
 		Requestor: requestor,

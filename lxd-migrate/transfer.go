@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -19,7 +18,7 @@ import (
 	"github.com/lxc/lxd/shared/api"
 )
 
-// Send an rsync stream of a path over a websocket
+// Send an rsync stream of a path over a websocket.
 func rsyncSend(ctx context.Context, conn *websocket.Conn, path string, rsyncArgs string, instanceType api.InstanceType) error {
 	cmd, dataSocket, stderr, err := rsyncSendSetup(ctx, path, rsyncArgs, instanceType)
 	if err != nil {
@@ -27,15 +26,15 @@ func rsyncSend(ctx context.Context, conn *websocket.Conn, path string, rsyncArgs
 	}
 
 	if dataSocket != nil {
-		defer dataSocket.Close()
+		defer func() { _ = dataSocket.Close() }()
 	}
 
 	readDone, writeDone := shared.WebsocketMirror(conn, dataSocket, io.ReadCloser(dataSocket), nil, nil)
 
-	output, err := ioutil.ReadAll(stderr)
+	output, err := io.ReadAll(stderr)
 	if err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return fmt.Errorf("Failed to rsync: %v\n%s", err, output)
 	}
 
@@ -50,7 +49,7 @@ func rsyncSend(ctx context.Context, conn *websocket.Conn, path string, rsyncArgs
 	return nil
 }
 
-// Spawn the rsync process
+// Spawn the rsync process.
 func rsyncSendSetup(ctx context.Context, path string, rsyncArgs string, instanceType api.InstanceType) (*exec.Cmd, net.Conn, io.ReadCloser, error) {
 	auds := fmt.Sprintf("@lxd-migrate/%s", uuid.New())
 	if len(auds) > shared.ABSTRACT_UNIX_SOCK_LEN-1 {
@@ -112,17 +111,19 @@ func rsyncSendSetup(ctx context.Context, path string, rsyncArgs string, instance
 		return nil, nil, nil, err
 	}
 
-	if err := cmd.Start(); err != nil {
+	err = cmd.Start()
+	if err != nil {
 		return nil, nil, nil, err
 	}
 
 	conn, err := l.Accept()
 	if err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return nil, nil, nil, err
 	}
-	l.Close()
+
+	_ = l.Close()
 
 	return cmd, conn, stderr, nil
 }
@@ -132,7 +133,7 @@ func protoSendError(ws *websocket.Conn, err error) {
 
 	if err != nil {
 		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-		ws.WriteMessage(websocket.CloseMessage, closeMsg)
-		ws.Close()
+		_ = ws.WriteMessage(websocket.CloseMessage, closeMsg)
+		_ = ws.Close()
 	}
 }

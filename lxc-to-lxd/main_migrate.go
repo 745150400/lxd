@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
+	liblxc "github.com/lxc/go-lxc"
 	"github.com/spf13/cobra"
-	liblxc "gopkg.in/lxc/go-lxc.v2"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxc/utils"
@@ -89,6 +89,7 @@ func (c *cmdMigrate) RunE(cmd *cobra.Command, args []string) error {
 				fmt.Println("Would destroy container now")
 				continue
 			}
+
 			err := container.Destroy()
 			if err != nil {
 				fmt.Printf("Failed to destroy container '%s': %v\n", container.Name(), err)
@@ -111,6 +112,7 @@ func validateConfig(conf []string, container *liblxc.Container) error {
 	if value == nil {
 		value = getConfig(conf, "lxc.utsname")
 	}
+
 	if value == nil || value[0] != container.Name() {
 		return fmt.Errorf("Container name doesn't match lxc.uts.name / lxc.utsname")
 	}
@@ -121,6 +123,7 @@ func validateConfig(conf []string, container *liblxc.Container) error {
 	if value == nil {
 		value = getConfig(conf, "lxc.aa_allow_incomplete")
 	}
+
 	if value != nil {
 		v, err := strconv.Atoi(value[0])
 		if err != nil {
@@ -191,7 +194,7 @@ func convertContainer(d lxd.ContainerServer, container *liblxc.Container, storag
 
 	// Make sure we don't have a conflict
 	fmt.Println("Checking for existing containers")
-	containers, err := d.GetContainerNames()
+	containers, err := d.GetInstanceNames(api.InstanceTypeContainer)
 	if err != nil {
 		return err
 	}
@@ -218,6 +221,7 @@ func convertContainer(d lxd.ContainerServer, container *liblxc.Container, storag
 	if value == nil {
 		value = getConfig(conf, "lxd.id_map")
 	}
+
 	if value == nil {
 		// Privileged container
 		newConfig["security.privileged"] = "true"
@@ -294,6 +298,7 @@ func convertContainer(d lxd.ContainerServer, container *liblxc.Container, storag
 	if value == nil {
 		value = getConfig(conf, "lxc.aa_profile")
 	}
+
 	if value != nil {
 		if value[0] == "lxc-container-default-with-nesting" {
 			newConfig["security.nesting"] = "true"
@@ -308,6 +313,7 @@ func convertContainer(d lxd.ContainerServer, container *liblxc.Container, storag
 	if value == nil {
 		value = getConfig(conf, "lxc.seccomp")
 	}
+
 	if value != nil && value[0] != "/usr/share/lxc/config/common.seccomp" {
 		return fmt.Errorf("Custom seccomp profiles aren't supported")
 	}
@@ -318,6 +324,7 @@ func convertContainer(d lxd.ContainerServer, container *liblxc.Container, storag
 	if value == nil {
 		value = getConfig(conf, "lxc.se_context")
 	}
+
 	if value != nil {
 		return fmt.Errorf("Custom SELinux policies aren't supported")
 	}
@@ -332,6 +339,7 @@ func convertContainer(d lxd.ContainerServer, container *liblxc.Container, storag
 				"sys_time"}) {
 				continue
 			}
+
 			return fmt.Errorf("Custom capabilities aren't supported")
 		}
 	}
@@ -375,6 +383,7 @@ func convertContainer(d lxd.ContainerServer, container *liblxc.Container, storag
 			Mode: "push",
 		},
 	}
+
 	req.Config = newConfig
 	req.Devices = newDevices
 	req.Profiles = []string{"default"}
@@ -392,7 +401,37 @@ func convertContainer(d lxd.ContainerServer, container *liblxc.Container, storag
 
 	archID, err := osarch.ArchitectureId(arch)
 	if err != nil {
-		return err
+		// If arch is linux32 or linux64, the architecture ID cannot be determined as multiple
+		// architectures have the linux32 or linux64 personality. In this case, assume the native
+		// architecture.
+		arch = runtime.GOARCH
+
+		archID, err = osarch.ArchitectureId(arch)
+		if err != nil {
+			return err
+		}
+
+		// If the instance architecture is 32bit but the local architecture is 64bit, iterate
+		// through the local architecture's personalities until the supported architecture
+		// personality matches the instance's architecture.
+		if len(value) > 0 && value[0] == "linux32" {
+			personalities, err := osarch.ArchitecturePersonalities(archID)
+			if err != nil {
+				return err
+			}
+
+			for id, personality := range personalities {
+				arch, err = osarch.ArchitecturePersonality(personality)
+				if err != nil {
+					return err
+				}
+
+				if arch == value[0] {
+					archID = id
+					break
+				}
+			}
+		}
 	}
 
 	req.Architecture, err = osarch.ArchitectureName(archID)
@@ -478,6 +517,7 @@ func convertNetworkConfig(container *liblxc.Container, devices map[string]map[st
 			} else {
 				device["nictype"] = "p2p"
 			}
+
 		case "phys":
 			device["nictype"] = "physical"
 		case "empty":
@@ -566,6 +606,7 @@ func convertStorageConfig(conf []string, devices map[string]map[string]string) e
 			if err != nil {
 				return err
 			}
+
 			device["path"] = strings.TrimPrefix(parts[1], rootfs)
 		}
 

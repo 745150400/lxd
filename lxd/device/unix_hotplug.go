@@ -1,5 +1,4 @@
 //go:build linux && cgo
-// +build linux,cgo
 
 package device
 
@@ -7,12 +6,13 @@ import (
 	"fmt"
 	"strings"
 
-	udev "github.com/jochenvg/go-udev"
+	"github.com/jochenvg/go-udev"
 
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/validate"
 )
 
@@ -35,11 +35,7 @@ type unixHotplug struct {
 // isRequired indicates whether the device config requires this device to start OK.
 func (d *unixHotplug) isRequired() bool {
 	// Defaults to not required.
-	if shared.IsTrue(d.config["required"]) {
-		return true
-	}
-
-	return false
+	return shared.IsTrue(d.config["required"])
 }
 
 // validateConfig checks the supplied config for correctness.
@@ -126,7 +122,7 @@ func (d *unixHotplug) Register() error {
 	return nil
 }
 
-// Start is run when the device is added to the instance
+// Start is run when the device is added to the instance.
 func (d *unixHotplug) Start() (*deviceConfig.RunConfig, error) {
 	runConf := deviceConfig.RunConfig{}
 	runConf.PostHooks = []func() error{d.Register}
@@ -135,6 +131,7 @@ func (d *unixHotplug) Start() (*deviceConfig.RunConfig, error) {
 	if d.isRequired() && device == nil {
 		return nil, fmt.Errorf("Required Unix Hotplug device not found")
 	}
+
 	if device == nil {
 		return &runConf, nil
 	}
@@ -158,7 +155,7 @@ func (d *unixHotplug) Start() (*deviceConfig.RunConfig, error) {
 	return &runConf, nil
 }
 
-// Stop is run when the device is removed from the instance
+// Stop is run when the device is removed from the instance.
 func (d *unixHotplug) Stop() (*deviceConfig.RunConfig, error) {
 	unixHotplugUnregisterHandler(d.inst, d.name)
 
@@ -174,7 +171,7 @@ func (d *unixHotplug) Stop() (*deviceConfig.RunConfig, error) {
 	return &runConf, nil
 }
 
-// postStop is run after the device is removed from the instance
+// postStop is run after the device is removed from the instance.
 func (d *unixHotplug) postStop() error {
 	err := unixDeviceDeleteFiles(d.state, d.inst.DevicesPath(), "unix", d.name, "")
 	if err != nil {
@@ -185,23 +182,39 @@ func (d *unixHotplug) postStop() error {
 }
 
 // loadUnixDevice scans the host machine for unix devices with matching product/vendor ids
-// and returns the first matching device with the subsystem type char or block
+// and returns the first matching device with the subsystem type char or block.
 func (d *unixHotplug) loadUnixDevice() *udev.Device {
 	// Find device if exists
 	u := udev.Udev{}
 	e := u.NewEnumerate()
 
 	if d.config["vendorid"] != "" {
-		e.AddMatchProperty("ID_VENDOR_ID", d.config["vendorid"])
+		err := e.AddMatchProperty("ID_VENDOR_ID", d.config["vendorid"])
+		if err != nil {
+			logger.Warn("Failed to add property to device", logger.Ctx{"property_name": "ID_VENDOR_ID", "property_value": d.config["vendorid"], "err": err})
+		}
 	}
+
 	if d.config["productid"] != "" {
-		e.AddMatchProperty("ID_MODEL_ID", d.config["productid"])
+		err := e.AddMatchProperty("ID_MODEL_ID", d.config["productid"])
+		if err != nil {
+			logger.Warn("Failed to add property to device", logger.Ctx{"property_name": "ID_MODEL_ID", "property_value": d.config["productid"], "err": err})
+		}
 	}
-	e.AddMatchIsInitialized()
+
+	err := e.AddMatchIsInitialized()
+	if err != nil {
+		logger.Warn("Failed to add initialised property to device", logger.Ctx{"err": err})
+	}
+
 	devices, _ := e.Devices()
 	var device *udev.Device
 	for i := range devices {
 		device = devices[i]
+
+		if device == nil {
+			continue
+		}
 
 		devnum := device.Devnum()
 		if devnum.Major() == 0 || devnum.Minor() == 0 {

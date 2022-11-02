@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"strings"
 )
 
-// ChrootLoader is a pong2 compatible file loader which restricts all accesses to a directory
+// ChrootLoader is a pong2 compatible file loader which restricts all accesses to a directory.
 type ChrootLoader struct {
 	Path string
 }
@@ -42,7 +42,7 @@ func (l ChrootLoader) Get(path string) (io.Reader, error) {
 	}
 
 	// Open and read the file
-	buf, err := ioutil.ReadFile(path)
+	buf, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}

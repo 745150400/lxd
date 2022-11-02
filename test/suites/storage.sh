@@ -1,7 +1,7 @@
 test_storage() {
   ensure_import_testimage
 
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD_STORAGE_DIR lxd_backend
 
   lxd_backend=$(storage_backend "$LXD_DIR")
@@ -10,7 +10,7 @@ test_storage() {
   spawn_lxd "${LXD_STORAGE_DIR}" false
 
   # edit storage and pool description
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local storage_pool storage_volume
   storage_pool="lxdtest-$(basename "${LXD_DIR}")-pool"
   storage_volume="${storage_pool}-vol"
@@ -32,11 +32,18 @@ test_storage() {
   [ "$(lxc storage volume get "$storage_pool" "$storage_volume" user.abc)" = "def" ]
 
   lxc storage volume delete "$storage_pool" "$storage_volume"
+
+  # Test copying pool volume.* key to the volume with prefix stripped at volume creation time
+  lxc storage set "$storage_pool" volume.snapshots.expiry 3d
+  lxc storage volume create "$storage_pool" "$storage_volume"
+  [ "$(lxc storage volume get "$storage_pool" "$storage_volume" snapshots.expiry)" = "3d" ]
+  lxc storage volume delete "$storage_pool" "$storage_volume"
+
   lxc storage delete "$storage_pool"
 
   # Test btrfs resize
   if [ "$lxd_backend" = "lvm" ] || [ "$lxd_backend" = "ceph" ]; then
-      # shellcheck disable=2039
+      # shellcheck disable=2039,3043
       local btrfs_storage_pool btrfs_storage_volume
       btrfs_storage_pool="lxdtest-$(basename "${LXD_DIR}")-pool-btrfs"
       btrfs_storage_volume="${storage_pool}-vol"
@@ -765,12 +772,12 @@ test_storage() {
 
   if [ "$lxd_backend" = "lvm" ]; then
     QUOTA1="20MB"
-    rootMinKB1="14000"
+    rootMinKB1="13800"
     rootMaxKB1="20000"
 
     # Increase quota enough to require a new 4MB LVM extent.
     QUOTA2="25MB"
-    rootMinKB2="19000"
+    rootMinKB2="18900"
     rootMaxKB2="23000"
   fi
 
@@ -881,7 +888,7 @@ test_storage() {
   fi
 
   # Test removing storage pools only containing image volumes
-  # shellcheck disable=SC2031
+  # shellcheck disable=SC2031,2269
   LXD_DIR="${LXD_DIR}"
   storage_pool="lxdtest-$(basename "${LXD_DIR}")-pool26"
   lxc storage create "$storage_pool" "$lxd_backend"
@@ -894,7 +901,7 @@ test_storage() {
   lxc storage delete "${storage_pool}"
   lxc image show testimage
 
-  # shellcheck disable=SC2031
+  # shellcheck disable=SC2031,2269
   LXD_DIR="${LXD_DIR}"
   kill_lxd "${LXD_STORAGE_DIR}"
 }

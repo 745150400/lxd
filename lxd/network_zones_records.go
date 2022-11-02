@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/gorilla/mux"
 
@@ -129,13 +130,17 @@ var networkZoneRecordCmd = APIEndpoint{
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkZoneRecordsGet(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	recursion := util.IsRecursionRequest(r)
-	zoneName := mux.Vars(r)["zone"]
+
+	zoneName, err := url.PathUnescape(mux.Vars(r)["zone"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Get the network zone.
 	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, zoneName)
@@ -199,12 +204,15 @@ func networkZoneRecordsGet(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkZoneRecordsPost(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	zoneName := mux.Vars(r)["zone"]
+	zoneName, err := url.PathUnescape(mux.Vars(r)["zone"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Get the network zone.
 	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, zoneName)
@@ -225,10 +233,10 @@ func networkZoneRecordsPost(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.NetworkZoneRecordCreated.Event(netzone, req.Name, request.CreateRequestor(r), nil))
+	lc := lifecycle.NetworkZoneRecordCreated.Event(netzone, req.Name, request.CreateRequestor(r), nil)
+	d.State().Events.SendLifecycle(projectName, lc)
 
-	url := fmt.Sprintf("/%s/network-zones/%s/records/%s", version.APIVersion, zoneName, req.Name)
-	return response.SyncResponseLocation(true, nil, url)
+	return response.SyncResponseLocation(true, nil, lc.Source)
 }
 
 // swagger:operation DELETE /1.0/network-zones/{zone}/records/{name} network-zones network_zone_record_delete
@@ -256,13 +264,20 @@ func networkZoneRecordsPost(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkZoneRecordDelete(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	zoneName := mux.Vars(r)["zone"]
-	name := mux.Vars(r)["name"]
+	zoneName, err := url.PathUnescape(mux.Vars(r)["zone"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	recordName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Get the network zone.
 	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, zoneName)
@@ -271,12 +286,12 @@ func networkZoneRecordDelete(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Delete the record.
-	err = netzone.DeleteRecord(name)
+	err = netzone.DeleteRecord(recordName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.NetworkZoneRecordDeleted.Event(netzone, name, request.CreateRequestor(r), nil))
+	d.State().Events.SendLifecycle(projectName, lifecycle.NetworkZoneRecordDeleted.Event(netzone, recordName, request.CreateRequestor(r), nil))
 
 	return response.EmptySyncResponse
 }
@@ -322,13 +337,20 @@ func networkZoneRecordDelete(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkZoneRecordGet(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	zoneName := mux.Vars(r)["zone"]
-	name := mux.Vars(r)["name"]
+	zoneName, err := url.PathUnescape(mux.Vars(r)["zone"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	recordName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Get the network zone.
 	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, zoneName)
@@ -337,7 +359,7 @@ func networkZoneRecordGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Get the record.
-	record, err := netzone.GetRecord(name)
+	record, err := netzone.GetRecord(recordName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -415,13 +437,20 @@ func networkZoneRecordGet(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkZoneRecordPut(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	zoneName := mux.Vars(r)["zone"]
-	name := mux.Vars(r)["name"]
+	zoneName, err := url.PathUnescape(mux.Vars(r)["zone"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	recordName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Get the network zone.
 	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, zoneName)
@@ -430,7 +459,7 @@ func networkZoneRecordPut(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Get the record.
-	record, err := netzone.GetRecord(name)
+	record, err := netzone.GetRecord(recordName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -460,12 +489,12 @@ func networkZoneRecordPut(d *Daemon, r *http.Request) response.Response {
 	}
 
 	clientType := clusterRequest.UserAgentClientType(r.Header.Get("User-Agent"))
-	err = netzone.UpdateRecord(name, req, clientType)
+	err = netzone.UpdateRecord(recordName, req, clientType)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.NetworkZoneRecordUpdated.Event(netzone, name, request.CreateRequestor(r), nil))
+	d.State().Events.SendLifecycle(projectName, lifecycle.NetworkZoneRecordUpdated.Event(netzone, recordName, request.CreateRequestor(r), nil))
 
 	return response.EmptySyncResponse
 }

@@ -3,17 +3,17 @@ package query_test
 import (
 	"context"
 	"database/sql"
-	"sort"
 	"testing"
 
-	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lxc/lxd/lxd/db/query"
 )
 
 func TestDump(t *testing.T) {
 	tx := newTxForDump(t, "local")
-	dump, err := query.Dump(context.Background(), tx, schemas["local"], false /* schemaOnly */)
+	dump, err := query.Dump(context.Background(), tx, false)
 	require.NoError(t, err)
 	assert.Equal(t, `PRAGMA foreign_keys=OFF;
 BEGIN TRANSACTION;
@@ -43,6 +43,7 @@ CREATE TABLE raft_nodes (
     address TEXT NOT NULL,
     UNIQUE (address)
 );
+CREATE INDEX config_key_idx ON config (key);
 DELETE FROM sqlite_sequence;
 INSERT INTO sqlite_sequence VALUES('schema',1);
 INSERT INTO sqlite_sequence VALUES('patches',2);
@@ -52,41 +53,39 @@ COMMIT;
 
 func TestDumpTablePatches(t *testing.T) {
 	tx := newTxForDump(t, "local")
-	tables := query.DumpParseSchema(schemas["local"])
 
-	dump, err := query.DumpTable(context.Background(), tx, "patches", tables["patches"])
+	dump, _, err := query.GetEntitiesSchemas(context.Background(), tx)
 	require.NoError(t, err)
 	assert.Equal(t, `CREATE TABLE patches (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     name VARCHAR(255) NOT NULL,
     applied_at DATETIME NOT NULL,
     UNIQUE (name)
-);
-INSERT INTO patches VALUES(1,'invalid_profile_names',1523946366);
-INSERT INTO patches VALUES(2,'leftover_profile_config',1523946366);
-`, dump)
+);`, dump["patches"][1])
+	data, err := query.GetTableData(context.Background(), tx, "patches")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, data, []string{
+		"INSERT INTO patches VALUES(1,'invalid_profile_names',1523946366);",
+		"INSERT INTO patches VALUES(2,'leftover_profile_config',1523946366);",
+	})
 }
 
 func TestDumpTableConfig(t *testing.T) {
 	tx := newTxForDump(t, "local")
-	tables := query.DumpParseSchema(schemas["local"])
 
-	dump, err := query.DumpTable(context.Background(), tx, "config", tables["config"])
+	dump, _, err := query.GetEntitiesSchemas(context.Background(), tx)
 	require.NoError(t, err)
 	assert.Equal(t, `CREATE TABLE config (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     key VARCHAR(255) NOT NULL,
     value TEXT,
     UNIQUE (key)
-);
-`, dump)
+);`, dump["config"][1])
 }
 
 func TestDumpTableStoragePoolsConfig(t *testing.T) {
 	tx := newTxForDump(t, "global")
-	tables := query.DumpParseSchema(schemas["global"])
-
-	dump, err := query.DumpTable(context.Background(), tx, "storage_pools_config", tables["storage_pools_config"])
+	dump, _, err := query.GetEntitiesSchemas(context.Background(), tx)
 	require.NoError(t, err)
 	assert.Equal(t, `CREATE TABLE storage_pools_config (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -97,77 +96,24 @@ func TestDumpTableStoragePoolsConfig(t *testing.T) {
     UNIQUE (storage_pool_id, node_id, key),
     FOREIGN KEY (storage_pool_id) REFERENCES storage_pools (id) ON DELETE CASCADE,
     FOREIGN KEY (node_id) REFERENCES nodes (id) ON DELETE CASCADE
-);
-INSERT INTO storage_pools_config VALUES(1,1,NULL,'k','v');
-`, dump)
+);`, dump["storage_pools_config"][1])
+	data, err := query.GetTableData(context.Background(), tx, "storage_pools_config")
+	require.NoError(t, err)
+	assert.Equal(t, data, []string{"INSERT INTO storage_pools_config VALUES(1,1,NULL,'k','v');"})
 }
 
-func TestDumpParseSchema(t *testing.T) {
-	cases := []struct {
-		schema string   // Schema name
-		names  []string // Expected names
-	}{
-		{
-			"local",
-			[]string{
-				"config",
-				"patches",
-				"raft_nodes",
-			},
-		},
-		{
-			"global",
-			[]string{
-				"certificates",
-				"config",
-				"containers",
-				"containers_config",
-				"containers_devices",
-				"containers_devices_config",
-				"containers_profiles",
-				"images",
-				"images_aliases",
-				"images_nodes",
-				"images_properties",
-				"images_source",
-				"networks",
-				"networks_config",
-				"networks_nodes",
-				"nodes",
-				"operations",
-				"profiles",
-				"profiles_config",
-				"profiles_devices",
-				"profiles_devices_config",
-				"storage_pools",
-				"storage_pools_config",
-				"storage_pools_nodes",
-				"storage_volumes",
-				"storage_volumes_config",
-			},
-		},
-	}
-
-	for _, c := range cases {
-		t.Run(c.schema, func(t *testing.T) {
-			tables := query.DumpParseSchema(schemas[c.schema])
-			names := make([]string, 0)
-			for name := range tables {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-			assert.Equal(t, c.names, names)
-		})
-	}
-}
-
-// Return a new transaction against an in-memory SQLite database pupulated with
+// Return a new transaction against an in-memory SQLite database populated with
 // a few tables and data, according to the given schema.
 func newTxForDump(t *testing.T, schema string) *sql.Tx {
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
 
-	_, err = db.Exec(query.DumpSchemaTable)
+	_, err = db.Exec(`CREATE TABLE schema (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    version    INTEGER NOT NULL,
+    updated_at DATETIME NOT NULL,
+    UNIQUE (version)
+);`)
 	require.NoError(t, err)
 
 	_, err = db.Exec(schemas[schema])
@@ -203,6 +149,7 @@ CREATE TABLE raft_nodes (
     address TEXT NOT NULL,
     UNIQUE (address)
 );
+CREATE INDEX config_key_idx ON config (key);
 `,
 	"global": `
 CREATE TABLE certificates (

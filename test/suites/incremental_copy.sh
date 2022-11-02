@@ -1,58 +1,54 @@
 test_incremental_copy() {
-  # shellcheck disable=2039
-  local lxd_backend
-  lxd_backend=$(storage_backend "$LXD_DIR")
-
   ensure_import_testimage
   ensure_has_localhost_remote "${LXD_ADDR}"
 
   do_copy "" ""
 
   # cross-pool copy
-  if [ "${lxd_backend}" != 'dir' ]; then
-    # FIXME: Skip copies across old and new backends for now
-    if ! storage_compatible "dir" "${lxd_backend}"; then
-        true
-        return
-    fi
-
-    # shellcheck disable=2039
-    local source_pool
-    source_pool="lxdtest-$(basename "${LXD_DIR}")-dir-pool"
-    lxc storage create "${source_pool}" dir
-    do_copy "${source_pool}" "lxdtest-$(basename "${LXD_DIR}")"
-    lxc storage rm "${source_pool}"
-  fi
+  # shellcheck disable=2039,3043
+  local source_pool
+  source_pool="lxdtest-$(basename "${LXD_DIR}")-dir-pool"
+  lxc storage create "${source_pool}" dir
+  do_copy "${source_pool}" "lxdtest-$(basename "${LXD_DIR}")"
+  lxc storage rm "${source_pool}"
 }
 
 do_copy() {
-  # shellcheck disable=2039
-  local source_pool=$1
-  # shellcheck disable=2039
-  local target_pool=$2
+  # shellcheck disable=2039,3043
+  local source_pool="${1}"
+  # shellcheck disable=2039,3043
+  local target_pool="${2}"
 
   # Make sure the containers don't exist
   lxc rm -f c1 c2 || true
 
   if [ -z "${source_pool}" ]; then
-    lxc init testimage c1
-  else
-    lxc init testimage c1 -s "${source_pool}"
+    source_pool=$(lxc profile device get default root pool)
   fi
 
-  pool=
+  lxc init testimage c1 -s "${source_pool}"
+  lxc storage volume set "${source_pool}" container/c1 user.foo=main
+
+  # Set size to check this is supported during copy.
+  lxc config device set c1 root size=50MiB
+
+  targetPoolFlag=
   if [ -n "${target_pool}" ]; then
-    pool="-s ${target_pool}"
+    targetPoolFlag="-s ${target_pool}"
+  else
+    target_pool="${source_pool}"
   fi
 
   # Initial copy
   # shellcheck disable=2086
-  lxc copy c1 c2 ${pool}
+  lxc copy c1 c2 ${targetPoolFlag}
+  lxc storage volume get "${target_pool}" container/c2 user.foo | grep -Fx "main"
+
   lxc start c1 c2
 
   # Target container may not be running when refreshing
   # shellcheck disable=2086
-  ! lxc copy c1 c2 --refresh ${pool} || false
+  ! lxc copy c1 c2 --refresh ${targetPoolFlag} || false
 
   # Create test file in c1
   lxc exec c1 -- touch /root/testfile1
@@ -61,18 +57,22 @@ do_copy() {
 
   # Refresh the container and validate the contents
   # shellcheck disable=2086
-  lxc copy c1 c2 --refresh ${pool}
+  lxc copy c1 c2 --refresh ${targetPoolFlag}
   lxc start c2
   lxc exec c2 -- test -f /root/testfile1
   lxc stop -f c2
 
   # This will create snapshot c1/snap0
+  lxc storage volume set "${source_pool}" container/c1 user.foo=snap0
   lxc snapshot c1
+  lxc storage volume set "${source_pool}" container/c1 user.foo=snap1
+  lxc snapshot c1
+  lxc storage volume set "${source_pool}" container/c1 user.foo=main
 
   # Remove the testfile from c1 and refresh again
   lxc exec c1 -- rm /root/testfile1
   # shellcheck disable=2086
-  lxc copy c1 c2 --refresh --instance-only ${pool}
+  lxc copy c1 c2 --refresh --instance-only ${targetPoolFlag}
   lxc start c2
   ! lxc exec c2 -- test -f /root/testfile1 || false
   lxc stop -f c2
@@ -80,17 +80,23 @@ do_copy() {
   # Check whether snapshot c2/snap0 has been created
   ! lxc config show c2/snap0 || false
   # shellcheck disable=2086
-  lxc copy c1 c2 --refresh ${pool}
+  lxc copy c1 c2 --refresh ${targetPoolFlag}
   lxc config show c2/snap0
-
-  # This will create snapshot c2/snap1
-  lxc snapshot c2
   lxc config show c2/snap1
+  lxc storage volume get "${target_pool}" container/c2 user.foo | grep -Fx "main"
+  lxc storage volume get "${target_pool}" container/c2/snap0 user.foo | grep -Fx "snap0"
+  lxc storage volume get "${target_pool}" container/c2/snap1 user.foo | grep -Fx "snap1"
 
-  # This should remove c2/snap1
+  # This will create snapshot c2/snap2
+  lxc snapshot c2
+  lxc config show c2/snap2
+  lxc storage volume show "${target_pool}" container/c2/snap2
+
+  # This should remove c2/snap2
   # shellcheck disable=2086
-  lxc copy c1 c2 --refresh ${pool}
-  ! lxc config show c2/snap1 || false
+  lxc copy c1 c2 --refresh ${targetPoolFlag}
+  ! lxc config show c2/snap2 || false
+  ! lxc storage volume show "${target_pool}" container/c2/snap2 || false
 
   lxc rm -f c1 c2
 }

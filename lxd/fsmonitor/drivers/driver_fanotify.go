@@ -11,7 +11,8 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
-	log "gopkg.in/inconshreveable/log15.v2"
+
+	"github.com/lxc/lxd/shared/logger"
 )
 
 var fanotifyLoaded bool
@@ -47,25 +48,20 @@ func (d *fanotify) load(ctx context.Context) error {
 
 	err = unix.FanotifyMark(d.fd, unix.FAN_MARK_ADD|unix.FAN_MARK_FILESYSTEM, unix.FAN_CREATE|unix.FAN_DELETE|unix.FAN_ONDIR, unix.AT_FDCWD, d.prefixPath)
 	if err != nil {
-		unix.Close(d.fd)
+		_ = unix.Close(d.fd)
 		return fmt.Errorf("Failed to watch directory %q: %w", d.prefixPath, err)
 	}
 
 	fd, err := unix.Open(d.prefixPath, unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		unix.Close(d.fd)
+		_ = unix.Close(d.fd)
 		return fmt.Errorf("Failed to open directory %q: %w", d.prefixPath, err)
 	}
 
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				unix.Close(d.fd)
-				fanotifyLoaded = false
-				return
-			}
-		}
+		<-ctx.Done()
+		_ = unix.Close(d.fd)
+		fanotifyLoaded = false
 	}()
 
 	go d.getEvents(fd)
@@ -87,11 +83,11 @@ func (d *fanotify) getEvents(mountFd int) {
 		if err != nil {
 			// Stop listening for events as the fanotify fd has been closed due to cleanup.
 			if errors.Is(err, unix.EBADF) {
-				unix.Close(mountFd)
+				_ = unix.Close(mountFd)
 				return
 			}
 
-			d.logger.Error("Failed to read event", log.Ctx{"err": err})
+			d.logger.Error("Failed to read event", logger.Ctx{"err": err})
 			continue
 		}
 
@@ -101,7 +97,7 @@ func (d *fanotify) getEvents(mountFd int) {
 
 		err = binary.Read(rd, binary.LittleEndian, &event)
 		if err != nil {
-			d.logger.Error("Failed to read event metadata", log.Ctx{"err": err})
+			d.logger.Error("Failed to read event metadata", logger.Ctx{"err": err})
 			continue
 		}
 
@@ -110,7 +106,7 @@ func (d *fanotify) getEvents(mountFd int) {
 
 		err = binary.Read(rd, binary.LittleEndian, &fid)
 		if err != nil {
-			d.logger.Error("Failed to read event fid", log.Ctx{"err": err})
+			d.logger.Error("Failed to read event fid", logger.Ctx{"err": err})
 			continue
 		}
 
@@ -126,7 +122,7 @@ func (d *fanotify) getEvents(mountFd int) {
 
 		err = binary.Read(rd, binary.LittleEndian, &fhInfo)
 		if err != nil {
-			d.logger.Error("Failed to read file handle info", log.Ctx{"err": err})
+			d.logger.Error("Failed to read file handle info", logger.Ctx{"err": err})
 			continue
 		}
 
@@ -135,7 +131,7 @@ func (d *fanotify) getEvents(mountFd int) {
 
 		err = binary.Read(rd, binary.LittleEndian, fileHandle)
 		if err != nil {
-			d.logger.Error("Failed to read file handle", log.Ctx{"err": err})
+			d.logger.Error("Failed to read file handle", logger.Ctx{"err": err})
 			continue
 		}
 
@@ -145,19 +141,22 @@ func (d *fanotify) getEvents(mountFd int) {
 		if err != nil {
 			errno := err.(unix.Errno)
 			if errno != unix.ESTALE {
-				d.logger.Error("Failed to open file", log.Ctx{"err": err})
+				d.logger.Error("Failed to open file", logger.Ctx{"err": err})
 			}
+
 			continue
 		}
+
 		unix.CloseOnExec(fd)
 
 		// Determine the directory of the created or deleted file.
 		target, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
 		if err != nil {
-			d.logger.Error("Failed to read symlink", log.Ctx{"err": err})
+			d.logger.Error("Failed to read symlink", logger.Ctx{"err": err})
 			continue
 		}
-		unix.Close(fd)
+
+		_ = unix.Close(fd)
 
 		// If the target file has been deleted, the returned value might contain a " (deleted)" suffix.
 		// This needs to be removed.
@@ -210,6 +209,7 @@ func (d *fanotify) getEvents(mountFd int) {
 
 			break
 		}
+
 		d.mu.Unlock()
 	}
 }

@@ -4,8 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,10 +17,9 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"golang.org/x/sys/unix"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/lxd/cluster"
-	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/operationtype"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/operations"
@@ -27,9 +27,10 @@ import (
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/cancel"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 	"github.com/lxc/lxd/shared/netutils"
+	"github.com/lxc/lxd/shared/tcp"
 	"github.com/lxc/lxd/shared/version"
 )
 
@@ -44,15 +45,13 @@ type execWs struct {
 	instance              instance.Instance
 	conns                 map[int]*websocket.Conn
 	connsLock             sync.Mutex
-	requiredConnectedCtx  context.Context
-	requiredConnectedDone func()
-	controlConnectedCtx   context.Context
-	controlConnectedDone  func()
+	waitRequiredConnected *cancel.Canceller
+	waitControlConnected  *cancel.Canceller
 	fds                   map[int]string
 	s                     *state.State
 }
 
-func (s *execWs) Metadata() interface{} {
+func (s *execWs) Metadata() any {
 	fds := shared.Jmap{}
 	for fd, secret := range s.fds {
 		if fd == execWSControl {
@@ -90,8 +89,33 @@ func (s *execWs) Connect(op *operations.Operation, r *http.Request, w http.Respo
 			if found && val == nil {
 				s.conns[fd] = conn
 
+				// Set TCP timeout options.
+				remoteTCP, _ := tcp.ExtractConn(conn.UnderlyingConn())
+				if remoteTCP != nil {
+					err = tcp.SetTimeouts(remoteTCP)
+					if err != nil {
+						logger.Error("Failed setting TCP timeouts on remote connection", logger.Ctx{"err": err})
+					}
+				}
+
+				// Start channel keep alive to run until channel is closed.
+				go func() {
+					pingInterval := time.Second * 10
+					t := time.NewTicker(pingInterval)
+					defer t.Stop()
+
+					for {
+						err := conn.WriteControl(websocket.PingMessage, []byte("keepalive"), time.Now().Add(5*time.Second))
+						if err != nil {
+							return
+						}
+
+						<-t.C
+					}
+				}()
+
 				if fd == execWSControl {
-					s.controlConnectedDone() // Control connection connected.
+					s.waitControlConnected.Cancel() // Control connection connected.
 				}
 
 				for i, c := range s.conns {
@@ -99,7 +123,7 @@ func (s *execWs) Connect(op *operations.Operation, r *http.Request, w http.Respo
 						// Due to a historical bug in the LXC CLI command, we cannot force
 						// the client to connect a control socket when in non-interactive
 						// mode. This is because the older CLI tools did not connect this
-						// channel and so we would prevent the older CLIs connecitng to
+						// channel and so we would prevent the older CLIs connecting to
 						// newer servers. So skip the control connection from being
 						// considered as a required connection in this case.
 						continue
@@ -110,7 +134,7 @@ func (s *execWs) Connect(op *operations.Operation, r *http.Request, w http.Respo
 					}
 				}
 
-				s.requiredConnectedDone() // All required connections now connected.
+				s.waitRequiredConnected.Cancel() // All required connections now connected.
 				return nil
 			} else if !found {
 				return fmt.Errorf("Unknown websocket number")
@@ -131,7 +155,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 		s.connsLock.Lock()
 		for i := range s.conns {
 			if s.conns[i] != nil {
-				s.conns[i].Close()
+				_ = s.conns[i].Close()
 			}
 		}
 		s.connsLock.Unlock()
@@ -141,7 +165,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 	// connect to all of the required websockets within a short period of time and we won't proceed until then.
 	logger.Debug("Waiting for exec websockets to connect")
 	select {
-	case <-s.requiredConnectedCtx.Done():
+	case <-s.waitRequiredConnected.Done():
 		break
 	case <-time.After(time.Second * 5):
 		return fmt.Errorf("Timed out waiting for websockets to connect")
@@ -178,13 +202,14 @@ func (s *execWs) Do(op *operations.Operation) error {
 
 			if devptsFd != nil && s.s.OS.NativeTerminals {
 				ptys[0], ttys[0], err = shared.OpenPtyInDevpts(int(devptsFd.Fd()), rootUID, rootGID)
-				devptsFd.Close()
+				_ = devptsFd.Close()
 				devptsFd = nil
 			} else {
 				ptys[0], ttys[0], err = shared.OpenPty(rootUID, rootGID)
 			}
+
 			if err != nil {
-				return err
+				return fmt.Errorf("Unable to open the PTY device: %w", err)
 			}
 
 			stdin = ttys[0]
@@ -192,7 +217,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 			stderr = ttys[0]
 
 			if s.req.Width > 0 && s.req.Height > 0 {
-				shared.SetSize(int(ptys[0].Fd()), s.req.Width, s.req.Height)
+				_ = shared.SetSize(int(ptys[0].Fd()), s.req.Width, s.req.Height)
 			}
 		} else {
 			// For VMs we rely on the lxd-agent PTY running inside the VM guest.
@@ -223,16 +248,16 @@ func (s *execWs) Do(op *operations.Operation) error {
 		stderr = ttys[execWSStderr]
 	}
 
-	attachedChildIsDead := make(chan struct{})
+	waitAttachedChildIsDead := cancel.New(context.Background())
 	var wgEOF sync.WaitGroup
 
 	// Define a function to clean up TTYs and sockets when done.
 	finisher := func(cmdResult int, cmdErr error) error {
 		// Close this before closing the control connection so control handler can detect command ending.
-		close(attachedChildIsDead)
+		waitAttachedChildIsDead.Cancel()
 
 		for _, tty := range ttys {
-			tty.Close()
+			_ = tty.Close()
 		}
 
 		s.connsLock.Lock()
@@ -240,15 +265,18 @@ func (s *execWs) Do(op *operations.Operation) error {
 		s.connsLock.Unlock()
 
 		if conn == nil {
-			s.controlConnectedDone() // Request control go routine to end if no control connection.
+			s.waitControlConnected.Cancel() // Request control go routine to end if no control connection.
 		} else {
-			conn.Close() // Close control connection (will cause control go routine to end).
+			err = conn.Close() // Close control connection (will cause control go routine to end).
+			if err != nil && cmdErr == nil {
+				cmdErr = err
+			}
 		}
 
 		wgEOF.Wait()
 
 		for _, pty := range ptys {
-			pty.Close()
+			_ = pty.Close()
 		}
 
 		metadata := shared.Jmap{"return": cmdResult}
@@ -265,16 +293,16 @@ func (s *execWs) Do(op *operations.Operation) error {
 		return finisher(-1, err)
 	}
 
-	logger := logging.AddContext(logger.Log, log.Ctx{"project": s.instance.Project(), "instance": s.instance.Name(), "PID": cmd.PID(), "interactive": s.req.Interactive})
-	logger.Debug("Instance process started")
+	l := logger.AddContext(logger.Log, logger.Ctx{"project": s.instance.Project(), "instance": s.instance.Name(), "PID": cmd.PID(), "interactive": s.req.Interactive})
+	l.Debug("Instance process started")
 
 	var cmdKillOnce sync.Once
 	cmdKill := func() {
 		err := cmd.Signal(unix.SIGKILL)
 		if err != nil {
-			logger.Debug("Failed to send SIGKILL signal", log.Ctx{"err": err})
+			l.Debug("Failed to send SIGKILL signal", logger.Ctx{"err": err})
 		} else {
-			logger.Debug("Sent SIGKILL signal")
+			l.Debug("Sent SIGKILL signal")
 		}
 	}
 
@@ -283,7 +311,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 	go func() {
 		defer wgEOF.Done()
 
-		<-s.controlConnectedCtx.Done() // Indicates control connection has started or command has ended.
+		<-s.waitControlConnected.Done() // Indicates control connection has started or command has ended.
 
 		s.connsLock.Lock()
 		conn := s.conns[execWSControl]
@@ -293,23 +321,21 @@ func (s *execWs) Do(op *operations.Operation) error {
 			return // No connection, command has ended, being asked to end.
 		}
 
-		logger.Debug("Exec control handler started")
-		defer logger.Debug("Exec control handler finished")
+		l.Debug("Exec control handler started")
+		defer l.Debug("Exec control handler finished")
 
 		for {
 			mt, r, err := conn.NextReader()
 			if err != nil || mt == websocket.CloseMessage {
 				// Check if command process has finished normally, if so, no need to kill it.
-				select {
-				case <-attachedChildIsDead:
+				if waitAttachedChildIsDead.Err() != nil {
 					return
-				default:
 				}
 
 				if mt == websocket.CloseMessage {
-					logger.Warn("Got exec control websocket close message, killing command")
+					l.Warn("Got exec control websocket close message, killing command")
 				} else {
-					logger.Warn("Failed getting exec control websocket reader, killing command", log.Ctx{"err": err})
+					l.Warn("Failed getting exec control websocket reader, killing command", logger.Ctx{"err": err})
 				}
 
 				cmdKillOnce.Do(cmdKill)
@@ -317,16 +343,14 @@ func (s *execWs) Do(op *operations.Operation) error {
 				return
 			}
 
-			buf, err := ioutil.ReadAll(r)
+			buf, err := io.ReadAll(r)
 			if err != nil {
 				// Check if command process has finished normally, if so, no need to kill it.
-				select {
-				case <-attachedChildIsDead:
+				if waitAttachedChildIsDead.Err() != nil {
 					return
-				default:
 				}
 
-				logger.Warn("Failed reading control websocket message, killing command", log.Ctx{"err": err})
+				l.Warn("Failed reading control websocket message, killing command", logger.Ctx{"err": err})
 
 				cmdKillOnce.Do(cmdKill)
 
@@ -335,8 +359,9 @@ func (s *execWs) Do(op *operations.Operation) error {
 
 			command := api.InstanceExecControl{}
 
-			if err := json.Unmarshal(buf, &command); err != nil {
-				logger.Debug("Failed to unmarshal control socket command", log.Ctx{"err": err})
+			err = json.Unmarshal(buf, &command)
+			if err != nil {
+				l.Debug("Failed to unmarshal control socket command", logger.Ctx{"err": err})
 				continue
 			}
 
@@ -344,25 +369,25 @@ func (s *execWs) Do(op *operations.Operation) error {
 			if command.Command == "window-resize" && s.req.Interactive {
 				winchWidth, err := strconv.Atoi(command.Args["width"])
 				if err != nil {
-					logger.Debug("Unable to extract window width", log.Ctx{"err": err})
+					l.Debug("Unable to extract window width", logger.Ctx{"err": err})
 					continue
 				}
 
 				winchHeight, err := strconv.Atoi(command.Args["height"])
 				if err != nil {
-					logger.Debug("Unable to extract window height", log.Ctx{"err": err})
+					l.Debug("Unable to extract window height", logger.Ctx{"err": err})
 					continue
 				}
 
 				err = cmd.WindowResize(int(ptys[0].Fd()), winchWidth, winchHeight)
 				if err != nil {
-					logger.Debug("Failed to set window size", log.Ctx{"err": err, "width": winchWidth, "height": winchHeight})
+					l.Debug("Failed to set window size", logger.Ctx{"err": err, "width": winchWidth, "height": winchHeight})
 					continue
 				}
 			} else if command.Command == "signal" {
 				err := cmd.Signal(unix.Signal(command.Signal))
 				if err != nil {
-					logger.Debug("Failed forwarding signal", log.Ctx{"err": err, "signal": command.Signal})
+					l.Debug("Failed forwarding signal", logger.Ctx{"err": err, "signal": command.Signal})
 					continue
 				}
 			}
@@ -375,8 +400,8 @@ func (s *execWs) Do(op *operations.Operation) error {
 		go func() {
 			defer wgEOF.Done()
 
-			logger.Debug("Exec mirror websocket started", log.Ctx{"number": 0})
-			defer logger.Debug("Exec mirror websocket finished", log.Ctx{"number": 0})
+			l.Debug("Exec mirror websocket started", logger.Ctx{"number": 0})
+			defer l.Debug("Exec mirror websocket finished", logger.Ctx{"number": 0})
 
 			s.connsLock.Lock()
 			conn := s.conns[0]
@@ -387,8 +412,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 			if s.instance.Type() == instancetype.Container {
 				// For containers, we are running the command via the local LXD managed PTY and so
 				// need special signal handling provided by netutils.WebsocketExecMirror.
-				readDone, writeDone = netutils.WebsocketExecMirror(conn, ptys[0], ptys[0], attachedChildIsDead, int(ptys[0].Fd()))
-
+				readDone, writeDone = netutils.WebsocketExecMirror(conn, ptys[0], ptys[0], waitAttachedChildIsDead.Done(), int(ptys[0].Fd()))
 			} else {
 				// For VMs we are just relaying the websockets between client and lxd-agent, so no
 				// need for the special signal handling provided by netutils.WebsocketExecMirror.
@@ -398,14 +422,14 @@ func (s *execWs) Do(op *operations.Operation) error {
 
 			<-readDone
 			<-writeDone
-			conn.Close()
+			_ = conn.Close()
 		}()
 	} else {
 		wgEOF.Add(len(ttys) - 1)
 		for i := 0; i < len(ttys); i++ {
 			go func(i int) {
-				logger.Debug("Exec mirror websocket started", log.Ctx{"number": i})
-				defer logger.Debug("Exec mirror websocket finished", log.Ctx{"number": i})
+				l.Debug("Exec mirror websocket started", logger.Ctx{"number": i})
+				defer l.Debug("Exec mirror websocket finished", logger.Ctx{"number": i})
 
 				s.connsLock.Lock()
 				conn := s.conns[i]
@@ -427,8 +451,8 @@ func (s *execWs) Do(op *operations.Operation) error {
 						// can also be used indicate that the command has already finished.
 						// In either case there is no need to kill the command, but if not
 						// then it is our responsibility to kill the command now.
-						if s.controlConnectedCtx.Err() == nil {
-							logger.Warn("Unexpected read on stdout websocket, killing command", log.Ctx{"number": i, "err": err})
+						if s.waitControlConnected.Err() == nil {
+							l.Warn("Unexpected read on stdout websocket, killing command", logger.Ctx{"number": i, "err": err})
 							cmdKillOnce.Do(cmdKill)
 						}
 					}()
@@ -436,10 +460,10 @@ func (s *execWs) Do(op *operations.Operation) error {
 
 				if i == execWSStdin {
 					<-shared.WebsocketRecvStream(ttys[i], conn)
-					ttys[i].Close()
+					_ = ttys[i].Close()
 				} else {
 					<-shared.WebsocketSendStream(conn, ptys[i], -1)
-					ptys[i].Close()
+					_ = ptys[i].Close()
 					wgEOF.Done()
 				}
 			}(i)
@@ -447,7 +471,8 @@ func (s *execWs) Do(op *operations.Operation) error {
 	}
 
 	exitStatus, err := cmd.Wait()
-	logger.Debug("Instance process stopped", log.Ctx{"exitStatus": exitStatus})
+	l.Debug("Instance process stopped", logger.Ctx{"err": err, "exitStatus": exitStatus})
+
 	return finisher(exitStatus, err)
 }
 
@@ -496,27 +521,35 @@ func instanceExecPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	post := api.InstanceExecPost{}
-	buf, err := ioutil.ReadAll(r.Body)
+	buf, err := io.ReadAll(r.Body)
 	if err != nil {
 		return response.BadRequest(err)
 	}
 
-	if err := json.Unmarshal(buf, &post); err != nil {
+	err = json.Unmarshal(buf, &post)
+	if err != nil {
 		return response.BadRequest(err)
 	}
 
 	// Forward the request if the container is remote.
-	client, err := cluster.ConnectIfInstanceIsRemote(d.cluster, projectName, name, d.endpoints.NetworkCert(), d.serverCert(), r, instanceType)
+	client, err := cluster.ConnectIfInstanceIsRemote(d.db.Cluster, projectName, name, d.endpoints.NetworkCert(), d.serverCert(), r, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	if client != nil {
-		url := fmt.Sprintf("/1.0/instances/%s/exec?project=%s", name, projectName)
-		resp, _, err := client.RawQuery("POST", url, post, "")
+		url := api.NewURL().Path("1.0", "instances", name, "exec").Project(projectName)
+		resp, _, err := client.RawQuery("POST", url.String(), post, "")
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -551,7 +584,8 @@ func instanceExecPost(d *Daemon, r *http.Request) response.Response {
 	for k, v := range inst.ExpandedConfig() {
 		if strings.HasPrefix(k, "environment.") {
 			envKey := strings.TrimPrefix(k, "environment.")
-			if _, found := post.Environment[envKey]; !found {
+			_, found := post.Environment[envKey]
+			if !found {
 				post.Environment[envKey] = v
 			}
 		}
@@ -615,8 +649,8 @@ func instanceExecPost(d *Daemon, r *http.Request) response.Response {
 			ws.conns[execWSStderr] = nil
 		}
 
-		ws.requiredConnectedCtx, ws.requiredConnectedDone = context.WithCancel(context.Background())
-		ws.controlConnectedCtx, ws.controlConnectedDone = context.WithCancel(context.Background())
+		ws.waitRequiredConnected = cancel.New(context.Background())
+		ws.waitControlConnected = cancel.New(context.Background())
 
 		for i := range ws.conns {
 			ws.fds[i], err = shared.RandomCryptoString()
@@ -635,7 +669,7 @@ func instanceExecPost(d *Daemon, r *http.Request) response.Response {
 			resources["containers"] = resources["instances"]
 		}
 
-		op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassWebsocket, db.OperationCommandExec, resources, ws.Metadata(), ws.Do, nil, ws.Connect, r)
+		op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassWebsocket, operationtype.CommandExec, resources, ws.Metadata(), ws.Do, nil, ws.Connect, r)
 		if err != nil {
 			return response.InternalError(err)
 		}
@@ -655,13 +689,15 @@ func instanceExecPost(d *Daemon, r *http.Request) response.Response {
 			if err != nil {
 				return err
 			}
-			defer stdout.Close()
+
+			defer func() { _ = stdout.Close() }()
 
 			stderr, err = os.OpenFile(filepath.Join(inst.LogPath(), fmt.Sprintf("exec_%s.stderr", op.ID())), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 			if err != nil {
 				return err
 			}
-			defer stderr.Close()
+
+			defer func() { _ = stderr.Close() }()
 
 			// Update metadata with the right URLs.
 			metadata["output"] = shared.Jmap{
@@ -676,20 +712,20 @@ func instanceExecPost(d *Daemon, r *http.Request) response.Response {
 			return err
 		}
 
-		logger := logging.AddContext(logger.Log, log.Ctx{"project": inst.Project(), "instance": inst.Name(), "PID": cmd.PID(), "recordOutput": post.RecordOutput})
-		logger.Debug("Instance process started")
+		l := logger.AddContext(logger.Log, logger.Ctx{"project": inst.Project(), "instance": inst.Name(), "PID": cmd.PID(), "recordOutput": post.RecordOutput})
+		l.Debug("Instance process started")
 
-		exitStatus, err := cmd.Wait()
-		logger.Debug("Instance process stopped", log.Ctx{"exitStatus": exitStatus})
-		if err != nil {
-			return err
-		}
+		exitStatus, cmdErr := cmd.Wait()
+		l.Debug("Instance process stopped", logger.Ctx{"err": cmdErr, "exitStatus": exitStatus})
 
 		metadata["return"] = exitStatus
-
 		err = op.ExtendMetadata(metadata)
 		if err != nil {
-			logger.Error("Error updating metadata for cmd", log.Ctx{"err": err, "cmd": post.Command})
+			l.Error("Error updating metadata for cmd", logger.Ctx{"err": err, "cmd": post.Command})
+		}
+
+		if cmdErr != nil {
+			return cmdErr
 		}
 
 		return nil
@@ -702,7 +738,7 @@ func instanceExecPost(d *Daemon, r *http.Request) response.Response {
 		resources["containers"] = resources["instances"]
 	}
 
-	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationCommandExec, resources, nil, run, nil, nil, r)
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, operationtype.CommandExec, resources, nil, run, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}

@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"sort"
 	"strconv"
@@ -13,7 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v2"
 
-	"github.com/lxc/lxd/client"
+	lxd "github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxc/utils"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
@@ -127,7 +126,7 @@ Unless specified through a prefix, all volume operations affect "custom" (user c
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
@@ -151,7 +150,7 @@ func (c *cmdStorageVolume) parseVolumeWithPool(name string) (string, string) {
 	return fields[1], fields[0]
 }
 
-// Attach
+// Attach.
 type cmdStorageVolumeAttach struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -226,7 +225,7 @@ func (c *cmdStorageVolumeAttach) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Attach profile
+// Attach profile.
 type cmdStorageVolumeAttachProfile struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -311,7 +310,7 @@ func (c *cmdStorageVolumeAttachProfile) Run(cmd *cobra.Command, args []string) e
 	return nil
 }
 
-// Copy
+// Copy.
 type cmdStorageVolumeCopy struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -325,7 +324,7 @@ type cmdStorageVolumeCopy struct {
 
 func (c *cmdStorageVolumeCopy) Command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("copy", i18n.G("<pool>/<volume>[/<snapshot>] <pool>/<volume>"))
+	cmd.Use = usage("copy", i18n.G("[<remote>:]<pool>/<volume>[/<snapshot>] [<remote>:]<pool>/<volume>"))
 	cmd.Aliases = []string{"cp"}
 	cmd.Short = i18n.G("Copy storage volumes")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
@@ -406,23 +405,24 @@ func (c *cmdStorageVolumeCopy) Run(cmd *cobra.Command, args []string) error {
 
 	var srcVol *api.StorageVolume
 
-	// Check if requested storage volume exists
-	isSnapshot := shared.IsSnapshot(srcVolName)
+	// Check if requested storage volume exists.
+	srcVolParentName, srcVolSnapName, srcIsSnapshot := api.GetParentAndSnapshotName(srcVolName)
+	srcVol, _, err = srcServer.GetStoragePoolVolume(srcVolPool, "custom", srcVolParentName)
+	if err != nil {
+		return err
+	}
 
-	if isSnapshot {
-		fields := strings.SplitN(srcVolName, "/", 2)
-		_, _, err = srcServer.GetStoragePoolVolumeSnapshot(srcVolPool,
-			"custom", fields[0], fields[1])
+	// If source is a snapshot get source snapshot volume info and apply to the srcVol.
+	if srcIsSnapshot {
+		srcVolSnapshot, _, err := srcServer.GetStoragePoolVolumeSnapshot(srcVolPool, "custom", srcVolParentName, srcVolSnapName)
 		if err != nil {
 			return err
 		}
 
-		srcVol, _, err = srcServer.GetStoragePoolVolume(srcVolPool, "custom", fields[0])
-	} else {
-		srcVol, _, err = srcServer.GetStoragePoolVolume(srcVolPool, "custom", srcVolName)
-	}
-	if err != nil {
-		return err
+		// Copy info from source snapshot into source volume used for new volume.
+		srcVol.Name = srcVolName
+		srcVol.Config = srcVolSnapshot.Config
+		srcVol.Description = srcVolSnapshot.Description
 	}
 
 	// If destination target was specified, copy the volume onto the given member.
@@ -445,10 +445,6 @@ func (c *cmdStorageVolumeCopy) Run(cmd *cobra.Command, args []string) error {
 		args.VolumeOnly = false
 		args.Project = c.flagTargetProject
 
-		if isSnapshot {
-			srcVol.Name = srcVolName
-		}
-
 		op, err = dstServer.MoveStoragePoolVolume(dstVolPool, srcServer, srcVolPool, *srcVol, args)
 		if err != nil {
 			return err
@@ -462,10 +458,6 @@ func (c *cmdStorageVolumeCopy) Run(cmd *cobra.Command, args []string) error {
 
 		if c.flagTargetProject != "" {
 			dstServer = dstServer.UseProject(c.flagTargetProject)
-		}
-
-		if isSnapshot {
-			srcVol.Name = srcVolName
 		}
 
 		op, err = dstServer.CopyStoragePoolVolume(dstVolPool, srcServer, srcVolPool, *srcVol, args)
@@ -494,10 +486,15 @@ func (c *cmdStorageVolumeCopy) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	if cmd.Name() == "move" && srcServer != dstServer {
-		err := srcServer.DeleteStoragePoolVolume(srcVolPool, srcVol.Type, srcVolName)
+		if srcIsSnapshot {
+			_, err = srcServer.DeleteStoragePoolVolumeSnapshot(srcVolPool, srcVol.Type, srcVolParentName, srcVolSnapName)
+		} else {
+			err = srcServer.DeleteStoragePoolVolume(srcVolPool, srcVol.Type, srcVolName)
+		}
+
 		if err != nil {
 			progress.Done("")
-			return err
+			return fmt.Errorf("Failed deleting source volume after copy: %w", err)
 		}
 	}
 	progress.Done(finalMsg)
@@ -505,7 +502,7 @@ func (c *cmdStorageVolumeCopy) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Create
+// Create.
 type cmdStorageVolumeCreate struct {
 	global          *cmdGlobal
 	storage         *cmdStorage
@@ -584,7 +581,7 @@ func (c *cmdStorageVolumeCreate) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Delete
+// Delete.
 type cmdStorageVolumeDelete struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -645,7 +642,6 @@ func (c *cmdStorageVolumeDelete) Run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-
 	} else {
 		// Delete the volume
 		err := client.DeleteStoragePoolVolume(resource.name, volType, volName)
@@ -661,7 +657,7 @@ func (c *cmdStorageVolumeDelete) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Detach
+// Detach.
 type cmdStorageVolumeDetach struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -743,7 +739,7 @@ func (c *cmdStorageVolumeDetach) Run(cmd *cobra.Command, args []string) error {
 	return op.Wait()
 }
 
-// Detach profile
+// Detach profile.
 type cmdStorageVolumeDetachProfile struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -824,7 +820,7 @@ func (c *cmdStorageVolumeDetachProfile) Run(cmd *cobra.Command, args []string) e
 	return nil
 }
 
-// Edit
+// Edit.
 type cmdStorageVolumeEdit struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -895,7 +891,7 @@ func (c *cmdStorageVolumeEdit) Run(cmd *cobra.Command, args []string) error {
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -986,8 +982,10 @@ func (c *cmdStorageVolumeEdit) Run(cmd *cobra.Command, args []string) error {
 				if err != nil {
 					return err
 				}
+
 				continue
 			}
+
 			break
 		}
 
@@ -1016,15 +1014,17 @@ func (c *cmdStorageVolumeEdit) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			continue
 		}
+
 		break
 	}
 
 	return nil
 }
 
-// Get
+// Get.
 type cmdStorageVolumeGet struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -1112,7 +1112,7 @@ func (c *cmdStorageVolumeGet) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Info
+// Info.
 type cmdStorageVolumeInfo struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -1210,11 +1210,13 @@ func (c *cmdStorageVolumeInfo) Run(cmd *cobra.Command, args []string) error {
 	if vol.Type == "" {
 		vol.Type = "custom"
 	}
+
 	fmt.Printf(i18n.G("Type: %s")+"\n", vol.Type)
 
 	if vol.ContentType == "" {
 		vol.ContentType = "filesystem"
 	}
+
 	fmt.Printf(i18n.G("Content type: %s")+"\n", vol.ContentType)
 
 	if vol.Location != "" && client.IsClustered() {
@@ -1223,6 +1225,13 @@ func (c *cmdStorageVolumeInfo) Run(cmd *cobra.Command, args []string) error {
 
 	if volState.Usage != nil {
 		fmt.Printf(i18n.G("Usage: %s")+"\n", units.GetByteSizeStringIEC(int64(volState.Usage.Used), 2))
+		if volState.Usage.Total > 0 {
+			fmt.Printf(i18n.G("Total: %s")+"\n", units.GetByteSizeStringIEC(int64(volState.Usage.Total), 2))
+		}
+	}
+
+	if shared.TimeIsSet(vol.CreatedAt) {
+		fmt.Printf(i18n.G("Created: %s")+"\n", vol.CreatedAt.Local().Format(layout))
 	}
 
 	// List snapshots
@@ -1316,26 +1325,28 @@ func (c *cmdStorageVolumeInfo) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// List
+// List.
 type cmdStorageVolumeList struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
 	storageVolume *cmdStorageVolume
 
-	flagFormat  string
-	flagColumns string
+	flagFormat      string
+	flagColumns     string
+	flagAllProjects bool
 
 	defaultColumns string
 }
 
 func (c *cmdStorageVolumeList) Command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("list", i18n.G("[<remote>:]<pool>"))
+	cmd.Use = usage("list", i18n.G("[<remote>:]<pool> [<filter>...]"))
 	cmd.Aliases = []string{"ls"}
 	cmd.Short = i18n.G("List storage volumes")
 
-	c.defaultColumns = "tndcuL"
+	c.defaultColumns = "etndcuL"
 	cmd.Flags().StringVarP(&c.flagColumns, "columns", "c", c.defaultColumns, i18n.G("Columns")+"``")
+	cmd.Flags().BoolVar(&c.flagAllProjects, "all-projects", false, i18n.G("All projects")+"``")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
 		`List storage volumes
 
@@ -1343,16 +1354,14 @@ The -c option takes a (optionally comma-separated) list of arguments
 that control which image attributes to output when displaying in table
 or csv format.
 
-Default column layout is: tndcuL
-
 Column shorthand chars:
-
-    t - Type of volume (custom, image, container or virtual-machine)
-    n - Name
-    d - Description
     c - Content type (filesystem or block)
-    u - Number of references (used by)
+    d - Description
+    e - Project name
     L - Location of the instance (e.g. its cluster member)
+    n - Name
+    t - Type of volume (custom, image, container or virtual-machine)
+    u - Number of references (used by)
     U - Current disk usage`))
 	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "table", i18n.G("Format (csv|json|table|yaml|compact)")+"``")
 
@@ -1363,7 +1372,7 @@ Column shorthand chars:
 
 func (c *cmdStorageVolumeList) Run(cmd *cobra.Command, args []string) error {
 	// Quick checks.
-	exit, err := c.global.CheckArgs(cmd, args, 1, 1)
+	exit, err := c.global.CheckArgs(cmd, args, 1, -1)
 	if exit {
 		return err
 	}
@@ -1380,7 +1389,19 @@ func (c *cmdStorageVolumeList) Run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf(i18n.G("Missing pool name"))
 	}
 
-	volumes, err := resource.server.GetStoragePoolVolumes(resource.name)
+	// Process the filters
+	filters := []string{}
+	if len(args) > 1 {
+		filters = append(filters, args[1:]...)
+	}
+
+	var volumes []api.StorageVolume
+	if c.flagAllProjects {
+		volumes, err = resource.server.GetStoragePoolVolumesWithFilterAllProjects(resource.name, filters)
+	} else {
+		volumes, err = resource.server.GetStoragePoolVolumesWithFilter(resource.name, filters)
+	}
+
 	if err != nil {
 		return err
 	}
@@ -1409,6 +1430,7 @@ func (c *cmdStorageVolumeList) Run(cmd *cobra.Command, args []string) error {
 		}
 		data = append(data, row)
 	}
+
 	if len(columns) >= 2 {
 		sort.Sort(utils.ByNameAndType(data))
 	}
@@ -1447,6 +1469,12 @@ func (c *cmdStorageVolumeList) parseColumns(clustered bool) ([]volumeColumn, err
 		c.flagColumns = strings.Replace(c.flagColumns, "L", "", -1)
 	}
 
+	if c.flagAllProjects {
+		columnsShorthandMap['e'] = volumeColumn{Name: i18n.G("PROJECT"), Data: c.projectColumnData}
+	} else {
+		c.flagColumns = strings.Replace(c.flagColumns, "e", "", -1)
+	}
+
 	columnList := strings.Split(c.flagColumns, ",")
 
 	columns := []volumeColumn{}
@@ -1456,7 +1484,8 @@ func (c *cmdStorageVolumeList) parseColumns(clustered bool) ([]volumeColumn, err
 		}
 
 		for _, columnRune := range columnEntry {
-			if column, ok := columnsShorthandMap[columnRune]; ok {
+			column, ok := columnsShorthandMap[columnRune]
+			if ok {
 				columns = append(columns, column)
 			} else {
 				return nil, fmt.Errorf(i18n.G("Unknown column shorthand char '%c' in '%s'"), columnRune, columnEntry)
@@ -1507,7 +1536,11 @@ func (c *cmdStorageVolumeList) usageColumnData(vol api.StorageVolume, state api.
 	return ""
 }
 
-// Move
+func (c *cmdStorageVolumeList) projectColumnData(vol api.StorageVolume, state api.StorageVolumeState) string {
+	return vol.Project
+}
+
+// Move.
 type cmdStorageVolumeMove struct {
 	global            *cmdGlobal
 	storage           *cmdStorage
@@ -1517,7 +1550,7 @@ type cmdStorageVolumeMove struct {
 
 func (c *cmdStorageVolumeMove) Command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("move", i18n.G("<pool>/<volume> <pool>/<volume>"))
+	cmd.Use = usage("move", i18n.G("[<remote>:]<pool>/<volume> [<remote>:]<pool>/<volume>"))
 	cmd.Aliases = []string{"mv"}
 	cmd.Short = i18n.G("Move storage volumes between pools")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
@@ -1542,7 +1575,7 @@ func (c *cmdStorageVolumeMove) Run(cmd *cobra.Command, args []string) error {
 	return c.storageVolumeCopy.Run(cmd, args)
 }
 
-// Rename
+// Rename.
 type cmdStorageVolumeRename struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -1597,7 +1630,7 @@ func (c *cmdStorageVolumeRename) Run(cmd *cobra.Command, args []string) error {
 	if isSnapshot {
 		// Create the storage volume entry
 		vol := api.StorageVolumeSnapshotPost{}
-		dstParentName, dstSnapName, dstIsSnap := shared.InstanceGetParentAndSnapshotName(args[2])
+		dstParentName, dstSnapName, dstIsSnap := api.GetParentAndSnapshotName(args[2])
 
 		if dstParentName != fields[0] {
 			return fmt.Errorf(i18n.G("Invalid new snapshot name, parent volume must be the same as source"))
@@ -1655,7 +1688,7 @@ func (c *cmdStorageVolumeRename) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Set
+// Set.
 type cmdStorageVolumeSet struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -1743,7 +1776,7 @@ func (c *cmdStorageVolumeSet) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Show
+// Show.
 type cmdStorageVolumeShow struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -1841,7 +1874,7 @@ func (c *cmdStorageVolumeShow) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Unset
+// Unset.
 type cmdStorageVolumeUnset struct {
 	global           *cmdGlobal
 	storage          *cmdStorage
@@ -1873,7 +1906,7 @@ func (c *cmdStorageVolumeUnset) Run(cmd *cobra.Command, args []string) error {
 	return c.storageVolumeSet.Run(cmd, args)
 }
 
-// Snapshot
+// Snapshot.
 type cmdStorageVolumeSnapshot struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -1971,10 +2004,9 @@ func (c *cmdStorageVolumeSnapshot) Run(cmd *cobra.Command, args []string) error 
 	}
 
 	return op.Wait()
-
 }
 
-// Restore
+// Restore.
 type cmdStorageVolumeRestore struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -2037,7 +2069,7 @@ func (c *cmdStorageVolumeRestore) Run(cmd *cobra.Command, args []string) error {
 	return client.UpdateStoragePoolVolume(resource.name, "custom", args[1], req, etag)
 }
 
-// Export
+// Export.
 type cmdStorageVolumeExport struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -2128,6 +2160,7 @@ func (c *cmdStorageVolumeExport) Run(cmd *cobra.Command, args []string) error {
 		progress.Done("")
 		return err
 	}
+
 	progress.Done("")
 
 	err = op.Wait()
@@ -2143,7 +2176,7 @@ func (c *cmdStorageVolumeExport) Run(cmd *cobra.Command, args []string) error {
 		// Delete backup after we're done
 		op, err = d.DeleteStoragePoolVolumeBackup(name, volName, backupName)
 		if err == nil {
-			op.Wait()
+			_ = op.Wait()
 		}
 	}()
 
@@ -2158,13 +2191,15 @@ func (c *cmdStorageVolumeExport) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer target.Close()
+
+	defer func() { _ = target.Close() }()
 
 	// Prepare the download request
 	progress = utils.ProgressRenderer{
 		Format: i18n.G("Exporting the backup: %s"),
 		Quiet:  c.global.flagQuiet,
 	}
+
 	backupFileRequest := lxd.BackupFileRequest{
 		BackupFile:      io.WriteSeeker(target),
 		ProgressHandler: progress.UpdateProgress,
@@ -2173,16 +2208,16 @@ func (c *cmdStorageVolumeExport) Run(cmd *cobra.Command, args []string) error {
 	// Export tarball
 	_, err = d.GetStoragePoolVolumeBackupFile(name, volName, backupName, &backupFileRequest)
 	if err != nil {
-		os.Remove(targetName)
+		_ = os.Remove(targetName)
 		progress.Done("")
-		return fmt.Errorf("Fetch storage volume backup file: %w", err)
+		return fmt.Errorf("Failed to fetch storage volume backup file: %w", err)
 	}
 
 	progress.Done(i18n.G("Backup exported successfully!"))
 	return nil
 }
 
-// Import
+// Import.
 type cmdStorageVolumeImport struct {
 	global        *cmdGlobal
 	storage       *cmdStorage
@@ -2233,7 +2268,8 @@ func (c *cmdStorageVolumeImport) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	fstat, err := file.Stat()
 	if err != nil {

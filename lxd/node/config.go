@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/lxc/lxd/lxd/config"
@@ -19,9 +20,9 @@ type Config struct {
 // ConfigLoad loads a new Config object with the current node-local configuration
 // values fetched from the database. An optional list of config value triggers
 // can be passed, each config key must have at most one trigger.
-func ConfigLoad(tx *db.NodeTx) (*Config, error) {
+func ConfigLoad(ctx context.Context, tx *db.NodeTx) (*Config, error) {
 	// Load current raw values from the database, any error is fatal.
-	values, err := tx.Config()
+	values, err := tx.Config(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("Cannot fetch node config from database: %w", err)
 	}
@@ -45,12 +46,12 @@ func (c *Config) HTTPSAddress() string {
 	return networkAddress
 }
 
-// BGPAddress returns the address and port to setup the BGP listener on
+// BGPAddress returns the address and port to setup the BGP listener on.
 func (c *Config) BGPAddress() string {
 	return c.m.GetString("core.bgp_address")
 }
 
-// BGPRouterID returns the address to use as a router ID
+// BGPRouterID returns the address to use as a router ID.
 func (c *Config) BGPRouterID() string {
 	return c.m.GetString("core.bgp_routerid")
 }
@@ -66,7 +67,7 @@ func (c *Config) ClusterAddress() string {
 	return clusterAddress
 }
 
-// DebugAddress returns the address and port to setup the pprof listener on
+// DebugAddress returns the address and port to setup the pprof listener on.
 func (c *Config) DebugAddress() string {
 	debugAddress := c.m.GetString("core.debug_address")
 	if debugAddress != "" {
@@ -76,12 +77,12 @@ func (c *Config) DebugAddress() string {
 	return debugAddress
 }
 
-// DNSAddress returns the address and port to setup the DNS listener on
+// DNSAddress returns the address and port to setup the DNS listener on.
 func (c *Config) DNSAddress() string {
 	return c.m.GetString("core.dns_address")
 }
 
-// MetricsAddress returns the address and port to setup the metrics listener on
+// MetricsAddress returns the address and port to setup the metrics listener on.
 func (c *Config) MetricsAddress() string {
 	metricsAddress := c.m.GetString("core.metrics_address")
 	if metricsAddress != "" {
@@ -97,29 +98,39 @@ func (c *Config) MAASMachine() string {
 	return c.m.GetString("maas.machine")
 }
 
-// StorageBackupsVolume returns the name of the pool/volume to use for storing backup tarballs
+// StorageBucketsAddress returns the address and port to setup the storage buckets listener on.
+func (c *Config) StorageBucketsAddress() string {
+	objectAddress := c.m.GetString("core.storage_buckets_address")
+	if objectAddress != "" {
+		return util.CanonicalNetworkAddress(objectAddress, shared.HTTPSStorageBucketsDefaultPort)
+	}
+
+	return objectAddress
+}
+
+// StorageBackupsVolume returns the name of the pool/volume to use for storing backup tarballs.
 func (c *Config) StorageBackupsVolume() string {
 	return c.m.GetString("storage.backups_volume")
 }
 
-// StorageImagesVolume returns the name of the pool/volume to use for storing image tarballs
+// StorageImagesVolume returns the name of the pool/volume to use for storing image tarballs.
 func (c *Config) StorageImagesVolume() string {
 	return c.m.GetString("storage.images_volume")
 }
 
 // Dump current configuration keys and their values. Keys with values matching
 // their defaults are omitted.
-func (c *Config) Dump() map[string]interface{} {
+func (c *Config) Dump() map[string]any {
 	return c.m.Dump()
 }
 
 // Replace the current configuration with the given values.
-func (c *Config) Replace(values map[string]interface{}) (map[string]string, error) {
+func (c *Config) Replace(values map[string]any) (map[string]string, error) {
 	return c.update(values)
 }
 
 // Patch changes only the configuration keys in the given map.
-func (c *Config) Patch(patch map[string]interface{}) (map[string]string, error) {
+func (c *Config) Patch(patch map[string]any) (map[string]string, error) {
 	values := c.Dump() // Use current values as defaults
 	for name, value := range patch {
 		values[name] = value
@@ -128,119 +139,7 @@ func (c *Config) Patch(patch map[string]interface{}) (map[string]string, error) 
 	return c.update(values)
 }
 
-// HTTPSAddress is a convenience for loading the node configuration and
-// returning the value of core.https_address.
-func HTTPSAddress(node *db.Node) (string, error) {
-	var config *Config
-	err := node.Transaction(func(tx *db.NodeTx) error {
-		var err error
-		config, err = ConfigLoad(tx)
-		return err
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return config.HTTPSAddress(), nil
-}
-
-// BGPAddress is a convenience for loading the node configuration and
-// returning the value of core.bgp_address.
-func BGPAddress(node *db.Node) (string, error) {
-	var config *Config
-	err := node.Transaction(func(tx *db.NodeTx) error {
-		var err error
-		config, err = ConfigLoad(tx)
-		return err
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return config.BGPAddress(), nil
-}
-
-// BGPRouterID is a convenience for loading the node configuration and
-// returning the value of core.bgp_routerid.
-func BGPRouterID(node *db.Node) (string, error) {
-	var config *Config
-	err := node.Transaction(func(tx *db.NodeTx) error {
-		var err error
-		config, err = ConfigLoad(tx)
-		return err
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return config.BGPRouterID(), nil
-}
-
-// ClusterAddress is a convenience for loading the node configuration and
-// returning the value of cluster.https_address.
-func ClusterAddress(node *db.Node) (string, error) {
-	var config *Config
-	err := node.Transaction(func(tx *db.NodeTx) error {
-		var err error
-		config, err = ConfigLoad(tx)
-		return err
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return config.ClusterAddress(), nil
-}
-
-// DebugAddress is a convenience for loading the node configuration and
-// returning the value of core.debug_address.
-func DebugAddress(node *db.Node) (string, error) {
-	var config *Config
-	err := node.Transaction(func(tx *db.NodeTx) error {
-		var err error
-		config, err = ConfigLoad(tx)
-		return err
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return config.DebugAddress(), nil
-}
-
-// DNSAddress is a convenience for loading the node configuration and
-// returning the value of core.dns_address.
-func DNSAddress(node *db.Node) (string, error) {
-	var config *Config
-	err := node.Transaction(func(tx *db.NodeTx) error {
-		var err error
-		config, err = ConfigLoad(tx)
-		return err
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return config.DNSAddress(), nil
-}
-
-// MetricsAddress is a convenience for loading the node configuration and
-// returning the value of core.metrics_address.
-func MetricsAddress(node *db.Node) (string, error) {
-	var config *Config
-	err := node.Transaction(func(tx *db.NodeTx) error {
-		var err error
-		config, err = ConfigLoad(tx)
-		return err
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return config.MetricsAddress(), nil
-}
-
-func (c *Config) update(values map[string]interface{}) (map[string]string, error) {
+func (c *Config) update(values map[string]any) (map[string]string, error) {
 	changed, err := c.m.Change(values)
 	if err != nil {
 		return nil, err
@@ -276,6 +175,9 @@ var ConfigSchema = config.Schema{
 
 	// Network address for the metrics server
 	"core.metrics_address": {Validator: validate.Optional(validate.IsListenAddress(true, true, false))},
+
+	// Network address for the storage buckets server
+	"core.storage_buckets_address": {Validator: validate.Optional(validate.IsListenAddress(true, true, false))},
 
 	// MAAS machine this LXD instance is associated with
 	"maas.machine": {},

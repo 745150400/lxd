@@ -1,5 +1,4 @@
 //go:build linux && cgo
-// +build linux,cgo
 
 package i18n
 
@@ -7,7 +6,7 @@ import (
 	"github.com/gosexy/gettext"
 )
 
-// G returns the translated string
+// G returns the translated string.
 func G(msgid string) string {
 	return gettext.DGettext("lxd", msgid)
 }

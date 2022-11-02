@@ -4,31 +4,36 @@ import (
 	"bytes"
 	"strings"
 	"unicode"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
-// Capital capitalizes the given string ("foo" -> "Foo")
+// Capital capitalizes the given string ("foo" -> "Foo").
 func Capital(s string) string {
-	return strings.Title(s)
+	return cases.Title(language.English, cases.NoLower).String(s)
 }
 
-// Minuscule turns the first character to lower case ("Foo" -> "foo") or the whole word if it is all uppercase ("UUID" -> "uuid")
+// Minuscule turns the first character to lower case ("Foo" -> "foo") or the whole word if it is all uppercase ("UUID" -> "uuid").
 func Minuscule(s string) string {
 	if strings.ToUpper(s) == s {
 		return strings.ToLower(s)
 	}
+
 	return strings.ToLower(s[:1]) + s[1:]
 }
 
-// Camel converts to camel case ("foo_bar" -> "FooBar")
+// Camel converts to camel case ("foo_bar" -> "FooBar").
 func Camel(s string) string {
 	words := strings.Split(s, "_")
 	for i := range words {
 		words[i] = Capital(words[i])
 	}
+
 	return strings.Join(words, "")
 }
 
-// Snake converts to snake case ("FooBar" -> "foo_bar")
+// Snake converts to snake case ("FooBar" -> "foo_bar").
 func Snake(name string) string {
 	var ret bytes.Buffer
 
@@ -51,6 +56,7 @@ func Snake(name string) string {
 			if ret.Len() > 0 && (firstInRow || lastInRow) && beforeUpper != '_' {
 				ret.WriteByte('_')
 			}
+
 			ret.WriteRune(unicode.ToLower(lastUpper))
 		}
 
@@ -71,5 +77,6 @@ func Snake(name string) string {
 	if lastUpper != 0 {
 		ret.WriteRune(unicode.ToLower(lastUpper))
 	}
-	return string(ret.Bytes())
+
+	return ret.String()
 }

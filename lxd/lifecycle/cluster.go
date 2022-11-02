@@ -1,10 +1,8 @@
 package lifecycle
 
 import (
-	"fmt"
-	"net/url"
-
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/version"
 )
 
 // ClusterAction represents a lifecycle event action for clusters.
@@ -12,20 +10,19 @@ type ClusterAction string
 
 // All supported lifecycle events for clusters.
 const (
-	ClusterEnabled            = ClusterAction("enabled")
-	ClusterDisabled           = ClusterAction("disabled")
-	ClusterCertificateUpdated = ClusterAction("certificate-updated")
-	ClusterTokenCreated       = ClusterAction("token-created")
+	ClusterEnabled            = ClusterAction(api.EventLifecycleClusterEnabled)
+	ClusterDisabled           = ClusterAction(api.EventLifecycleClusterDisabled)
+	ClusterCertificateUpdated = ClusterAction(api.EventLifecycleClusterCertificateUpdated)
+	ClusterTokenCreated       = ClusterAction(api.EventLifecycleClusterTokenCreated)
 )
 
 // Event creates the lifecycle event for an action on a cluster.
-func (a ClusterAction) Event(name string, requestor *api.EventLifecycleRequestor, ctx map[string]interface{}) api.EventLifecycle {
-	eventType := fmt.Sprintf("cluster-%s", a)
-	u := fmt.Sprintf("/1.0/cluster/%s", url.PathEscape(name))
+func (a ClusterAction) Event(name string, requestor *api.EventLifecycleRequestor, ctx map[string]any) api.EventLifecycle {
+	u := api.NewURL().Path(version.APIVersion, "cluster", name)
 
 	return api.EventLifecycle{
-		Action:    eventType,
-		Source:    u,
+		Action:    string(a),
+		Source:    u.String(),
 		Context:   ctx,
 		Requestor: requestor,
 	}

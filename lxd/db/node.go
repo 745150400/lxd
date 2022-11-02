@@ -1,16 +1,18 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/db/operationtype"
 	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
@@ -34,6 +36,9 @@ const ClusterRoleDatabaseLeader = ClusterRole("database-leader")
 // ClusterRoleEventHub represents a cluster member who operates as an event hub.
 const ClusterRoleEventHub = ClusterRole("event-hub")
 
+// ClusterRoleOVNChassis represents a cluster member who operates as an OVN chassis.
+const ClusterRoleOVNChassis = ClusterRole("ovn-chassis")
+
 // ClusterRoles maps role ids into human-readable names.
 //
 // Note: the database role is currently stored directly in the raft
@@ -41,6 +46,7 @@ const ClusterRoleEventHub = ClusterRole("event-hub")
 // only contain LXD-specific cluster roles.
 var ClusterRoles = map[int]ClusterRole{
 	1: ClusterRoleEventHub,
+	2: ClusterRoleOVNChassis,
 }
 
 // Numeric type codes identifying different cluster member states.
@@ -81,20 +87,20 @@ func (n NodeInfo) ToAPI(cluster *Cluster, node *Node, leader string) (*api.Clust
 	var failureDomain string
 
 	// From cluster database.
-	err = cluster.Transaction(func(tx *ClusterTx) error {
+	err = cluster.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Get offline threshold.
-		offlineThreshold, err = tx.GetNodeOfflineThreshold()
+		offlineThreshold, err = tx.GetNodeOfflineThreshold(ctx)
 		if err != nil {
 			return fmt.Errorf("Load offline threshold config: %w", err)
 		}
 
 		// Get failure domains.
-		nodesDomains, err := tx.GetNodesFailureDomains()
+		nodesDomains, err := tx.GetNodesFailureDomains(ctx)
 		if err != nil {
 			return fmt.Errorf("Load nodes failure domains: %w", err)
 		}
 
-		domainsNames, err := tx.GetFailureDomainsNames()
+		domainsNames, err := tx.GetFailureDomainsNames(ctx)
 		if err != nil {
 			return fmt.Errorf("Load failure domains names: %w", err)
 		}
@@ -103,7 +109,7 @@ func (n NodeInfo) ToAPI(cluster *Cluster, node *Node, leader string) (*api.Clust
 		failureDomain = domainsNames[domainID]
 
 		// Get the highest schema and API versions.
-		maxVersion, err = tx.GetNodeMaxVersion()
+		maxVersion, err = tx.GetNodeMaxVersion(ctx)
 		if err != nil {
 			return fmt.Errorf("Get max version: %w", err)
 		}
@@ -116,8 +122,8 @@ func (n NodeInfo) ToAPI(cluster *Cluster, node *Node, leader string) (*api.Clust
 
 	// From local database.
 	var raftNode *RaftNode
-	err = node.Transaction(func(tx *NodeTx) error {
-		nodes, err := tx.GetRaftNodes()
+	err = node.Transaction(context.TODO(), func(ctx context.Context, tx *NodeTx) error {
+		nodes, err := tx.GetRaftNodes(ctx)
 		if err != nil {
 			return fmt.Errorf("Load offline threshold config: %w", err)
 		}
@@ -162,14 +168,17 @@ func (n NodeInfo) ToAPI(cluster *Cluster, node *Node, leader string) (*api.Clust
 		result.Roles = append(result.Roles, string(ClusterRoleDatabase))
 		result.Database = true
 	}
+
 	if raftNode != nil && raftNode.Role == RaftStandBy {
 		result.Roles = append(result.Roles, string(ClusterRoleDatabaseStandBy))
 		result.Database = true
 	}
+
 	result.Architecture, err = osarch.ArchitectureName(n.Architecture)
 	if err != nil {
 		return nil, err
 	}
+
 	result.FailureDomain = failureDomain
 
 	// Set state and message.
@@ -195,7 +204,7 @@ func (n NodeInfo) ToAPI(cluster *Cluster, node *Node, leader string) (*api.Clust
 	}
 
 	if n.IsOffline(offlineThreshold) {
-		result.Message = fmt.Sprintf("No heartbeat for %s (%s)", time.Now().Sub(n.Heartbeat), n.Heartbeat)
+		result.Message = fmt.Sprintf("No heartbeat for %s (%s)", time.Since(n.Heartbeat), n.Heartbeat)
 	}
 
 	return &result, nil
@@ -208,15 +217,16 @@ func (n NodeInfo) Version() [2]int {
 }
 
 // GetNodeByAddress returns the node with the given network address.
-func (c *ClusterTx) GetNodeByAddress(address string) (NodeInfo, error) {
+func (c *ClusterTx) GetNodeByAddress(ctx context.Context, address string) (NodeInfo, error) {
 	null := NodeInfo{}
-	nodes, err := c.nodes(false /* not pending */, "address=?", address)
+	nodes, err := c.nodes(ctx, false /* not pending */, "address=?", address)
 	if err != nil {
 		return null, err
 	}
+
 	switch len(nodes) {
 	case 0:
-		return null, ErrNoSuchObject
+		return null, api.StatusErrorf(http.StatusNotFound, "Cluster member not found")
 	case 1:
 		return nodes[0], nil
 	default:
@@ -225,12 +235,12 @@ func (c *ClusterTx) GetNodeByAddress(address string) (NodeInfo, error) {
 }
 
 // GetNodeMaxVersion returns the highest version possible on the cluster.
-func (c *ClusterTx) GetNodeMaxVersion() ([2]int, error) {
+func (c *ClusterTx) GetNodeMaxVersion(ctx context.Context) ([2]int, error) {
 	version := [2]int{}
 
 	// Get the maximum DB schema.
 	var maxSchema int
-	row := c.tx.QueryRow("SELECT MAX(schema) FROM nodes")
+	row := c.tx.QueryRowContext(ctx, "SELECT MAX(schema) FROM nodes")
 	err := row.Scan(&maxSchema)
 	if err != nil {
 		return version, err
@@ -238,7 +248,7 @@ func (c *ClusterTx) GetNodeMaxVersion() ([2]int, error) {
 
 	// Get the maximum API extension.
 	var maxAPI int
-	row = c.tx.QueryRow("SELECT MAX(api_extensions) FROM nodes")
+	row = c.tx.QueryRowContext(ctx, "SELECT MAX(api_extensions) FROM nodes")
 	err = row.Scan(&maxAPI)
 	if err != nil {
 		return version, err
@@ -251,63 +261,68 @@ func (c *ClusterTx) GetNodeMaxVersion() ([2]int, error) {
 }
 
 // GetNodeWithID returns the node with the given ID.
-func (c *ClusterTx) GetNodeWithID(nodeID int) (NodeInfo, error) {
+func (c *ClusterTx) GetNodeWithID(ctx context.Context, nodeID int) (NodeInfo, error) {
 	null := NodeInfo{}
-	nodes, err := c.nodes(false /* not pending */, "id=?", nodeID)
+	nodes, err := c.nodes(ctx, false /* not pending */, "id=?", nodeID)
 	if err != nil {
 		return null, err
 	}
+
 	switch len(nodes) {
 	case 0:
-		return null, ErrNoSuchObject
+		return null, api.StatusErrorf(http.StatusNotFound, "Cluster member not found")
 	case 1:
 		return nodes[0], nil
 	default:
-		return null, fmt.Errorf("more than one node matches")
+		return null, fmt.Errorf("More than one cluster member matches")
 	}
 }
 
 // GetPendingNodeByAddress returns the pending node with the given network address.
-func (c *ClusterTx) GetPendingNodeByAddress(address string) (NodeInfo, error) {
+func (c *ClusterTx) GetPendingNodeByAddress(ctx context.Context, address string) (NodeInfo, error) {
 	null := NodeInfo{}
-	nodes, err := c.nodes(true /*pending */, "address=?", address)
+	nodes, err := c.nodes(ctx, true /*pending */, "address=?", address)
 	if err != nil {
 		return null, err
 	}
+
 	switch len(nodes) {
 	case 0:
-		return null, ErrNoSuchObject
+		return null, api.StatusErrorf(http.StatusNotFound, "Cluster member not found")
 	case 1:
 		return nodes[0], nil
 	default:
-		return null, fmt.Errorf("more than one node matches")
+		return null, fmt.Errorf("More than one cluster member matches")
 	}
 }
 
 // GetNodeByName returns the node with the given name.
-func (c *ClusterTx) GetNodeByName(name string) (NodeInfo, error) {
+func (c *ClusterTx) GetNodeByName(ctx context.Context, name string) (NodeInfo, error) {
 	null := NodeInfo{}
-	nodes, err := c.nodes(false /* not pending */, "name=?", name)
+	nodes, err := c.nodes(ctx, false /* not pending */, "name=?", name)
 	if err != nil {
 		return null, err
 	}
+
 	switch len(nodes) {
 	case 0:
-		return null, ErrNoSuchObject
+		return null, api.StatusErrorf(http.StatusNotFound, "Cluster member not found")
 	case 1:
 		return nodes[0], nil
 	default:
-		return null, fmt.Errorf("more than one node matches")
+		return null, fmt.Errorf("More than one cluster member matches")
 	}
 }
 
 // GetLocalNodeName returns the name of the node this method is invoked on.
-func (c *ClusterTx) GetLocalNodeName() (string, error) {
+// Usually you should not use this function directly but instead use the cached State.ServerName value.
+func (c *ClusterTx) GetLocalNodeName(ctx context.Context) (string, error) {
 	stmt := "SELECT name FROM nodes WHERE id=?"
-	names, err := query.SelectStrings(c.tx, stmt, c.nodeID)
+	names, err := query.SelectStrings(ctx, c.tx, stmt, c.nodeID)
 	if err != nil {
 		return "", err
 	}
+
 	switch len(names) {
 	case 0:
 		return "", nil
@@ -319,12 +334,13 @@ func (c *ClusterTx) GetLocalNodeName() (string, error) {
 }
 
 // GetLocalNodeAddress returns the address of the node this method is invoked on.
-func (c *ClusterTx) GetLocalNodeAddress() (string, error) {
+func (c *ClusterTx) GetLocalNodeAddress(ctx context.Context) (string, error) {
 	stmt := "SELECT address FROM nodes WHERE id=?"
-	addresses, err := query.SelectStrings(c.tx, stmt, c.nodeID)
+	addresses, err := query.SelectStrings(ctx, c.tx, stmt, c.nodeID)
 	if err != nil {
 		return "", err
 	}
+
 	switch len(addresses) {
 	case 0:
 		return "", nil
@@ -337,8 +353,8 @@ func (c *ClusterTx) GetLocalNodeAddress() (string, error) {
 
 // NodeIsOutdated returns true if there's some cluster node having an API or
 // schema version greater than the node this method is invoked on.
-func (c *ClusterTx) NodeIsOutdated() (bool, error) {
-	nodes, err := c.nodes(false /* not pending */, "")
+func (c *ClusterTx) NodeIsOutdated(ctx context.Context) (bool, error) {
+	nodes, err := c.nodes(ctx, false /* not pending */, "")
 	if err != nil {
 		return false, fmt.Errorf("Failed to fetch nodes: %w", err)
 	}
@@ -351,7 +367,7 @@ func (c *ClusterTx) NodeIsOutdated() (bool, error) {
 		}
 	}
 	if version[0] == 0 || version[1] == 0 {
-		return false, fmt.Errorf("Inconsistency: local node not found")
+		return false, fmt.Errorf("Inconsistency: local member not found")
 	}
 
 	// Check if any of the other nodes is greater than us.
@@ -359,9 +375,10 @@ func (c *ClusterTx) NodeIsOutdated() (bool, error) {
 		if node.ID == c.nodeID {
 			continue
 		}
+
 		n, err := util.CompareVersions(node.Version(), version)
 		if err != nil {
-			return false, fmt.Errorf("Failed to compare with version of node %s: %w", node.Name, err)
+			return false, fmt.Errorf("Failed to compare with version of member %s: %w", node.Name, err)
 		}
 
 		if n == 1 {
@@ -377,45 +394,51 @@ func (c *ClusterTx) NodeIsOutdated() (bool, error) {
 //
 // If this LXD instance is not clustered, a list with a single node whose
 // address is 0.0.0.0 is returned.
-func (c *ClusterTx) GetNodes() ([]NodeInfo, error) {
-	return c.nodes(false /* not pending */, "")
+func (c *ClusterTx) GetNodes(ctx context.Context) ([]NodeInfo, error) {
+	return c.nodes(ctx, false /* not pending */, "")
 }
 
 // GetNodesCount returns the number of nodes in the LXD cluster.
 //
 // Since there's always at least one node row, even when not-clustered, the
-// return value is greater than zero
-func (c *ClusterTx) GetNodesCount() (int, error) {
-	count, err := query.Count(c.tx, "nodes", "")
+// return value is greater than zero.
+func (c *ClusterTx) GetNodesCount(ctx context.Context) (int, error) {
+	count, err := query.Count(ctx, c.tx, "nodes", "")
 	if err != nil {
 		return 0, fmt.Errorf("failed to count existing nodes: %w", err)
 	}
+
 	return count, nil
 }
 
 // RenameNode changes the name of an existing node.
 //
 // Return an error if a node with the same name already exists.
-func (c *ClusterTx) RenameNode(old, new string) error {
-	count, err := query.Count(c.tx, "nodes", "name=?", new)
+func (c *ClusterTx) RenameNode(ctx context.Context, old string, new string) error {
+	count, err := query.Count(ctx, c.tx, "nodes", "name=?", new)
 	if err != nil {
 		return fmt.Errorf("failed to check existing nodes: %w", err)
 	}
+
 	if count != 0 {
 		return ErrAlreadyDefined
 	}
+
 	stmt := `UPDATE nodes SET name=? WHERE name=?`
 	result, err := c.tx.Exec(stmt, new, old)
 	if err != nil {
 		return fmt.Errorf("failed to update node name: %w", err)
 	}
+
 	n, err := result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("failed to get rows count: %w", err)
 	}
+
 	if n != 1 {
 		return fmt.Errorf("expected to update one row, not %d", n)
 	}
+
 	return nil
 }
 
@@ -440,43 +463,32 @@ func (c *ClusterTx) SetDescription(id int64, description string) error {
 }
 
 // Nodes returns all LXD nodes part of the cluster.
-func (c *ClusterTx) nodes(pending bool, where string, args ...interface{}) ([]NodeInfo, error) {
+func (c *ClusterTx) nodes(ctx context.Context, pending bool, where string, args ...any) ([]NodeInfo, error) {
 	// Get node roles
 	sql := "SELECT node_id, role FROM nodes_roles"
 
 	nodeRoles := map[int64][]ClusterRole{}
-	rows, err := c.tx.Query(sql)
-	if err != nil {
-		// Don't fail on a missing table, we need to handle updates
-		if err.Error() != "no such table: nodes_roles" {
-			return nil, err
-		}
-	} else {
-		defer rows.Close()
+	err := query.Scan(ctx, c.Tx(), sql, func(scan func(dest ...any) error) error {
+		var nodeID int64
+		var role int
 
-		for i := 0; rows.Next(); i++ {
-			var nodeID int64
-			var role int
-			err := rows.Scan(&nodeID, &role)
-			if err != nil {
-				return nil, err
-			}
-
-			if nodeRoles[nodeID] == nil {
-				nodeRoles[nodeID] = []ClusterRole{}
-			}
-
-			roleName := string(ClusterRoles[role])
-
-			nodeRoles[nodeID] = append(nodeRoles[nodeID], ClusterRole(roleName))
-		}
-
-		err = rows.Err()
+		err := scan(&nodeID, &role)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
-		rows.Close()
+		if nodeRoles[nodeID] == nil {
+			nodeRoles[nodeID] = []ClusterRole{}
+		}
+
+		roleName := string(ClusterRoles[role])
+		nodeRoles[nodeID] = append(nodeRoles[nodeID], ClusterRole(roleName))
+
+		return nil
+	})
+	if err != nil && err.Error() != "no such table: nodes_roles" {
+		// Don't fail on a missing table, we need to handle updates
+		return nil, err
 	}
 
 	// Get node groups
@@ -484,52 +496,26 @@ func (c *ClusterTx) nodes(pending bool, where string, args ...interface{}) ([]No
 JOIN cluster_groups ON cluster_groups.id = nodes_cluster_groups.group_id`
 	nodeGroups := map[int64][]string{}
 
-	rows, err = c.tx.Query(sql)
-	if err != nil {
-		// Don't fail on a missing table, we need to handle updates
-		if err.Error() != "no such table: nodes_cluster_groups" {
-			return nil, err
-		}
-	} else {
-		defer rows.Close()
+	err = query.Scan(ctx, c.Tx(), sql, func(scan func(dest ...any) error) error {
+		var nodeID int64
+		var group string
 
-		for i := 0; rows.Next(); i++ {
-			var nodeID int64
-			var group string
-
-			err := rows.Scan(&nodeID, &group)
-			if err != nil {
-				return nil, err
-			}
-
-			if nodeGroups[nodeID] == nil {
-				nodeGroups[nodeID] = []string{}
-			}
-
-			nodeGroups[nodeID] = append(nodeGroups[nodeID], group)
-		}
-
-		err = rows.Err()
+		err := scan(&nodeID, &group)
 		if err != nil {
-			return nil, err
+			return err
 		}
-	}
 
-	// Process node entries
-	nodes := []NodeInfo{}
-	dest := func(i int) []interface{} {
-		nodes = append(nodes, NodeInfo{})
-		return []interface{}{
-			&nodes[i].ID,
-			&nodes[i].Name,
-			&nodes[i].Address,
-			&nodes[i].Description,
-			&nodes[i].Schema,
-			&nodes[i].APIExtensions,
-			&nodes[i].Heartbeat,
-			&nodes[i].Architecture,
-			&nodes[i].State,
+		if nodeGroups[nodeID] == nil {
+			nodeGroups[nodeID] = []string{}
 		}
+
+		nodeGroups[nodeID] = append(nodeGroups[nodeID], group)
+
+		return nil
+	})
+	if err != nil && err.Error() != "no such table: nodes_cluster_groups" {
+		// Don't fail on a missing table, we need to handle updates
+		return nil, err
 	}
 
 	// Get the node entries
@@ -537,26 +523,33 @@ JOIN cluster_groups ON cluster_groups.id = nodes_cluster_groups.group_id`
 
 	if pending {
 		// Include only pending nodes
-		sql += fmt.Sprintf("WHERE state=? ")
+		sql += "WHERE state=? "
 	} else {
 		// Include created and evacuated nodes
-		sql += fmt.Sprintf("WHERE state!=? ")
+		sql += "WHERE state!=? "
 	}
 
-	args = append([]interface{}{ClusterMemberStatePending}, args...)
+	args = append([]any{ClusterMemberStatePending}, args...)
 
 	if where != "" {
 		sql += fmt.Sprintf("AND %s ", where)
 	}
+
 	sql += "ORDER BY id"
 
-	stmt, err := c.tx.Prepare(sql)
-	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
+	// Process node entries
+	nodes := []NodeInfo{}
+	err = query.Scan(ctx, c.tx, sql, func(scan func(dest ...any) error) error {
+		node := NodeInfo{}
+		err := scan(&node.ID, &node.Name, &node.Address, &node.Description, &node.Schema, &node.APIExtensions, &node.Heartbeat, &node.Architecture, &node.State)
+		if err != nil {
+			return err
+		}
 
-	err = query.SelectObjects(stmt, dest, args...)
+		nodes = append(nodes, node)
+
+		return nil
+	}, args...)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to fetch nodes: %w", err)
 	}
@@ -577,13 +570,14 @@ JOIN cluster_groups ON cluster_groups.id = nodes_cluster_groups.group_id`
 		}
 	}
 
-	config, err := c.GetConfig("node")
+	config, err := cluster.GetConfig(context.TODO(), c.Tx(), "node")
 	if err != nil {
 		return nil, fmt.Errorf("Failed to fetch nodes config: %w", err)
 	}
 
 	for i := range nodes {
-		if data, ok := config[int(nodes[i].ID)]; !ok {
+		data, ok := config[int(nodes[i].ID)]
+		if !ok {
 			nodes[i].Config = map[string]string{}
 		} else {
 			nodes[i].Config = data
@@ -601,6 +595,7 @@ func (c *ClusterTx) CreateNode(name string, address string) (int64, error) {
 	if err != nil {
 		return -1, err
 	}
+
 	return c.CreateNodeWithArch(name, address, arch)
 }
 
@@ -608,7 +603,7 @@ func (c *ClusterTx) CreateNode(name string, address string) (int64, error) {
 // architecture explicitly.
 func (c *ClusterTx) CreateNodeWithArch(name string, address string, arch int) (int64, error) {
 	columns := []string{"name", "address", "schema", "api_extensions", "arch", "description"}
-	values := []interface{}{name, address, cluster.SchemaVersion, version.APIExtensionsCount(), arch, ""}
+	values := []any{name, address, cluster.SchemaVersion, version.APIExtensionsCount(), arch, ""}
 	return query.UpsertObject(c.tx, "nodes", columns, values)
 }
 
@@ -619,17 +614,21 @@ func (c *ClusterTx) SetNodePendingFlag(id int64, pending bool) error {
 	if pending {
 		value = 1
 	}
+
 	result, err := c.tx.Exec("UPDATE nodes SET state=? WHERE id=?", value, id)
 	if err != nil {
 		return err
 	}
+
 	n, err := result.RowsAffected()
 	if err != nil {
 		return err
 	}
+
 	if n != 1 {
 		return fmt.Errorf("query updated %d rows instead of 1", n)
 	}
+
 	return nil
 }
 
@@ -639,10 +638,12 @@ func (c *ClusterTx) BootstrapNode(name string, address string) error {
 	if err != nil {
 		return err
 	}
+
 	n, err := result.RowsAffected()
 	if err != nil {
 		return err
 	}
+
 	if n != 1 {
 		return fmt.Errorf("query updated %d rows instead of 1", n)
 	}
@@ -651,8 +652,8 @@ func (c *ClusterTx) BootstrapNode(name string, address string) error {
 }
 
 // UpdateNodeConfig updates the replaces the node's config with the specified config.
-func (c *ClusterTx) UpdateNodeConfig(id int64, config map[string]string) error {
-	err := c.UpdateConfig("node", int(id), config)
+func (c *ClusterTx) UpdateNodeConfig(ctx context.Context, id int64, config map[string]string) error {
+	err := cluster.UpdateConfig(ctx, c.Tx(), "node", int(id), config)
 	if err != nil {
 		return fmt.Errorf("Unable to update node config: %w", err)
 	}
@@ -705,13 +706,13 @@ func (c *ClusterTx) UpdateNodeRoles(id int64, roles []ClusterRole) error {
 }
 
 // UpdateNodeClusterGroups changes the list of cluster groups the member belongs to.
-func (c *ClusterTx) UpdateNodeClusterGroups(id int64, groups []string) error {
-	nodeInfo, err := c.GetNodeWithID(int(id))
+func (c *ClusterTx) UpdateNodeClusterGroups(ctx context.Context, id int64, groups []string) error {
+	nodeInfo, err := c.GetNodeWithID(ctx, int(id))
 	if err != nil {
 		return err
 	}
 
-	oldGroups, err := c.GetClusterGroupsWithNode(nodeInfo.Name)
+	oldGroups, err := c.GetClusterGroupsWithNode(ctx, nodeInfo.Name)
 	if err != nil {
 		return err
 	}
@@ -727,7 +728,7 @@ func (c *ClusterTx) UpdateNodeClusterGroups(id int64, groups []string) error {
 		}
 
 		// Add node to new group.
-		err = c.AddNodeToClusterGroup(newGroup, nodeInfo.Name)
+		err = c.AddNodeToClusterGroup(ctx, newGroup, nodeInfo.Name)
 		if err != nil {
 			return fmt.Errorf("Failed to add member to cluster group: %w", err)
 		}
@@ -739,7 +740,7 @@ func (c *ClusterTx) UpdateNodeClusterGroups(id int64, groups []string) error {
 		}
 
 		// Remove node from group.
-		err = c.RemoveNodeFromClusterGroup(oldGroup, nodeInfo.Name)
+		err = c.RemoveNodeFromClusterGroup(ctx, oldGroup, nodeInfo.Name)
 		if err != nil {
 			return fmt.Errorf("Failed to remove member from cluster group: %w", err)
 		}
@@ -749,8 +750,8 @@ func (c *ClusterTx) UpdateNodeClusterGroups(id int64, groups []string) error {
 }
 
 // UpdateNodeFailureDomain changes the failure domain of a node.
-func (c *ClusterTx) UpdateNodeFailureDomain(id int64, domain string) error {
-	var domainID interface{}
+func (c *ClusterTx) UpdateNodeFailureDomain(ctx context.Context, id int64, domain string) error {
+	var domainID any
 
 	if domain == "" {
 		return fmt.Errorf("Failure domain name can't be empty")
@@ -759,16 +760,18 @@ func (c *ClusterTx) UpdateNodeFailureDomain(id int64, domain string) error {
 	if domain == "default" {
 		domainID = nil
 	} else {
-		row := c.tx.QueryRow("SELECT id FROM nodes_failure_domains WHERE name=?", domain)
+		row := c.tx.QueryRowContext(ctx, "SELECT id FROM nodes_failure_domains WHERE name=?", domain)
 		err := row.Scan(&domainID)
 		if err != nil {
 			if err != sql.ErrNoRows {
 				return fmt.Errorf("Load failure domain name: %w", err)
 			}
+
 			result, err := c.tx.Exec("INSERT INTO nodes_failure_domains (name) VALUES (?)", domain)
 			if err != nil {
 				return fmt.Errorf("Create new failure domain: %w", err)
 			}
+
 			domainID, err = result.LastInsertId()
 			if err != nil {
 				return fmt.Errorf("Get last inserted ID: %w", err)
@@ -780,10 +783,12 @@ func (c *ClusterTx) UpdateNodeFailureDomain(id int64, domain string) error {
 	if err != nil {
 		return err
 	}
+
 	n, err := result.RowsAffected()
 	if err != nil {
 		return err
 	}
+
 	if n != 1 {
 		return fmt.Errorf("Query updated %d rows instead of 1", n)
 	}
@@ -811,7 +816,7 @@ func (c *ClusterTx) UpdateNodeStatus(id int64, state int) error {
 }
 
 // GetNodeFailureDomain returns the failure domain associated with the node with the given ID.
-func (c *ClusterTx) GetNodeFailureDomain(id int64) (string, error) {
+func (c *ClusterTx) GetNodeFailureDomain(ctx context.Context, id int64) (string, error) {
 	stmt := `
 SELECT coalesce(nodes_failure_domains.name,'default')
   FROM nodes LEFT JOIN nodes_failure_domains ON nodes.failure_domain_id = nodes_failure_domains.id
@@ -819,35 +824,35 @@ SELECT coalesce(nodes_failure_domains.name,'default')
 `
 	var domain string
 
-	err := c.tx.QueryRow(stmt, id).Scan(&domain)
+	err := c.tx.QueryRowContext(ctx, stmt, id).Scan(&domain)
 	if err != nil {
 		return "", err
 	}
+
 	return domain, nil
 }
 
 // GetNodesFailureDomains returns a map associating each node address with its
 // failure domain code.
-func (c *ClusterTx) GetNodesFailureDomains() (map[string]uint64, error) {
-	stmt, err := c.tx.Prepare("SELECT address, coalesce(failure_domain_id, 0) FROM nodes")
-	if err != nil {
-		return nil, err
-	}
-
-	rows := []struct {
+func (c *ClusterTx) GetNodesFailureDomains(ctx context.Context) (map[string]uint64, error) {
+	sql := "SELECT address, coalesce(failure_domain_id, 0) FROM nodes"
+	type failureDomain struct {
 		Address         string
 		FailureDomainID int64
-	}{}
-
-	dest := func(i int) []interface{} {
-		rows = append(rows, struct {
-			Address         string
-			FailureDomainID int64
-		}{})
-		return []interface{}{&rows[len(rows)-1].Address, &rows[len(rows)-1].FailureDomainID}
 	}
 
-	err = query.SelectObjects(stmt, dest)
+	rows := []failureDomain{}
+	err := query.Scan(ctx, c.tx, sql, func(scan func(dest ...any) error) error {
+		fd := failureDomain{}
+		err := scan(&fd.Address, &fd.FailureDomainID)
+		if err != nil {
+			return err
+		}
+
+		rows = append(rows, fd)
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -863,26 +868,26 @@ func (c *ClusterTx) GetNodesFailureDomains() (map[string]uint64, error) {
 
 // GetFailureDomainsNames return a map associating failure domain IDs to their
 // names.
-func (c *ClusterTx) GetFailureDomainsNames() (map[uint64]string, error) {
-	stmt, err := c.tx.Prepare("SELECT id, name FROM nodes_failure_domains")
-	if err != nil {
-		return nil, err
-	}
+func (c *ClusterTx) GetFailureDomainsNames(ctx context.Context) (map[uint64]string, error) {
+	sql := "SELECT id, name FROM nodes_failure_domains"
 
-	rows := []struct {
+	type failureDomain struct {
 		ID   int64
 		Name string
-	}{}
-
-	dest := func(i int) []interface{} {
-		rows = append(rows, struct {
-			ID   int64
-			Name string
-		}{})
-		return []interface{}{&rows[len(rows)-1].ID, &rows[len(rows)-1].Name}
 	}
 
-	err = query.SelectObjects(stmt, dest)
+	rows := []failureDomain{}
+	err := query.Scan(ctx, c.tx, sql, func(scan func(dest ...any) error) error {
+		fd := failureDomain{}
+		err := scan(&fd.ID, &fd.Name)
+		if err != nil {
+			return err
+		}
+
+		rows = append(rows, fd)
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -904,13 +909,16 @@ func (c *ClusterTx) RemoveNode(id int64) error {
 	if err != nil {
 		return err
 	}
+
 	n, err := result.RowsAffected()
 	if err != nil {
 		return err
 	}
+
 	if n != 1 {
 		return fmt.Errorf("query deleted %d rows instead of 1", n)
 	}
+
 	return nil
 }
 
@@ -921,13 +929,14 @@ func (c *ClusterTx) SetNodeHeartbeat(address string, heartbeat time.Time) error 
 	if err != nil {
 		return err
 	}
+
 	n, err := result.RowsAffected()
 	if err != nil {
 		return err
 	}
 
 	if n < 1 {
-		return ErrNoSuchObject
+		return api.StatusErrorf(http.StatusNotFound, "Cluster member not found")
 	} else if n > 1 {
 		return fmt.Errorf("Expected to update one row and not %d", n)
 	}
@@ -938,12 +947,13 @@ func (c *ClusterTx) SetNodeHeartbeat(address string, heartbeat time.Time) error 
 // NodeIsEmpty returns an empty string if the node with the given ID has no
 // containers or images associated with it. Otherwise, it returns a message
 // say what's left.
-func (c *ClusterTx) NodeIsEmpty(id int64) (string, error) {
+func (c *ClusterTx) NodeIsEmpty(ctx context.Context, id int64) (string, error) {
 	// Check if the node has any instances.
-	containers, err := query.SelectStrings(c.tx, "SELECT name FROM instances WHERE node_id=?", id)
+	containers, err := query.SelectStrings(ctx, c.tx, "SELECT name FROM instances WHERE node_id=?", id)
 	if err != nil {
 		return "", fmt.Errorf("Failed to get instances for node %d: %w", id, err)
 	}
+
 	if len(containers) > 0 {
 		message := fmt.Sprintf(
 			"Node still has the following containers: %s", strings.Join(containers, ", "))
@@ -951,28 +961,28 @@ func (c *ClusterTx) NodeIsEmpty(id int64) (string, error) {
 	}
 
 	// Check if the node has any images available only in it.
-	images := []struct {
+	type image struct {
 		fingerprint string
 		nodeID      int64
-	}{}
-	dest := func(i int) []interface{} {
-		images = append(images, struct {
-			fingerprint string
-			nodeID      int64
-		}{})
-		return []interface{}{&images[i].fingerprint, &images[i].nodeID}
+	}
 
-	}
-	stmt, err := c.tx.Prepare(`
-SELECT fingerprint, node_id FROM images JOIN images_nodes ON images.id=images_nodes.image_id`)
-	if err != nil {
-		return "", err
-	}
-	defer stmt.Close()
-	err = query.SelectObjects(stmt, dest)
+	images := []image{}
+	sql := `SELECT fingerprint, node_id FROM images JOIN images_nodes ON images.id=images_nodes.image_id`
+	err = query.Scan(ctx, c.tx, sql, func(scan func(dest ...any) error) error {
+		img := image{}
+		err := scan(&img.fingerprint, &img.nodeID)
+		if err != nil {
+			return err
+		}
+
+		images = append(images, img)
+
+		return nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("Failed to get image list for node %d: %w", id, err)
 	}
+
 	index := map[string][]int64{} // Map fingerprints to IDs of nodes
 	for _, image := range images {
 		index[image.fingerprint] = append(index[image.fingerprint], image.nodeID)
@@ -983,6 +993,7 @@ SELECT fingerprint, node_id FROM images JOIN images_nodes ON images.id=images_no
 		if len(ids) > 1 {
 			continue
 		}
+
 		if ids[0] == id {
 			fingerprints = append(fingerprints, fingerprint)
 		}
@@ -995,12 +1006,17 @@ SELECT fingerprint, node_id FROM images JOIN images_nodes ON images.id=images_no
 	}
 
 	// Check if the node has any custom volumes.
-	volumes, err := query.SelectStrings(
-		c.tx, "SELECT storage_volumes.name FROM storage_volumes JOIN storage_pools ON storage_volumes.storage_pool_id=storage_pools.id WHERE storage_volumes.node_id=? AND storage_volumes.type=? AND storage_pools.driver NOT IN ('ceph', 'cephfs')",
-		id, StoragePoolVolumeTypeCustom)
+	sql = `
+SELECT storage_volumes.name
+  FROM storage_volumes
+  JOIN storage_pools ON storage_volumes.storage_pool_id=storage_pools.id
+  WHERE storage_volumes.node_id=? AND storage_volumes.type=? AND storage_pools.driver NOT IN ('ceph', 'cephfs')
+`
+	volumes, err := query.SelectStrings(ctx, c.tx, sql, id, StoragePoolVolumeTypeCustom)
 	if err != nil {
 		return "", fmt.Errorf("Failed to get custom volumes for node %d: %w", id, err)
 	}
+
 	if len(volumes) > 0 {
 		message := fmt.Sprintf(
 			"Node still has the following custom volumes: %s", strings.Join(volumes, ", "))
@@ -1011,14 +1027,14 @@ SELECT fingerprint, node_id FROM images JOIN images_nodes ON images.id=images_no
 }
 
 // ClearNode removes any instance or image associated with this node.
-func (c *ClusterTx) ClearNode(id int64) error {
+func (c *ClusterTx) ClearNode(ctx context.Context, id int64) error {
 	_, err := c.tx.Exec("DELETE FROM instances WHERE node_id=?", id)
 	if err != nil {
 		return err
 	}
 
 	// Get the IDs of the images this node is hosting.
-	ids, err := query.SelectIntegers(c.tx, "SELECT image_id FROM images_nodes WHERE node_id=?", id)
+	ids, err := query.SelectIntegers(ctx, c.tx, "SELECT image_id FROM images_nodes WHERE node_id=?", id)
 	if err != nil {
 		return err
 	}
@@ -1031,13 +1047,15 @@ func (c *ClusterTx) ClearNode(id int64) error {
 
 	// Delete the image as well if this was the only node with it.
 	for _, id := range ids {
-		count, err := query.Count(c.tx, "images_nodes", "image_id=?", id)
+		count, err := query.Count(ctx, c.tx, "images_nodes", "image_id=?", id)
 		if err != nil {
 			return err
 		}
+
 		if count > 0 {
 			continue
 		}
+
 		_, err = c.tx.Exec("DELETE FROM images WHERE id=?", id)
 		if err != nil {
 			return err
@@ -1050,20 +1068,22 @@ func (c *ClusterTx) ClearNode(id int64) error {
 // GetNodeOfflineThreshold returns the amount of time that needs to elapse after
 // which a series of unsuccessful heartbeat will make the node be considered
 // offline.
-func (c *ClusterTx) GetNodeOfflineThreshold() (time.Duration, error) {
+func (c *ClusterTx) GetNodeOfflineThreshold(ctx context.Context) (time.Duration, error) {
 	threshold := time.Duration(DefaultOfflineThreshold) * time.Second
-	values, err := query.SelectStrings(
-		c.tx, "SELECT value FROM config WHERE key='cluster.offline_threshold'")
+	values, err := query.SelectStrings(ctx, c.tx, "SELECT value FROM config WHERE key='cluster.offline_threshold'")
 	if err != nil {
 		return -1, err
 	}
+
 	if len(values) > 0 {
 		seconds, err := strconv.Atoi(values[0])
 		if err != nil {
 			return -1, err
 		}
+
 		threshold = time.Duration(seconds) * time.Second
 	}
+
 	return threshold, nil
 }
 
@@ -1071,13 +1091,13 @@ func (c *ClusterTx) GetNodeOfflineThreshold() (time.Duration, error) {
 // the least number of containers (either already created or being created with
 // an operation). If archs is not empty, then return only nodes with an
 // architecture in that list.
-func (c *ClusterTx) GetNodeWithLeastInstances(archs []int, defaultArch int, group string, allowedGroups []string) (string, error) {
-	threshold, err := c.GetNodeOfflineThreshold()
+func (c *ClusterTx) GetNodeWithLeastInstances(ctx context.Context, archs []int, defaultArch int, group string, allowedGroups []string) (string, error) {
+	threshold, err := c.GetNodeOfflineThreshold(ctx)
 	if err != nil {
 		return "", fmt.Errorf("Failed to get offline threshold: %w", err)
 	}
 
-	nodes, err := c.GetNodes()
+	nodes, err := c.GetNodes(ctx)
 	if err != nil {
 		return "", fmt.Errorf("Failed to get current cluster members: %w", err)
 	}
@@ -1136,6 +1156,7 @@ func (c *ClusterTx) GetNodeWithLeastInstances(archs []int, defaultArch int, grou
 			if shared.IntInSlice(entry, archs) {
 				match = true
 			}
+
 			if entry == defaultArch {
 				isDefaultArch = true
 			}
@@ -1143,25 +1164,25 @@ func (c *ClusterTx) GetNodeWithLeastInstances(archs []int, defaultArch int, grou
 		if len(archs) > 0 && !match {
 			continue
 		}
+
 		if !isDefaultArch && isDefaultArchChosen {
 			continue
 		}
 
 		// Fetch the number of instances already created on this node.
-		created, err := query.Count(c.tx, "instances", "node_id=?", node.ID)
+		created, err := query.Count(ctx, c.tx, "instances", "node_id=?", node.ID)
 		if err != nil {
 			return "", fmt.Errorf("Failed to get instances count: %w", err)
 		}
 
 		// Fetch the number of instances currently being created on this node.
-		pending, err := query.Count(
-			c.tx, "operations", "node_id=? AND type=?", node.ID, OperationInstanceCreate)
+		pending, err := query.Count(ctx, c.tx, "operations", "node_id=? AND type=?", node.ID, operationtype.InstanceCreate)
 		if err != nil {
 			return "", fmt.Errorf("Failed to get pending instances count: %w", err)
 		}
 
 		count := created + pending
-		if containers == -1 || count < containers || (isDefaultArch == true && isDefaultArchChosen == false) {
+		if containers == -1 || count < containers || (isDefaultArch && !isDefaultArchChosen) {
 			containers = count
 			name = node.Name
 			if isDefaultArch {
@@ -1201,17 +1222,17 @@ func nodeIsOffline(threshold time.Duration, heartbeat time.Time) bool {
 	return heartbeat.Before(offlineTime) || heartbeat.Equal(offlineTime)
 }
 
-// LocalNodeIsEvacuated returns whether the local node is in the evacuated state.
+// LocalNodeIsEvacuated returns whether the local member is in the evacuated state.
 func (c *Cluster) LocalNodeIsEvacuated() bool {
 	isEvacuated := false
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		name, err := tx.GetLocalNodeName()
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		name, err := tx.GetLocalNodeName(ctx)
 		if err != nil {
 			return err
 		}
 
-		node, err := tx.GetNodeByName(name)
+		node, err := tx.GetNodeByName(ctx, name)
 		if err != nil {
 			return nil
 		}

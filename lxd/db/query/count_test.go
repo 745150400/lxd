@@ -1,42 +1,45 @@
 package query_test
 
 import (
+	"context"
 	"database/sql"
 	"strconv"
 	"testing"
 
-	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lxc/lxd/lxd/db/query"
 )
 
 // Count returns the current number of rows.
 func TestCount(t *testing.T) {
 	cases := []struct {
 		where string
-		args  []interface{}
+		args  []any
 		count int
 	}{
 		{
 			"id=?",
-			[]interface{}{999},
+			[]any{999},
 			0,
 		},
 		{
 			"id=?",
-			[]interface{}{1},
+			[]any{1},
 			1,
 		},
 		{
 			"",
-			[]interface{}{},
+			[]any{},
 			2,
 		},
 	}
+
 	for _, c := range cases {
 		t.Run(strconv.Itoa(c.count), func(t *testing.T) {
 			tx := newTxForCount(t)
-			count, err := query.Count(tx, "test", c.where, c.args...)
+			count, err := query.Count(context.Background(), tx, "test", c.where, c.args...)
 			require.NoError(t, err)
 			assert.Equal(t, c.count, count)
 		})
@@ -45,9 +48,9 @@ func TestCount(t *testing.T) {
 
 func TestCountAll(t *testing.T) {
 	tx := newTxForCount(t)
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
-	counts, err := query.CountAll(tx)
+	counts, err := query.CountAll(context.Background(), tx)
 	require.NoError(t, err)
 
 	assert.Equal(t, map[string]int{

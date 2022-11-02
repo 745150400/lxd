@@ -1,19 +1,20 @@
 package cluster_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/shared/osarch"
 	"github.com/lxc/lxd/shared/version"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // If the node is not clustered, the schema updates works normally.
@@ -85,6 +86,7 @@ func TestEnsureSchema_ClusterNotUpgradable(t *testing.T) {
 			"nodes have inconsistent versions",
 		},
 	}
+
 	for _, c := range cases {
 		t.Run(c.title, func(t *testing.T) {
 			db := newDB(t)
@@ -122,6 +124,7 @@ func TestEnsureSchema_UpdateNodeVersion(t *testing.T) {
 			true,
 		},
 	}
+
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%v", c.ready), func(t *testing.T) {
 			db := newDB(t)
@@ -163,7 +166,7 @@ CREATE TABLE schema (
 
 // Add a new node with the given address, schema version and number of api extensions.
 func addNode(t *testing.T, db *sql.DB, address string, schema int, apiExtensions int) {
-	err := query.Transaction(db, func(tx *sql.Tx) error {
+	err := query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
 		stmt := `
 INSERT INTO nodes(name, address, schema, api_extensions, arch, description) VALUES (?, ?, ?, ?, ?, '')
 `
@@ -177,9 +180,9 @@ INSERT INTO nodes(name, address, schema, api_extensions, arch, description) VALU
 // Assert that the node with the given address has the given schema version and API
 // extensions number.
 func assertNode(t *testing.T, db *sql.DB, address string, schema int, apiExtensions int) {
-	err := query.Transaction(db, func(tx *sql.Tx) error {
+	err := query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
 		where := "address=? AND schema=? AND api_extensions=?"
-		n, err := query.Count(tx, "nodes", where, address, schema, apiExtensions)
+		n, err := query.Count(ctx, tx, "nodes", where, address, schema, apiExtensions)
 		assert.Equal(t, 1, n, "node does not have expected version")
 		return err
 	})
@@ -190,7 +193,7 @@ func assertNode(t *testing.T, db *sql.DB, address string, schema int, apiExtensi
 func newDir(t *testing.T) (string, func()) {
 	t.Helper()
 
-	dir, err := ioutil.TempDir("", "dqlite-replication-test-")
+	dir, err := os.MkdirTemp("", "dqlite-replication-test-")
 	assert.NoError(t, err)
 
 	cleanup := func() {

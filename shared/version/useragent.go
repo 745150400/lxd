@@ -5,10 +5,13 @@ import (
 	"runtime"
 	"strings"
 
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
 	"github.com/lxc/lxd/shared/osarch"
 )
 
-// UserAgent contains a string suitable as a user-agent
+// UserAgent contains a string suitable as a user-agent.
 var UserAgent = getUserAgent()
 var userAgentStorageBackends []string
 var userAgentFeatures []string
@@ -24,7 +27,7 @@ func getUserAgent() string {
 		panic(err)
 	}
 
-	osTokens := []string{strings.Title(runtime.GOOS), arch}
+	osTokens := []string{cases.Title(language.English).String(runtime.GOOS), arch}
 	osTokens = append(osTokens, getPlatformVersionStrings()...)
 
 	// Initial version string
@@ -46,13 +49,13 @@ func getUserAgent() string {
 	return agent
 }
 
-// UserAgentStorageBackends updates the list of storage backends to include in the user-agent
+// UserAgentStorageBackends updates the list of storage backends to include in the user-agent.
 func UserAgentStorageBackends(backends []string) {
 	userAgentStorageBackends = backends
 	UserAgent = getUserAgent()
 }
 
-// UserAgentFeatures updates the list of advertised features
+// UserAgentFeatures updates the list of advertised features.
 func UserAgentFeatures(features []string) {
 	userAgentFeatures = features
 	UserAgent = getUserAgent()

@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 
 	fsn "github.com/fsnotify/fsnotify"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/logger"
 )
 
 var fsnotifyLoaded bool
@@ -35,7 +35,7 @@ func (d *fsnotify) load(ctx context.Context) error {
 
 	err = d.watchFSTree(d.prefixPath)
 	if err != nil {
-		d.watcher.Close()
+		_ = d.watcher.Close()
 		fsnotifyLoaded = false
 		return fmt.Errorf("Failed to watch directory %q: %w", d.prefixPath, err)
 	}
@@ -52,7 +52,7 @@ func (d *fsnotify) getEvents(ctx context.Context) {
 		select {
 		// Clean up if context is done
 		case <-ctx.Done():
-			d.watcher.Close()
+			_ = d.watcher.Close()
 			fsnotifyLoaded = false
 			return
 		case event := <-d.watcher.Events:
@@ -67,7 +67,7 @@ func (d *fsnotify) getEvents(ctx context.Context) {
 			stat, err := os.Lstat(event.Name)
 			if err == nil && stat.IsDir() {
 				if event.Op&fsn.Create != 0 {
-					d.watchFSTree(event.Name)
+					_ = d.watchFSTree(event.Name)
 				}
 
 				// Check whether there's a watch on a specific file or directory.
@@ -124,9 +124,10 @@ func (d *fsnotify) getEvents(ctx context.Context) {
 
 				break
 			}
+
 			d.mu.Unlock()
 		case err := <-d.watcher.Errors:
-			d.logger.Error("Received event error", log.Ctx{"err": err})
+			d.logger.Error("Received event error", logger.Ctx{"err": err})
 		}
 	}
 }
@@ -139,7 +140,11 @@ func (d *fsnotify) watchFSTree(path string) error {
 	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
 		// Check for errors here as we only care about directories. Files and symlinks aren't of interest for this.
 		if err != nil {
-			d.logger.Warn("Error visiting path", log.Ctx{"path": path, "err": err})
+			if os.IsPermission(err) {
+				return nil
+			}
+
+			d.logger.Warn("Error visiting path", logger.Ctx{"path": path, "err": err})
 			return nil
 		}
 
@@ -151,7 +156,7 @@ func (d *fsnotify) watchFSTree(path string) error {
 		// Only watch on real paths.
 		err = d.watcher.Add(path)
 		if err != nil {
-			d.logger.Warn("Failed to watch path", log.Ctx{"path": path, "err": err})
+			d.logger.Warn("Failed to watch path", logger.Ctx{"path": path, "err": err})
 			return nil
 		}
 

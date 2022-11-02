@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -106,13 +106,21 @@ func instanceLogsGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to a container on a different node
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
@@ -125,7 +133,7 @@ func instanceLogsGet(d *Daemon, r *http.Request) response.Response {
 	result := []string{}
 
 	fullName := project.Instance(projectName, name)
-	dents, err := ioutil.ReadDir(shared.LogPath(fullName))
+	dents, err := os.ReadDir(shared.LogPath(fullName))
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -192,7 +200,14 @@ func instanceLogGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Ensure instance exists.
 	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
@@ -205,11 +220,15 @@ func instanceLogGet(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
 
-	file := mux.Vars(r)["file"]
+	file, err := url.PathUnescape(mux.Vars(r)["file"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	err = instance.ValidName(name, false)
 	if err != nil {
@@ -263,7 +282,14 @@ func instanceLogDelete(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Ensure instance exists.
 	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
@@ -276,11 +302,15 @@ func instanceLogDelete(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
 
-	file := mux.Vars(r)["file"]
+	file, err := url.PathUnescape(mux.Vars(r)["file"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	err = instance.ValidName(name, false)
 	if err != nil {
@@ -303,5 +333,4 @@ func instanceLogDelete(d *Daemon, r *http.Request) response.Response {
 	d.State().Events.SendLifecycle(projectName, lifecycle.InstanceLogDeleted.Event(file, inst, request.CreateRequestor(r), nil))
 
 	return response.EmptySyncResponse
-
 }

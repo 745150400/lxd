@@ -1,28 +1,64 @@
 package drivers
 
 import (
+	"bufio"
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"unsafe"
 
+	"github.com/pborman/uuid"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v2"
 
 	"github.com/lxc/lxd/lxd/backup"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/ioprogress"
 	"github.com/lxc/lxd/shared/logger"
 )
 
-// Errors
+// Errors.
 var errBtrfsNoQuota = fmt.Errorf("Quotas disabled on filesystem")
 var errBtrfsNoQGroup = fmt.Errorf("Unable to find quota group")
+
+// setReceivedUUID sets the "Received UUID" field on a subvolume with the given path using ioctl.
+func setReceivedUUID(path string, UUID string) error {
+	type btrfsIoctlReceivedSubvolArgs struct {
+		uuid [16]byte
+		_    [22]uint64 // padding
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("Failed opening %s: %w", path, err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	args := btrfsIoctlReceivedSubvolArgs{}
+
+	binUUID, err := uuid.Parse(UUID).MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("Failed coverting UUID: %w", err)
+	}
+
+	copy(args.uuid[:], binUUID)
+
+	// 0xC0C09425 = _IOWR(BTRFS_IOCTL_MAGIC, 37, struct btrfs_ioctl_received_subvol_args)
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), 0xC0C09425, uintptr(unsafe.Pointer(&args)))
+	if errno != 0 {
+		return fmt.Errorf("Failed setting received UUID: %w", unix.Errno(errno))
+	}
+
+	return nil
+}
 
 func (d *btrfs) getMountOptions() string {
 	// Allow overriding the default options.
@@ -113,13 +149,14 @@ func (d *btrfs) snapshotSubvolume(path string, dest string, recursion bool) erro
 		if err != nil {
 			return err
 		}
-		sort.Sort(sort.StringSlice(subSubVols))
+
+		sort.Strings(subSubVols)
 
 		for _, subSubVol := range subSubVols {
 			subSubVolSnapPath := filepath.Join(dest, subSubVol)
 
 			// Clear the target for the subvol to use.
-			os.Remove(subSubVolSnapPath)
+			_ = os.Remove(subSubVolSnapPath)
 
 			err := snapshot(filepath.Join(path, subSubVol), subSubVolSnapPath)
 			if err != nil {
@@ -137,12 +174,12 @@ func (d *btrfs) deleteSubvolume(rootPath string, recursion bool) error {
 		// Attempt (but don't fail on) to delete any qgroup on the subvolume.
 		qgroup, _, err := d.getQGroup(path)
 		if err == nil {
-			shared.RunCommand("btrfs", "qgroup", "destroy", qgroup, path)
+			_, _ = shared.RunCommand("btrfs", "qgroup", "destroy", qgroup, path)
 		}
 
 		// Temporarily change ownership & mode to help with nesting.
-		os.Chmod(path, 0700)
-		os.Chown(path, 0, 0)
+		_ = os.Chmod(path, 0700)
+		_ = os.Chown(path, 0, 0)
 
 		// Delete the subvolume itself.
 		_, err = shared.RunCommand("btrfs", "subvolume", "delete", path)
@@ -241,6 +278,7 @@ func (d *btrfs) sendSubvolume(path string, parent string, conn io.ReadWriteClose
 	if parent != "" {
 		args = append(args, "-p", parent)
 	}
+
 	args = append(args, path)
 	cmd := exec.Command("btrfs", args...)
 
@@ -269,8 +307,8 @@ func (d *btrfs) sendSubvolume(path string, parent string, conn io.ReadWriteClose
 	go func() {
 		_, err := io.Copy(conn, stdoutPipe)
 		chStdoutPipe <- err
-		conn.Close()
-		cmd.Process.Kill() // This closes stderr.
+		_ = conn.Close()
+		_ = cmd.Process.Kill() // This closes stderr.
 	}()
 
 	// Run the command.
@@ -280,7 +318,7 @@ func (d *btrfs) sendSubvolume(path string, parent string, conn io.ReadWriteClose
 	}
 
 	// Read any error.
-	output, err := ioutil.ReadAll(stderr)
+	output, err := io.ReadAll(stderr)
 	if err != nil {
 		logger.Errorf("Problem reading btrfs send stderr: %s", err)
 	}
@@ -317,6 +355,7 @@ func (d *btrfs) setSubvolumeReadonlyProperty(path string, readonly bool) error {
 	if btrfsPropertyForce {
 		args = append(args, "-f")
 	}
+
 	args = append(args, "-ts", path, "ro", fmt.Sprintf("%t", readonly))
 
 	_, err := shared.RunCommand("btrfs", args...)
@@ -329,6 +368,7 @@ type BTRFSSubVolume struct {
 	Path     string `json:"path" yaml:"path"`         // Path inside the volume where the subvolume belongs (so / is the top of the volume tree).
 	Snapshot string `json:"snapshot" yaml:"snapshot"` // Snapshot name the subvolume belongs to.
 	Readonly bool   `json:"readonly" yaml:"readonly"` // Is the sub volume read only or not.
+	UUID     string `json:"uuid" yaml:"uuid"`         // The subvolume UUID.
 }
 
 // getSubvolumesMetaData retrieves subvolume meta data with paths relative to the root volume.
@@ -338,7 +378,7 @@ func (d *btrfs) getSubvolumesMetaData(vol Volume) ([]BTRFSSubVolume, error) {
 
 	snapName := ""
 	if vol.IsSnapshot() {
-		_, snapName, _ = shared.InstanceGetParentAndSnapshotName(vol.name)
+		_, snapName, _ = api.GetParentAndSnapshotName(vol.name)
 	}
 
 	// Add main root volume to subvolumes list first.
@@ -353,7 +393,8 @@ func (d *btrfs) getSubvolumesMetaData(vol Volume) ([]BTRFSSubVolume, error) {
 	if err != nil {
 		return nil, err
 	}
-	sort.Sort(sort.StringSlice(subVolPaths))
+
+	sort.Strings(subVolPaths)
 
 	// Add any subvolumes under the root subvolume with relative path to root.
 	for _, subVolPath := range subVolPaths {
@@ -364,7 +405,70 @@ func (d *btrfs) getSubvolumesMetaData(vol Volume) ([]BTRFSSubVolume, error) {
 		})
 	}
 
+	stdout := strings.Builder{}
+
+	poolMountPath := GetPoolMountPath(vol.pool)
+
+	if !d.state.OS.RunningInUserNS {
+		// List all subvolumes in the given filesystem with their UUIDs and received UUIDs.
+		err = shared.RunCommandWithFds(context.TODO(), nil, &stdout, "btrfs", "subvolume", "list", "-u", "-R", poolMountPath)
+		if err != nil {
+			return nil, err
+		}
+
+		uuidMap := make(map[string]string)
+		receivedUUIDMap := make(map[string]string)
+
+		scanner := bufio.NewScanner(strings.NewReader(stdout.String()))
+
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+
+			if len(fields) != 13 {
+				continue
+			}
+
+			uuidMap[filepath.Join(poolMountPath, fields[12])] = fields[10]
+
+			if fields[8] != "-" {
+				receivedUUIDMap[filepath.Join(poolMountPath, fields[12])] = fields[8]
+			}
+		}
+
+		for i, subVol := range subVols {
+			subVols[i].UUID = uuidMap[filepath.Join(vol.MountPath(), subVol.Path)]
+		}
+	}
+
 	return subVols, nil
+}
+
+func (d *btrfs) getSubVolumeReceivedUUID(vol Volume) (string, error) {
+	stdout := strings.Builder{}
+
+	poolMountPath := GetPoolMountPath(vol.pool)
+
+	// List all subvolumes in the given filesystem with their UUIDs.
+	err := shared.RunCommandWithFds(context.TODO(), nil, &stdout, "btrfs", "subvolume", "list", "-R", poolMountPath)
+	if err != nil {
+		return "", err
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(stdout.String()))
+
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+
+		if len(fields) != 11 {
+			continue
+		}
+
+		if vol.MountPath() == filepath.Join(poolMountPath, fields[10]) && fields[8] != "-" {
+			return fields[8], nil
+		}
+	}
+
+	return "", nil
 }
 
 // BTRFSMetaDataHeader is the meta data header about the volumes being sent/stored.
@@ -424,6 +528,7 @@ func (d *btrfs) loadOptimizedBackupHeader(r io.ReadSeeker, mountPath string) (*B
 	if err != nil {
 		return nil, err
 	}
+
 	defer cancelFunc()
 
 	for {
@@ -431,6 +536,7 @@ func (d *btrfs) loadOptimizedBackupHeader(r io.ReadSeeker, mountPath string) (*B
 		if err == io.EOF {
 			break // End of archive.
 		}
+
 		if err != nil {
 			return nil, fmt.Errorf("Error reading backup file for optimized backup header file: %w", err)
 		}
@@ -449,40 +555,48 @@ func (d *btrfs) loadOptimizedBackupHeader(r io.ReadSeeker, mountPath string) (*B
 	return nil, fmt.Errorf("Optimized backup header file not found")
 }
 
-// receiveSubVolume receives a subvolume from an io.Reader into the receivePath, then sets it writable and returns
-// the path to the received subvolume.
+// receiveSubVolume receives a subvolume from an io.Reader into the receivePath and returns the path to the received subvolume.
 func (d *btrfs) receiveSubVolume(r io.Reader, receivePath string) (string, error) {
-	// Check target path is empty before receive.
-	files, err := ioutil.ReadDir(receivePath)
+	files, err := os.ReadDir(receivePath)
 	if err != nil {
 		return "", fmt.Errorf("Failed listing contents of %q: %w", receivePath, err)
 	}
-	if len(files) > 0 {
-		return "", fmt.Errorf("Target path is not empty %q", receivePath)
-	}
 
-	err = shared.RunCommandWithFds(r, nil, "btrfs", "receive", "-e", receivePath)
+	err = shared.RunCommandWithFds(context.TODO(), r, nil, "btrfs", "receive", "-e", receivePath)
 	if err != nil {
 		return "", err
 	}
 
 	// Check contents of target path is expected after receive.
-	files, err = ioutil.ReadDir(receivePath)
+	newFiles, err := os.ReadDir(receivePath)
 	if err != nil {
 		return "", fmt.Errorf("Failed listing contents of %q: %w", receivePath, err)
 	}
 
-	if len(files) != 1 {
-		return "", fmt.Errorf("Unpack target path contains %d files, expected 1 file after unpack", len(files))
+	filename := ""
+
+	// Identify the latest received path.
+	for _, a := range newFiles {
+		found := false
+
+		for _, b := range files {
+			if a.Name() == b.Name() {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			filename = a.Name()
+			break
+		}
 	}
 
-	subVolPath := filepath.Join(receivePath, files[0].Name())
-
-	// Set writable to allow subvolume to be moved (or deleted if needed) later.
-	err = d.setSubvolumeReadonlyProperty(subVolPath, false)
-	if err != nil {
-		return "", err
+	if filename == "" {
+		return "", fmt.Errorf("Failed to determine received subvolume")
 	}
+
+	subVolPath := filepath.Join(receivePath, filename)
 
 	return subVolPath, nil
 }

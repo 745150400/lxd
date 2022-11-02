@@ -19,6 +19,7 @@ func CompareConfigs(config1, config2 map[string]string, exclude []string) error 
 		if shared.StringInSlice(key, exclude) {
 			continue
 		}
+
 		if config2[key] != value {
 			delta = append(delta, key)
 		}
@@ -27,19 +28,21 @@ func CompareConfigs(config1, config2 map[string]string, exclude []string) error 
 		if shared.StringInSlice(key, exclude) {
 			continue
 		}
+
 		if config1[key] != value {
 			present := false
 			for i := range delta {
 				if delta[i] == key {
 					present = true
+					break
 				}
-				break
 			}
 			if !present {
 				delta = append(delta, key)
 			}
 		}
 	}
+
 	sort.Strings(delta)
 	if len(delta) > 0 {
 		return fmt.Errorf("different values for keys: %s", strings.Join(delta, ", "))
@@ -56,20 +59,4 @@ func CopyConfig(config map[string]string) map[string]string {
 	}
 
 	return copy
-}
-
-// SplitNTrimSpace returns result of strings.SplitN() and then strings.TrimSpace() on each element.
-// Accepts nilIfEmpty argument which if true, will return nil slice if s is empty (after trimming space).
-func SplitNTrimSpace(s string, sep string, n int, nilIfEmpty bool) []string {
-	if nilIfEmpty && strings.TrimSpace(s) == "" {
-		return nil
-	}
-
-	parts := strings.SplitN(s, sep, n)
-
-	for i, v := range parts {
-		parts[i] = strings.TrimSpace(v)
-	}
-
-	return parts
 }

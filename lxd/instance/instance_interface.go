@@ -1,19 +1,21 @@
 package instance
 
 import (
+	"crypto/x509"
 	"io"
 	"net"
 	"os"
 	"time"
 
+	liblxc "github.com/lxc/go-lxc"
 	"github.com/pkg/sftp"
-	liblxc "gopkg.in/lxc/go-lxc.v2"
 
 	"github.com/lxc/lxd/lxd/backup"
 	"github.com/lxc/lxd/lxd/cgroup"
 	"github.com/lxc/lxd/lxd/db"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
+	"github.com/lxc/lxd/lxd/instance/operationlock"
 	"github.com/lxc/lxd/lxd/metrics"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/shared/api"
@@ -49,7 +51,7 @@ const TemplateTriggerRename TemplateTrigger = "rename"
 
 // ConfigReader is used to read instance config.
 type ConfigReader interface {
-	Project() string
+	Project() api.Project
 	Type() instancetype.Type
 	Architecture() int
 	ExpandedConfig() map[string]string
@@ -89,9 +91,6 @@ type Instance interface {
 	Delete(force bool) error
 	Export(w io.Writer, properties map[string]string, expiration time.Time) (api.ImageMetadata, error)
 
-	// Used for security.
-	DevPaths() []string
-
 	// Live configuration.
 	CGroup() (*cgroup.CGroup, error)
 	VolatileSet(changes map[string]string) error
@@ -105,14 +104,15 @@ type Instance interface {
 	Exec(req api.InstanceExecPost, stdin *os.File, stdout *os.File, stderr *os.File) (Cmd, error)
 
 	// Status
-	Render(options ...func(response interface{}) error) (interface{}, interface{}, error)
-	RenderFull() (*api.InstanceFull, interface{}, error)
-	RenderState() (*api.InstanceState, error)
+	Render(options ...func(response any) error) (any, any, error)
+	RenderFull(hostInterfaces []net.Interface) (*api.InstanceFull, any, error)
+	RenderState(hostInterfaces []net.Interface) (*api.InstanceState, error)
 	IsRunning() bool
 	IsFrozen() bool
 	IsEphemeral() bool
 	IsSnapshot() bool
 	IsStateful() bool
+	LockExclusive() (*operationlock.InstanceOperation, error)
 
 	// Hooks.
 	DeviceEventHandler(*deviceConfig.RunConfig) error
@@ -127,7 +127,7 @@ type Instance interface {
 	CreationDate() time.Time
 	LastUsedDate() time.Time
 
-	Profiles() []string
+	Profiles() []api.Profile
 	InitPID() int
 	State() string
 	ExpiryDate() time.Time
@@ -156,7 +156,7 @@ type Instance interface {
 
 	DeferTemplateApply(trigger TemplateTrigger) error
 
-	Metrics() (*metrics.MetricSet, error)
+	Metrics(hostInterfaces []net.Interface) (*metrics.MetricSet, error)
 }
 
 // Container interface is for container specific functions.
@@ -170,6 +170,13 @@ type Container interface {
 	InsertSeccompUnixDevice(prefix string, m deviceConfig.Device, pid int) error
 	DevptsFd() (*os.File, error)
 	IdmappedStorage(path string) idmap.IdmapStorageType
+}
+
+// VM interface is for VM specific functions.
+type VM interface {
+	Instance
+
+	AgentCertificate() *x509.Certificate
 }
 
 // CriuMigrationArgs arguments for CRIU migration.

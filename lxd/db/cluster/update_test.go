@@ -1,17 +1,19 @@
 package cluster_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"testing"
 	"time"
 
-	"github.com/lxc/lxd/lxd/db/cluster"
-	"github.com/lxc/lxd/lxd/db/query"
-	"github.com/lxc/lxd/shared/osarch"
 	"github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/db/query"
+	"github.com/lxc/lxd/shared/osarch"
 )
 
 func TestUpdateFromV0(t *testing.T) {
@@ -72,13 +74,13 @@ func TestUpdateFromV1_Containers(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = db.Exec(`
-INSERT INTO containers VALUES (1, 1, 'focal', 1, 1, 0, ?, 0, ?, 'Focal Fossa')
+INSERT INTO containers VALUES (1, 1, 'jammy', 1, 1, 0, ?, 0, ?, 'Jammy Jellyfish')
 `, time.Now(), time.Now())
 	require.NoError(t, err)
 
 	// Unique constraint on name
 	_, err = db.Exec(`
-INSERT INTO containers VALUES (2, 2, 'focal', 2, 2, 1, ?, 1, ?, 'Ubuntu LTS')
+INSERT INTO containers VALUES (2, 2, 'jammy', 2, 2, 1, ?, 1, ?, 'Ubuntu LTS')
 `, time.Now(), time.Now())
 	require.Error(t, err)
 
@@ -92,7 +94,6 @@ INSERT INTO containers VALUES (2, 2, 'focal', 2, 2, 1, ?, 1, ?, 'Ubuntu LTS')
 	n, err := result.RowsAffected()
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), n) // The row was already deleted by the previous query
-
 }
 
 func TestUpdateFromV1_Network(t *testing.T) {
@@ -266,29 +267,29 @@ func TestUpdateFromV5(t *testing.T) {
 	// Check that a volume row for n2 was added for v1 on p2.
 	tx, err := db.Begin()
 	require.NoError(t, err)
-	defer tx.Rollback()
-	nodeIDs, err := query.SelectIntegers(tx, `
+	defer func() { _ = tx.Rollback() }()
+	nodeIDs, err := query.SelectIntegers(context.Background(), tx, `
 SELECT node_id FROM storage_volumes WHERE storage_pool_id=2 AND name='v1' ORDER BY node_id
 `)
 	require.NoError(t, err)
 	require.Equal(t, []int{1, 2}, nodeIDs)
 
 	// Check that a volume row for n1 was added for v2 on p2.
-	nodeIDs, err = query.SelectIntegers(tx, `
+	nodeIDs, err = query.SelectIntegers(context.Background(), tx, `
 SELECT node_id FROM storage_volumes WHERE storage_pool_id=2 AND name='v2' ORDER BY node_id
 `)
 	require.NoError(t, err)
 	require.Equal(t, []int{1, 2}, nodeIDs)
 
 	// Check that the config for volume v1 on p2 was duplicated.
-	volumeIDs, err := query.SelectIntegers(tx, `
+	volumeIDs, err := query.SelectIntegers(context.Background(), tx, `
 SELECT id FROM storage_volumes WHERE storage_pool_id=2 AND name='v1' ORDER BY id
 `)
 	require.NoError(t, err)
 	require.Equal(t, []int{2, 4}, volumeIDs)
-	config1, err := query.SelectConfig(tx, "storage_volumes_config", "storage_volume_id=?", volumeIDs[0])
+	config1, err := query.SelectConfig(context.Background(), tx, "storage_volumes_config", "storage_volume_id=?", volumeIDs[0])
 	require.NoError(t, err)
-	config2, err := query.SelectConfig(tx, "storage_volumes_config", "storage_volume_id=?", volumeIDs[1])
+	config2, err := query.SelectConfig(context.Background(), tx, "storage_volumes_config", "storage_volume_id=?", volumeIDs[1])
 	require.NoError(t, err)
 	require.Equal(t, config1, config2)
 }
@@ -332,18 +333,18 @@ INSERT INTO storage_pools_config(storage_pool_id, node_id, key, value)
 
 	tx, err := db.Begin()
 	require.NoError(t, err)
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Check the zfs.pool_name config is now node-specific.
 	for _, nodeID := range []int{1, 2} {
-		config, err := query.SelectConfig(
+		config, err := query.SelectConfig(context.Background(),
 			tx, "storage_pools_config", "storage_pool_id=1 AND node_id=?", nodeID)
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{"zfs.pool_name": "my-pool"}, config)
 	}
 
 	// Check the zfs.clone_copy is still global
-	config, err := query.SelectConfig(
+	config, err := query.SelectConfig(context.Background(),
 		tx, "storage_pools_config", "storage_pool_id=2 AND node_id IS NULL")
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{"zfs.clone_copy": "true"}, config)
@@ -368,9 +369,9 @@ func TestUpdateFromV9(t *testing.T) {
 	tx, err := db.Begin()
 	require.NoError(t, err)
 
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
-	types, err := query.SelectIntegers(tx, `SELECT type FROM operations`)
+	types, err := query.SelectIntegers(context.Background(), tx, `SELECT type FROM operations`)
 	require.NoError(t, err)
 	require.Equal(t, []int{0}, types)
 }
@@ -416,24 +417,23 @@ INSERT INTO profiles_devices_config VALUES(3, 2, 'path', '/');
 INSERT INTO profiles_devices_config VALUES(4, 2, 'pool', 'default');
 `, time.Now())
 		require.NoError(t, err)
-
 	})
 	require.NoError(t, err)
 
 	tx, err := db.Begin()
 	require.NoError(t, err)
 
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Check that a project_id column has been added to the various talbles
 	// and that existing rows default to 1 (the ID of the default project).
 	for _, table := range []string{"containers", "images", "images_aliases"} {
-		count, err := query.Count(tx, table, "")
+		count, err := query.Count(context.Background(), tx, table, "")
 		require.NoError(t, err)
 		assert.Equal(t, 1, count)
 
 		stmt := fmt.Sprintf("SELECT project_id FROM %s", table)
-		ids, err := query.SelectIntegers(tx, stmt)
+		ids, err := query.SelectIntegers(context.Background(), tx, stmt)
 		require.NoError(t, err)
 		assert.Equal(t, []int{1}, ids)
 	}
@@ -485,10 +485,10 @@ INSERT INTO containers VALUES (1, 1, 'eoan', 1, 1, 0, ?, 0, ?, 'Eoan Ermine', 1,
 	tx, err := db.Begin()
 	require.NoError(t, err)
 
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Check that the new instances table can be queried.
-	count, err := query.Count(tx, "instances", "")
+	count, err := query.Count(context.Background(), tx, "instances", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 }
@@ -526,7 +526,6 @@ INSERT INTO instances VALUES (2, 1, 'eoan/snap', 2, 1, 0, ?, 0, ?, 'Eoan Ermine 
 		require.NoError(t, err)
 		_, err = db.Exec("INSERT INTO instances_devices_config VALUES (2, 2, 'k', 'v')")
 		require.NoError(t, err)
-
 	})
 
 	require.NoError(t, err)
@@ -534,54 +533,54 @@ INSERT INTO instances VALUES (2, 1, 'eoan/snap', 2, 1, 0, ?, 0, ?, 'Eoan Ermine 
 	tx, err := db.Begin()
 	require.NoError(t, err)
 
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Check that snapshots were migrated to the new tables.
-	count, err := query.Count(tx, "instances", "")
+	count, err := query.Count(context.Background(), tx, "instances", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	count, err = query.Count(tx, "instances_config", "")
+	count, err = query.Count(context.Background(), tx, "instances_config", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	count, err = query.Count(tx, "instances_devices", "")
+	count, err = query.Count(context.Background(), tx, "instances_devices", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	count, err = query.Count(tx, "instances_devices_config", "")
+	count, err = query.Count(context.Background(), tx, "instances_devices_config", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	count, err = query.Count(tx, "instances_snapshots", "")
+	count, err = query.Count(context.Background(), tx, "instances_snapshots", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	count, err = query.Count(tx, "instances_snapshots_config", "")
+	count, err = query.Count(context.Background(), tx, "instances_snapshots_config", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	count, err = query.Count(tx, "instances_snapshots_devices", "")
+	count, err = query.Count(context.Background(), tx, "instances_snapshots_devices", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	count, err = query.Count(tx, "instances_snapshots_devices_config", "")
+	count, err = query.Count(context.Background(), tx, "instances_snapshots_devices_config", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	config, err := query.SelectConfig(tx, "instances_config", "id = 1")
+	config, err := query.SelectConfig(context.Background(), tx, "instances_config", "id = 1")
 	require.NoError(t, err)
 	assert.Equal(t, config, map[string]string{"key": "value2"})
 
-	config, err = query.SelectConfig(tx, "instances_snapshots_config", "id = 1")
+	config, err = query.SelectConfig(context.Background(), tx, "instances_snapshots_config", "id = 1")
 	require.NoError(t, err)
 	assert.Equal(t, config, map[string]string{"key": "value1"})
 
-	config, err = query.SelectConfig(tx, "instances_devices_config", "id = 1")
+	config, err = query.SelectConfig(context.Background(), tx, "instances_devices_config", "id = 1")
 	require.NoError(t, err)
 	assert.Equal(t, config, map[string]string{"k": "v"})
 
-	config, err = query.SelectConfig(tx, "instances_snapshots_devices_config", "id = 1")
+	config, err = query.SelectConfig(context.Background(), tx, "instances_snapshots_devices_config", "id = 1")
 	require.NoError(t, err)
 	assert.Equal(t, config, map[string]string{"k": "v"})
 }
@@ -596,7 +595,7 @@ func TestUpdateFromV19(t *testing.T) {
 		require.NoError(t, err)
 	})
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	expectedArch, err := osarch.ArchitectureGetLocalID()
 	require.NoError(t, err)
@@ -616,6 +615,7 @@ VALUES (2, 'n2', '', '2.2.3.4:666', 1, 32, ?, 0)`, time.Now())
 	if err == nil {
 		t.Fatal("expected insertion to fail")
 	}
+
 	sqliteErr, ok := err.(sqlite3.Error)
 	require.True(t, ok)
 	assert.Equal(t, sqliteErr.Code, sqlite3.ErrConstraint)
@@ -647,27 +647,27 @@ func TestUpdateFromV25(t *testing.T) {
 		require.NoError(t, err)
 	})
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	tx, err := db.Begin()
 	require.NoError(t, err)
 
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Check that regular volumes were kept.
-	count, err := query.Count(tx, "storage_volumes", "")
+	count, err := query.Count(context.Background(), tx, "storage_volumes", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
-	count, err = query.Count(tx, "storage_volumes_config", "")
+	count, err = query.Count(context.Background(), tx, "storage_volumes_config", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
 	// Check that volume snapshots were migrated.
-	count, err = query.Count(tx, "storage_volumes_snapshots", "")
+	count, err = query.Count(context.Background(), tx, "storage_volumes_snapshots", "")
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	config, err := query.SelectConfig(tx, "storage_volumes_snapshots_config", "")
+	config, err := query.SelectConfig(context.Background(), tx, "storage_volumes_snapshots_config", "")
 	require.NoError(t, err)
 	assert.Len(t, config, 1)
 	assert.Equal(t, config["k"], "v-old")
@@ -677,7 +677,7 @@ func TestUpdateFromV26_WithoutVolumes(t *testing.T) {
 	schema := cluster.Schema()
 	db, err := schema.ExerciseUpdate(27, func(db *sql.DB) {})
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 }
 
 func TestUpdateFromV26_WithVolumes(t *testing.T) {
@@ -706,13 +706,13 @@ func TestUpdateFromV26_WithVolumes(t *testing.T) {
 		require.NoError(t, err)
 	})
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	tx, err := db.Begin()
 	require.NoError(t, err)
 
-	defer tx.Rollback()
-	ids, err := query.SelectIntegers(tx, "SELECT seq FROM sqlite_sequence WHERE name = 'storage_volumes'")
+	defer func() { _ = tx.Rollback() }()
+	ids, err := query.SelectIntegers(context.Background(), tx, "SELECT seq FROM sqlite_sequence WHERE name = 'storage_volumes'")
 	require.NoError(t, err)
 
 	assert.Equal(t, ids[0], 2)
@@ -744,21 +744,21 @@ func TestUpdateFromV34(t *testing.T) {
 		require.NoError(t, err)
 	})
 	require.NoError(t, err)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	tx, err := db.Begin()
 	require.NoError(t, err)
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Only one volume is left and it's node ID is set to NULL.
-	count, err := query.Count(tx, "storage_volumes", "")
+	count, err := query.Count(context.Background(), tx, "storage_volumes", "")
 	require.NoError(t, err)
 
 	assert.Equal(t, count, 1)
 
 	row := tx.QueryRow("SELECT id, node_id FROM storage_volumes")
 	var id int
-	var nodeID interface{}
+	var nodeID any
 	require.NoError(t, row.Scan(&id, &nodeID))
 	assert.Equal(t, id, 2)
 	assert.Equal(t, nodeID, nil)

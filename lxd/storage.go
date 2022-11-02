@@ -7,10 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
-	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/db/warningtype"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/response"
@@ -63,12 +61,13 @@ func resetContainerDiskIdmap(container instance.Container, srcIdmap *idmap.Idmap
 			if err != nil {
 				return err
 			}
+
 			jsonIdmap = string(idmapBytes)
 		} else {
 			jsonIdmap = "[]"
 		}
 
-		logger.Debug("Setting new volatile.last_state.idmap from source instance", log.Ctx{"project": container.Project(), "instance": container.Name(), "sourceIdmap": srcIdmap})
+		logger.Debug("Setting new volatile.last_state.idmap from source instance", logger.Ctx{"project": container.Project().Name, "instance": container.Name(), "sourceIdmap": srcIdmap})
 		err := container.VolatileSet(map[string]string{"volatile.last_state.idmap": jsonIdmap})
 		if err != nil {
 			return err
@@ -82,7 +81,7 @@ func storageStartup(s *state.State, forceCheck bool) error {
 	// Update the storage drivers supported and used cache in api_1.0.go.
 	storagePoolDriversCacheUpdate(s)
 
-	poolNames, err := s.Cluster.GetCreatedStoragePoolNames()
+	poolNames, err := s.DB.Cluster.GetCreatedStoragePoolNames()
 	if err != nil {
 		if response.IsNotFoundError(err) {
 			logger.Debug("No existing storage pools detected")
@@ -97,48 +96,30 @@ func storageStartup(s *state.State, forceCheck bool) error {
 		initPools[poolName] = struct{}{}
 	}
 
-	// In case the daemon got killed during upgrade we will already have a
-	// valid storage pool entry but it might have gotten messed up and so we
-	// cannot perform StoragePoolCheck(). This case can be detected by
-	// looking at the patches db: If we already have a storage pool defined
-	// but the upgrade somehow got messed up then there will be no
-	// "storage_api" entry in the db.
-	if len(initPools) > 0 && !forceCheck {
-		appliedPatches, err := s.Node.GetAppliedPatches()
-		if err != nil {
-			return err
-		}
-
-		if !shared.StringInSlice("storage_api", appliedPatches) {
-			logger.Warn(`Incorrectly applied "storage_api" patch, skipping storage pool initialization as it might be corrupt`)
-			return nil
-		}
-	}
-
 	initPool := func(poolName string) bool {
-		logger.Debug("Initializing storage pool", log.Ctx{"pool": poolName})
+		logger.Debug("Initializing storage pool", logger.Ctx{"pool": poolName})
 
-		pool, err := storagePools.GetPoolByName(s, poolName)
+		pool, err := storagePools.LoadByName(s, poolName)
 		if err != nil {
 			if response.IsNotFoundError(err) {
 				return true // Nothing to activate as pool has been deleted.
 			}
 
-			logger.Error("Failed loading storage pool", log.Ctx{"pool": poolName, "err": err})
+			logger.Error("Failed loading storage pool", logger.Ctx{"pool": poolName, "err": err})
 
 			return false
 		}
 
 		_, err = pool.Mount()
 		if err != nil {
-			logger.Error("Failed mounting storage pool", log.Ctx{"pool": poolName, "err": err})
-			s.Cluster.UpsertWarningLocalNode("", cluster.TypeStoragePool, int(pool.ID()), db.WarningStoragePoolUnvailable, err.Error())
+			logger.Error("Failed mounting storage pool", logger.Ctx{"pool": poolName, "err": err})
+			_ = s.DB.Cluster.UpsertWarningLocalNode("", cluster.TypeStoragePool, int(pool.ID()), warningtype.StoragePoolUnvailable, err.Error())
 
 			return false
 		}
 
-		logger.Info("Initialized storage pool", log.Ctx{"pool": poolName})
-		warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(s.Cluster, "", db.WarningStoragePoolUnvailable, cluster.TypeStoragePool, int(pool.ID()))
+		logger.Info("Initialized storage pool", logger.Ctx{"pool": poolName})
+		_ = warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(s.DB.Cluster, "", warningtype.StoragePoolUnvailable, cluster.TypeStoragePool, int(pool.ID()))
 
 		return true
 	}
@@ -159,7 +140,7 @@ func storageStartup(s *state.State, forceCheck bool) error {
 				t := time.NewTimer(time.Duration(time.Minute))
 
 				select {
-				case <-s.Context.Done():
+				case <-s.ShutdownCtx.Done():
 					t.Stop()
 					return
 				case <-t.C:
@@ -169,8 +150,8 @@ func storageStartup(s *state.State, forceCheck bool) error {
 					tryInstancesStart := false
 					for poolName := range initPools {
 						if initPool(poolName) {
-							// Storage pool initialized successfully so remove it from
-							// the list so its not retried.
+							// Storage pool initialized successfully or deleted so
+							// remove it from the list so its not retried.
 							delete(initPools, poolName)
 							tryInstancesStart = true
 						}
@@ -185,7 +166,7 @@ func storageStartup(s *state.State, forceCheck bool) error {
 					if tryInstancesStart {
 						instances, err := instance.LoadNodeAll(s, instancetype.Any)
 						if err != nil {
-							logger.Error("Failed loading instances to start", log.Ctx{"err": err})
+							logger.Error("Failed loading instances to start", logger.Ctx{"err": err})
 						} else {
 							instancesStart(s, instances)
 						}
@@ -214,7 +195,7 @@ func storagePoolDriversCacheUpdate(s *state.State) {
 	// copy-on-write semantics without locking in the read case seems
 	// appropriate. (Should be cheaper then querying the db all the time,
 	// especially if we keep adding more storage drivers.)
-	drivers, err := s.Cluster.GetStoragePoolDrivers()
+	drivers, err := s.DB.Cluster.GetStoragePoolDrivers()
 	if err != nil && !response.IsNotFoundError(err) {
 		return
 	}
@@ -250,6 +231,4 @@ func storagePoolDriversCacheUpdate(s *state.State) {
 	storagePoolUsedDriversCacheVal.Store(usedDrivers)
 	storagePoolSupportedDriversCacheVal.Store(supportedDrivers)
 	storagePoolDriversCacheLock.Unlock()
-
-	return
 }

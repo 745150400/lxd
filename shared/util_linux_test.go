@@ -1,7 +1,6 @@
 package shared
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -17,20 +16,22 @@ func TestGetAllXattr(t *testing.T) {
 			"user.empty":    "",
 		}
 	)
-	xattrFile, err := ioutil.TempFile("", "")
+	xattrFile, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	defer os.Remove(xattrFile.Name())
-	xattrFile.Close()
 
-	xattrDir, err := ioutil.TempDir("", "")
+	defer func() { _ = os.Remove(xattrFile.Name()) }()
+	_ = xattrFile.Close()
+
+	xattrDir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	defer os.Remove(xattrDir)
+
+	defer func() { _ = os.Remove(xattrDir) }()
 
 	for k, v := range testxattr {
 		err = unix.Setxattr(xattrFile.Name(), k, []byte(v), 0)
@@ -38,15 +39,18 @@ func TestGetAllXattr(t *testing.T) {
 			t.Log(err)
 			return
 		}
+
 		if err != nil {
 			t.Error(err)
 			return
 		}
+
 		err = unix.Setxattr(xattrDir, k, []byte(v), 0)
 		if err == unix.ENOTSUP {
 			t.Log(err)
 			return
 		}
+
 		if err != nil {
 			t.Error(err)
 			return

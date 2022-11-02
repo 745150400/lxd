@@ -114,7 +114,6 @@ func expandAlias(conf *config.Config, args []string) ([]string, bool, error) {
 	// Replace arguments
 	hasReplacedArgsVar := false
 	for _, aliasArg := range aliasValue {
-
 		// Only replace all @ARGS@ when it is not part of another string
 		if aliasArg == "@ARGS@" {
 			newArgs = append(newArgs, atArgs...)
@@ -136,6 +135,7 @@ func expandAlias(conf *config.Config, args []string) ([]string, bool, error) {
 				replacement := numberedArgsMap[argNo]
 				newArg = strings.Replace(newArg, match[0], replacement, -1)
 			}
+
 			newArgs = append(newArgs, newArg)
 			continue
 		}

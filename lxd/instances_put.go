@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,7 +12,6 @@ import (
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
-	"github.com/lxc/lxd/lxd/node"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/shared"
@@ -74,8 +74,8 @@ func coalesceErrors(local bool, errors map[string]error) error {
 func instancesPut(d *Daemon, r *http.Request) response.Response {
 	projectName := projectParam(r)
 
-	// Don't mess with containers while in setup mode
-	<-d.readyChan
+	// Don't mess with instances while in setup mode.
+	<-d.waitReady.Done()
 
 	c, err := instance.LoadNodeAll(d.State(), instancetype.Any)
 	if err != nil {
@@ -85,7 +85,8 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 	req := api.InstancesPut{}
 	req.State = &api.InstanceStatePut{}
 	req.State.Timeout = -1
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	err = json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
 		return response.BadRequest(err)
 	}
 
@@ -94,7 +95,7 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 	var names []string
 	var instances []instance.Instance
 	for _, inst := range c {
-		if inst.Project() != projectName {
+		if inst.Project().Name != projectName {
 			continue
 		}
 
@@ -103,18 +104,22 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 			if !inst.IsRunning() {
 				continue
 			}
+
 		case shared.Restart:
 			if !inst.IsRunning() {
 				continue
 			}
+
 		case shared.Start:
 			if inst.IsRunning() {
 				continue
 			}
+
 		case shared.Stop:
 			if !inst.IsRunning() {
 				continue
 			}
+
 		case shared.Unfreeze:
 			if inst.IsRunning() {
 				continue
@@ -163,7 +168,7 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 		}
 
 		// Check if clustered.
-		clustered, err := cluster.Enabled(d.db)
+		clustered, err := cluster.Enabled(d.db.Node)
 		if err != nil {
 			return err
 		}
@@ -173,14 +178,14 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 			return localAction(true)
 		}
 
-		// Get all online nodes.
-		var nodes []db.NodeInfo
-		err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		// Get all members in cluster.
+		var members []db.NodeInfo
+		err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			var err error
 
-			nodes, err = tx.GetNodes()
+			members, err = tx.GetNodes(ctx)
 			if err != nil {
-				return err
+				return fmt.Errorf("Failed getting cluster members: %w", err)
 			}
 
 			return nil
@@ -189,11 +194,8 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 			return err
 		}
 
-		// Get local address.
-		localAddress, err := node.HTTPSAddress(d.db)
-		if err != nil {
-			return err
-		}
+		// Get local cluster address.
+		localClusterAddress := d.State().LocalConfig.ClusterAddress()
 
 		// Record the results.
 		failures := map[string]error{}
@@ -201,37 +203,39 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 		wgAction := sync.WaitGroup{}
 
 		networkCert := d.endpoints.NetworkCert()
-		for _, node := range nodes {
+		for _, member := range members {
 			wgAction.Add(1)
-			go func(node db.NodeInfo) {
+			go func(member db.NodeInfo) {
 				defer wgAction.Done()
 
-				// Special handling for the local node.
-				if node.Address == localAddress {
+				// Special handling for the local member.
+				if member.Address == localClusterAddress {
 					err := localAction(false)
 					if err != nil {
 						failuresLock.Lock()
-						failures[node.Name] = err
+						failures[member.Name] = err
 						failuresLock.Unlock()
 					}
+
 					return
 				}
 
 				// Connect to the remote server.
-				client, err := cluster.Connect(node.Address, networkCert, d.serverCert(), r, true)
+				client, err := cluster.Connect(member.Address, networkCert, d.serverCert(), r, true)
 				if err != nil {
 					failuresLock.Lock()
-					failures[node.Name] = err
+					failures[member.Name] = err
 					failuresLock.Unlock()
 					return
 				}
+
 				client = client.UseProject(projectName)
 
 				// Perform the action.
 				op, err := client.UpdateInstances(req, "")
 				if err != nil {
 					failuresLock.Lock()
-					failures[node.Name] = err
+					failures[member.Name] = err
 					failuresLock.Unlock()
 					return
 				}
@@ -239,11 +243,11 @@ func instancesPut(d *Daemon, r *http.Request) response.Response {
 				err = op.Wait()
 				if err != nil {
 					failuresLock.Lock()
-					failures[node.Name] = err
+					failures[member.Name] = err
 					failuresLock.Unlock()
 					return
 				}
-			}(node)
+			}(member)
 		}
 
 		wgAction.Wait()

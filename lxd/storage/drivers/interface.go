@@ -2,6 +2,7 @@ package drivers
 
 import (
 	"io"
+	"net/url"
 
 	"github.com/lxc/lxd/lxd/backup"
 	"github.com/lxc/lxd/lxd/migration"
@@ -46,12 +47,23 @@ type Driver interface {
 	Update(changedConfig map[string]string) error
 	ApplyPatch(name string) error
 
+	// Buckets.
+	ValidateBucket(bucket Volume) error
+	GetBucketURL(bucketName string) *url.URL
+	CreateBucket(bucket Volume, op *operations.Operation) error
+	DeleteBucket(bucket Volume, op *operations.Operation) error
+	UpdateBucket(bucket Volume, changedConfig map[string]string) error
+	ValidateBucketKey(keyName string, creds S3Credentials, roleName string) error
+	CreateBucketKey(bucket Volume, keyName string, creds S3Credentials, roleName string, op *operations.Operation) (*S3Credentials, error)
+	UpdateBucketKey(bucket Volume, keyName string, creds S3Credentials, roleName string, op *operations.Operation) (*S3Credentials, error)
+	DeleteBucketKey(bucket Volume, keyName string, op *operations.Operation) error
+
 	// Volumes.
 	FillVolumeConfig(vol Volume) error
 	ValidateVolume(vol Volume, removeUnknownKeys bool) error
 	CreateVolume(vol Volume, filler *VolumeFiller, op *operations.Operation) error
-	CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, op *operations.Operation) error
-	RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, op *operations.Operation) error
+	CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, allowInconsistent bool, op *operations.Operation) error
+	RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, allowInconsistent bool, op *operations.Operation) error
 	DeleteVolume(vol Volume, op *operations.Operation) error
 	RenameVolume(vol Volume, newName string, op *operations.Operation) error
 	UpdateVolume(vol Volume, changedConfig map[string]string) error
@@ -63,9 +75,8 @@ type Driver interface {
 	// MountVolume mounts a storage volume (if not mounted) and increments reference counter.
 	MountVolume(vol Volume, op *operations.Operation) error
 
-	// MountVolumeSnapshot mounts a storage volume snapshot as readonly, returns true if we
-	// caused a new mount, false if already mounted.
-	MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error)
+	// MountVolumeSnapshot mounts a storage volume snapshot as readonly.
+	MountVolumeSnapshot(snapVol Volume, op *operations.Operation) error
 
 	// UnmountVolume unmounts a storage volume, returns true if unmounted, false if was not
 	// mounted.

@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,7 +15,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/lxc/lxd/lxd/cluster"
+	clusterConfig "github.com/lxc/lxd/lxd/cluster/config"
 	"github.com/lxc/lxd/lxd/db"
+	clusterDB "github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared"
@@ -33,7 +35,7 @@ func TestBootstrap_UnmetPreconditions(t *testing.T) {
 				f.ClusterAddress("1.2.3.4:666")
 				f.RaftNode("5.6.7.8:666")
 				filename := filepath.Join(f.state.OS.VarDir, "cluster.crt")
-				ioutil.WriteFile(filename, []byte{}, 0644)
+				_ = os.WriteFile(filename, []byte{}, 0644)
 			},
 			"Inconsistent state: found leftover cluster certificate",
 		},
@@ -59,7 +61,7 @@ func TestBootstrap_UnmetPreconditions(t *testing.T) {
 				f.ClusterAddress("1.2.3.4:666")
 				f.ClusterNode("5.6.7.8:666")
 			},
-			"Inconsistent state: found leftover entries in nodes",
+			"Inconsistent state: Found leftover entries in cluster members",
 		},
 	}
 
@@ -72,8 +74,9 @@ func TestBootstrap_UnmetPreconditions(t *testing.T) {
 
 			serverCert := shared.TestingKeyPair()
 			state.ServerCert = func() *shared.CertInfo { return serverCert }
-			gateway := newGateway(t, state.Node, serverCert, serverCert)
-			defer gateway.Shutdown()
+
+			gateway := newGateway(t, state.DB.Node, serverCert, state)
+			defer func() { _ = gateway.Shutdown() }()
 
 			err := cluster.Bootstrap(state, gateway, "buzz")
 			assert.EqualError(t, err, c.error)
@@ -86,9 +89,10 @@ func TestBootstrap(t *testing.T) {
 	defer cleanup()
 
 	serverCert := shared.TestingKeyPair()
-	gateway := newGateway(t, state.Node, serverCert, serverCert)
 	state.ServerCert = func() *shared.CertInfo { return serverCert }
-	defer gateway.Shutdown()
+
+	gateway := newGateway(t, state.DB.Node, serverCert, state)
+	defer func() { _ = gateway.Shutdown() }()
 
 	mux := http.NewServeMux()
 	server := newServer(serverCert, mux)
@@ -102,8 +106,8 @@ func TestBootstrap(t *testing.T) {
 	require.NoError(t, err)
 
 	// The node-local database has now an entry in the raft_nodes table
-	err = state.Node.Transaction(func(tx *db.NodeTx) error {
-		nodes, err := tx.GetRaftNodes()
+	err = state.DB.Node.Transaction(context.Background(), func(ctx context.Context, tx *db.NodeTx) error {
+		nodes, err := tx.GetRaftNodes(ctx)
 		require.NoError(t, err)
 		require.Len(t, nodes, 1)
 		assert.Equal(t, uint64(1), nodes[0].ID)
@@ -113,12 +117,12 @@ func TestBootstrap(t *testing.T) {
 	require.NoError(t, err)
 
 	// The cluster database has now an entry in the nodes table
-	err = state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		nodes, err := tx.GetNodes()
+	err = state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		members, err := tx.GetNodes(ctx)
 		require.NoError(t, err)
-		require.Len(t, nodes, 1)
-		assert.Equal(t, "buzz", nodes[0].Name)
-		assert.Equal(t, address, nodes[0].Address)
+		require.Len(t, members, 1)
+		assert.Equal(t, "buzz", members[0].Name)
+		assert.Equal(t, address, members[0].Address)
 		return nil
 	})
 	require.NoError(t, err)
@@ -126,7 +130,7 @@ func TestBootstrap(t *testing.T) {
 	// The cluster certificate is in place.
 	assert.True(t, shared.PathExists(filepath.Join(state.OS.VarDir, "cluster.crt")))
 
-	trustedCerts := func() map[db.CertificateType]map[string]x509.Certificate {
+	trustedCerts := func() map[clusterDB.CertificateType]map[string]x509.Certificate {
 		return nil
 	}
 
@@ -139,7 +143,7 @@ func TestBootstrap(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 
-	enabled, err := cluster.Enabled(state.Node)
+	enabled, err := cluster.Enabled(state.DB.Node)
 	require.NoError(t, err)
 	assert.True(t, enabled)
 }
@@ -190,7 +194,7 @@ func TestAccept_UnmetPreconditions(t *testing.T) {
 			func(f *membershipFixtures) {
 				f.ClusterNode("5.6.7.8:666")
 			},
-			fmt.Sprintf("The joining server version doesn't (expected %s with DB schema %d)", version.Version, cluster.SchemaVersion-1),
+			fmt.Sprintf("The joining server version doesn't match (expected %s with DB schema %d)", version.Version, cluster.SchemaVersion-1),
 		},
 		{
 			"buzz",
@@ -200,17 +204,20 @@ func TestAccept_UnmetPreconditions(t *testing.T) {
 			func(f *membershipFixtures) {
 				f.ClusterNode("5.6.7.8:666")
 			},
-			fmt.Sprintf("The joining server version doesn't (expected %s with API count %d)", version.Version, len(version.APIExtensions)-1),
+			fmt.Sprintf("The joining server version doesn't match (expected %s with API count %d)", version.Version, len(version.APIExtensions)-1),
 		},
 	}
+
 	for _, c := range cases {
 		t.Run(c.error, func(t *testing.T) {
 			state, cleanup := state.NewTestState(t)
 			defer cleanup()
 
 			serverCert := shared.TestingKeyPair()
-			gateway := newGateway(t, state.Node, serverCert, serverCert)
-			defer gateway.Shutdown()
+			state.ServerCert = func() *shared.CertInfo { return serverCert }
+
+			gateway := newGateway(t, state.DB.Node, serverCert, state)
+			defer func() { _ = gateway.Shutdown() }()
 
 			c.setup(&membershipFixtures{t: t, state: state})
 
@@ -226,12 +233,32 @@ func TestAccept(t *testing.T) {
 	defer cleanup()
 
 	serverCert := shared.TestingKeyPair()
-	gateway := newGateway(t, state.Node, serverCert, serverCert)
-	defer gateway.Shutdown()
+	state.ServerCert = func() *shared.CertInfo { return serverCert }
+
+	gateway := newGateway(t, state.DB.Node, serverCert, state)
+	defer func() { _ = gateway.Shutdown() }()
 
 	f := &membershipFixtures{t: t, state: state}
 	f.RaftNode("1.2.3.4:666")
 	f.ClusterNode("1.2.3.4:666")
+
+	err := state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		var err error
+
+		state.GlobalConfig, err = clusterConfig.Load(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		// Get the local node (will be used if clustered).
+		state.ServerName, err = tx.GetLocalNodeName(ctx)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
 
 	nodes, err := cluster.Accept(
 		state, gateway, "buzz", "5.6.7.8:666", cluster.SchemaVersion, len(version.APIExtensions), osarch.ARCH_64BIT_INTEL_X86)
@@ -253,15 +280,17 @@ func TestJoin(t *testing.T) {
 	targetState, cleanup := state.NewTestState(t)
 	defer cleanup()
 
-	targetGateway := newGateway(t, targetState.Node, targetCert, targetCert)
-	defer targetGateway.Shutdown()
+	targetState.ServerCert = func() *shared.CertInfo { return targetCert }
+
+	targetGateway := newGateway(t, targetState.DB.Node, targetCert, targetState)
+	defer func() { _ = targetGateway.Shutdown() }()
 
 	altServerCert := shared.TestingAltKeyPair()
 	trustedAltServerCert, _ := x509.ParseCertificate(altServerCert.KeyPair().Certificate[0])
 
-	trustedCerts := func() map[db.CertificateType]map[string]x509.Certificate {
-		return map[db.CertificateType]map[string]x509.Certificate{
-			db.CertificateTypeServer: {
+	trustedCerts := func() map[clusterDB.CertificateType]map[string]x509.Certificate {
+		return map[clusterDB.CertificateType]map[string]x509.Certificate{
+			clusterDB.CertificateTypeServer: {
 				altServerCert.Fingerprint(): *trustedAltServerCert,
 			},
 		}
@@ -273,22 +302,41 @@ func TestJoin(t *testing.T) {
 
 	targetAddress := targetServer.Listener.Addr().String()
 
-	require.NoError(t, targetState.Cluster.Close())
+	require.NoError(t, targetState.DB.Cluster.Close())
 
 	targetStore := targetGateway.NodeStore()
 	targetDialFunc := targetGateway.DialFunc()
 
 	var err error
-	targetState.Cluster, err = db.OpenCluster(context.Background(), "db.bin", targetStore, targetAddress, "/unused/db/dir", 10*time.Second, nil, driver.WithDialFunc(targetDialFunc))
+	targetState.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", targetStore, targetAddress, "/unused/db/dir", 10*time.Second, nil, driver.WithDialFunc(targetDialFunc))
 	targetState.ServerCert = func() *shared.CertInfo { return targetCert }
 	require.NoError(t, err)
+
+	err = targetState.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		targetState.GlobalConfig, err = clusterConfig.Load(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		// Get the local node (will be used if clustered).
+		targetState.ServerName, err = tx.GetLocalNodeName(ctx)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+
+	// PreparedStmts is a global variable and will be overwritten by the OpenCluster call below, so save it here.
+	targetStmts := clusterDB.PreparedStmts
 
 	targetF := &membershipFixtures{t: t, state: targetState}
 	targetF.ClusterAddress(targetAddress)
 
 	err = cluster.Bootstrap(targetState, targetGateway, "buzz")
 	require.NoError(t, err)
-	_, err = targetState.Cluster.GetNetworks(project.Default)
+	_, err = targetState.DB.Cluster.GetNetworks(project.Default)
 	require.NoError(t, err)
 
 	// Setup a joining node
@@ -299,9 +347,11 @@ func TestJoin(t *testing.T) {
 	state, cleanup := state.NewTestState(t)
 	defer cleanup()
 
-	gateway := newGateway(t, state.Node, targetCert, altServerCert)
+	state.ServerCert = func() *shared.CertInfo { return altServerCert }
 
-	defer gateway.Shutdown()
+	gateway := newGateway(t, state.DB.Node, targetCert, state)
+
+	defer func() { _ = gateway.Shutdown() }()
 
 	for path, handler := range gateway.HandlerFuncs(nil, trustedCerts) {
 		mux.HandleFunc(path, handler)
@@ -309,23 +359,44 @@ func TestJoin(t *testing.T) {
 
 	address := server.Listener.Addr().String()
 
-	require.NoError(t, state.Cluster.Close())
+	require.NoError(t, state.DB.Cluster.Close())
 
 	store := gateway.NodeStore()
 	dialFunc := gateway.DialFunc()
 
-	state.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, nil, driver.WithDialFunc(dialFunc))
+	state.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, nil, driver.WithDialFunc(dialFunc))
 	require.NoError(t, err)
+
+	err = state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		state.GlobalConfig, err = clusterConfig.Load(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		// Get the local node (will be used if clustered).
+		state.ServerName, err = tx.GetLocalNodeName(ctx)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Save the other instance of PreparedStmts here.
+	sourceStmts := clusterDB.PreparedStmts
 
 	f := &membershipFixtures{t: t, state: state}
 	f.ClusterAddress(address)
 
 	// Accept the joining node.
+	clusterDB.PreparedStmts = targetStmts
 	raftNodes, err := cluster.Accept(
 		targetState, targetGateway, "rusp", address, cluster.SchemaVersion, len(version.APIExtensions), osarch.ARCH_64BIT_INTEL_X86)
 	require.NoError(t, err)
 
 	// Actually join the cluster.
+	clusterDB.PreparedStmts = sourceStmts
 	err = cluster.Join(state, gateway, targetCert, altServerCert, "rusp", raftNodes)
 	require.NoError(t, err)
 
@@ -350,14 +421,15 @@ func TestJoin(t *testing.T) {
 	leaving, err := cluster.Leave(state, targetGateway, "rusp", false /* force */)
 	require.NoError(t, err)
 	assert.Equal(t, address, leaving)
-	err = cluster.Purge(targetState.Cluster, "rusp")
+	clusterDB.PreparedStmts = targetStmts
+	err = cluster.Purge(targetState.DB.Cluster, "rusp")
 	require.NoError(t, err)
 
 	// The node has gone from the cluster db.
-	err = targetState.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		nodes, err := tx.GetNodes()
+	err = targetState.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		members, err := tx.GetNodes(ctx)
 		require.NoError(t, err)
-		assert.Len(t, nodes, 1)
+		assert.Len(t, members, 1)
 		return nil
 	})
 	require.NoError(t, err)
@@ -376,10 +448,11 @@ type membershipFixtures struct {
 
 // Set core.https_address to the given value.
 func (h *membershipFixtures) CoreAddress(address string) {
-	err := h.state.Node.Transaction(func(tx *db.NodeTx) error {
+	err := h.state.DB.Node.Transaction(context.Background(), func(ctx context.Context, tx *db.NodeTx) error {
 		config := map[string]string{
 			"core.https_address": address,
 		}
+
 		return tx.UpdateConfig(config)
 	})
 	require.NoError(h.t, err)
@@ -387,10 +460,11 @@ func (h *membershipFixtures) CoreAddress(address string) {
 
 // Set cluster.https_address to the given value.
 func (h *membershipFixtures) ClusterAddress(address string) {
-	err := h.state.Node.Transaction(func(tx *db.NodeTx) error {
+	err := h.state.DB.Node.Transaction(context.Background(), func(ctx context.Context, tx *db.NodeTx) error {
 		config := map[string]string{
 			"cluster.https_address": address,
 		}
+
 		return tx.UpdateConfig(config)
 	})
 	require.NoError(h.t, err)
@@ -398,7 +472,7 @@ func (h *membershipFixtures) ClusterAddress(address string) {
 
 // Add the given address to the raft_nodes table.
 func (h *membershipFixtures) RaftNode(address string) {
-	err := h.state.Node.Transaction(func(tx *db.NodeTx) error {
+	err := h.state.DB.Node.Transaction(context.Background(), func(ctx context.Context, tx *db.NodeTx) error {
 		_, err := tx.CreateRaftNode(address, "rusp")
 		return err
 	})
@@ -408,9 +482,9 @@ func (h *membershipFixtures) RaftNode(address string) {
 // Get the current list of the raft nodes in the raft_nodes table.
 func (h *membershipFixtures) RaftNodes() []db.RaftNode {
 	var nodes []db.RaftNode
-	err := h.state.Node.Transaction(func(tx *db.NodeTx) error {
+	err := h.state.DB.Node.Transaction(context.Background(), func(ctx context.Context, tx *db.NodeTx) error {
 		var err error
-		nodes, err = tx.GetRaftNodes()
+		nodes, err = tx.GetRaftNodes(ctx)
 		return err
 	})
 	require.NoError(h.t, err)
@@ -419,7 +493,7 @@ func (h *membershipFixtures) RaftNodes() []db.RaftNode {
 
 // Add the given address to the nodes table of the cluster database.
 func (h *membershipFixtures) ClusterNode(address string) {
-	err := h.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+	err := h.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		_, err := tx.CreateNode("rusp", address)
 		return err
 	})

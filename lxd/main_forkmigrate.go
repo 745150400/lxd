@@ -5,9 +5,8 @@ import (
 	"os"
 	"strconv"
 
+	liblxc "github.com/lxc/go-lxc"
 	"github.com/spf13/cobra"
-
-	liblxc "gopkg.in/lxc/go-lxc.v2"
 )
 
 type cmdForkmigrate struct {
@@ -34,7 +33,7 @@ func (c *cmdForkmigrate) Command() *cobra.Command {
 func (c *cmdForkmigrate) Run(cmd *cobra.Command, args []string) error {
 	// Quick checks.
 	if len(args) != 5 {
-		cmd.Help()
+		_ = cmd.Help()
 
 		if len(args) == 0 {
 			return nil
@@ -63,14 +62,15 @@ func (c *cmdForkmigrate) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := d.LoadConfigFile(configPath); err != nil {
+	err = d.LoadConfigFile(configPath)
+	if err != nil {
 		return err
 	}
 
 	/* see https://github.com/golang/go/issues/13155, startContainer, and dc3a229 */
-	os.Stdin.Close()
-	os.Stdout.Close()
-	os.Stderr.Close()
+	_ = os.Stdin.Close()
+	_ = os.Stdout.Close()
+	_ = os.Stderr.Close()
 
 	return d.Migrate(liblxc.MIGRATE_RESTORE, liblxc.MigrateOptions{
 		Directory:       imagesDir,

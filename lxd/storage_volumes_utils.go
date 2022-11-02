@@ -1,13 +1,11 @@
 package main
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/lxc/lxd/lxd/backup"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/instance"
-	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/state"
 	storagePools "github.com/lxc/lxd/lxd/storage"
 	"github.com/lxc/lxd/shared"
@@ -16,21 +14,21 @@ import (
 )
 
 var supportedVolumeTypes = []int{db.StoragePoolVolumeTypeContainer, db.StoragePoolVolumeTypeVM, db.StoragePoolVolumeTypeCustom, db.StoragePoolVolumeTypeImage}
-var supportedVolumeTypesInstances = []int{db.StoragePoolVolumeTypeContainer, db.StoragePoolVolumeTypeVM}
 
 func storagePoolVolumeUpdateUsers(d *Daemon, projectName string, oldPoolName string, oldVol *api.StorageVolume, newPoolName string, newVol *api.StorageVolume) error {
 	s := d.State()
 
 	// Update all instances that are using the volume with a local (non-expanded) device.
-	err := storagePools.VolumeUsedByInstanceDevices(s, oldPoolName, projectName, oldVol, false, func(dbInst db.Instance, project db.Project, profiles []api.Profile, usedByDevices []string) error {
-		inst, err := instance.Load(s, db.InstanceToArgs(&dbInst), profiles)
+	err := storagePools.VolumeUsedByInstanceDevices(s, oldPoolName, projectName, oldVol, false, func(dbInst db.InstanceArgs, project api.Project, usedByDevices []string) error {
+		inst, err := instance.Load(s, dbInst, project)
 		if err != nil {
 			return err
 		}
 
 		localDevices := inst.LocalDevices()
 		for _, devName := range usedByDevices {
-			if _, exists := localDevices[devName]; exists {
+			_, exists := localDevices[devName]
+			if exists {
 				localDevices[devName]["pool"] = newPoolName
 				localDevices[devName]["source"] = newVol.Name
 			}
@@ -43,7 +41,7 @@ func storagePoolVolumeUpdateUsers(d *Daemon, projectName string, oldPoolName str
 			Devices:      localDevices,
 			Ephemeral:    inst.IsEphemeral(),
 			Profiles:     inst.Profiles(),
-			Project:      inst.Project(),
+			Project:      inst.Project().Name,
 			Type:         inst.Type(),
 			Snapshot:     inst.IsSnapshot(),
 		}
@@ -60,20 +58,19 @@ func storagePoolVolumeUpdateUsers(d *Daemon, projectName string, oldPoolName str
 	}
 
 	// Update all profiles that are using the volume with a device.
-	err = storagePools.VolumeUsedByProfileDevices(s, oldPoolName, projectName, oldVol, func(profile db.Profile, p db.Project, usedByDevices []string) error {
-		for _, dev := range profile.Devices {
-			if shared.StringInSlice(dev.Name, usedByDevices) {
-				dev.Config["pool"] = newPoolName
-				dev.Config["source"] = newVol.Name
+	err = storagePools.VolumeUsedByProfileDevices(s, oldPoolName, projectName, oldVol, func(profileID int64, profile api.Profile, p api.Project, usedByDevices []string) error {
+		for name, dev := range profile.Devices {
+			if shared.StringInSlice(name, usedByDevices) {
+				dev["pool"] = newPoolName
+				dev["source"] = newVol.Name
 			}
 		}
 
 		pUpdate := api.ProfilePut{}
 		pUpdate.Config = profile.Config
 		pUpdate.Description = profile.Description
-		pUpdate.Devices = db.DevicesToAPI(profile.Devices)
-		apiProfile := db.ProfileToAPI(&profile)
-		err = doProfileUpdate(d, profile.Project, profile.Name, int64(profile.ID), apiProfile, pUpdate)
+		pUpdate.Devices = profile.Devices
+		err = doProfileUpdate(d, p, profile.Name, profileID, &profile, pUpdate)
 		if err != nil {
 			return err
 		}
@@ -87,33 +84,21 @@ func storagePoolVolumeUpdateUsers(d *Daemon, projectName string, oldPoolName str
 	return nil
 }
 
-// volumeUsedBy = append(volumeUsedBy, fmt.Sprintf("/%s/containers/%s", version.APIVersion, ct))
-func storagePoolVolumeUsedByGet(s *state.State, projectName string, poolName string, vol *api.StorageVolume) ([]string, error) {
+// storagePoolVolumeUsedByGet returns a list of URL resources that use the volume.
+func storagePoolVolumeUsedByGet(s *state.State, requestProjectName string, poolName string, vol *db.StorageVolume) ([]string, error) {
 	// Handle instance volumes.
 	if vol.Type == db.StoragePoolVolumeTypeNameContainer || vol.Type == db.StoragePoolVolumeTypeNameVM {
-		cName, sName, snap := shared.InstanceGetParentAndSnapshotName(vol.Name)
-		if snap {
-			if projectName == project.Default {
-				return []string{fmt.Sprintf("/%s/instances/%s/snapshots/%s", version.APIVersion, cName, sName)}, nil
-			}
-
-			return []string{fmt.Sprintf("/%s/instances/%s/snapshots/%s?project=%s", version.APIVersion, cName, sName, projectName)}, nil
+		volName, snapName, isSnap := api.GetParentAndSnapshotName(vol.Name)
+		if isSnap {
+			return []string{api.NewURL().Path(version.APIVersion, "instances", volName, "snapshots", snapName).Project(vol.Project).String()}, nil
 		}
 
-		if projectName == project.Default {
-			return []string{fmt.Sprintf("/%s/instances/%s", version.APIVersion, cName)}, nil
-		}
-
-		return []string{fmt.Sprintf("/%s/instances/%s?project=%s", version.APIVersion, cName, projectName)}, nil
+		return []string{api.NewURL().Path(version.APIVersion, "instances", volName).Project(vol.Project).String()}, nil
 	}
 
 	// Handle image volumes.
 	if vol.Type == db.StoragePoolVolumeTypeNameImage {
-		if projectName == project.Default {
-			return []string{fmt.Sprintf("/%s/images/%s", version.APIVersion, vol.Name)}, nil
-		}
-
-		return []string{fmt.Sprintf("/%s/images/%s?project=%s", version.APIVersion, vol.Name, projectName)}, nil
+		return []string{api.NewURL().Path(version.APIVersion, "images", vol.Name).Project(requestProjectName).Target(vol.Location).String()}, nil
 	}
 
 	// Check if the daemon itself is using it.
@@ -123,7 +108,7 @@ func storagePoolVolumeUsedByGet(s *state.State, projectName string, poolName str
 	}
 
 	if used {
-		return []string{fmt.Sprintf("/%s", version.APIVersion)}, nil
+		return []string{api.NewURL().Path(version.APIVersion).String()}, nil
 	}
 
 	// Look for instances using this volume.
@@ -131,26 +116,16 @@ func storagePoolVolumeUsedByGet(s *state.State, projectName string, poolName str
 
 	// Pass false to expandDevices, as we only want to see instances directly using a volume, rather than their
 	// profiles using a volume.
-	err = storagePools.VolumeUsedByInstanceDevices(s, poolName, projectName, vol, false, func(inst db.Instance, p db.Project, profiles []api.Profile, usedByDevices []string) error {
-		if inst.Project == project.Default {
-			volumeUsedBy = append(volumeUsedBy, fmt.Sprintf("/%s/instances/%s", version.APIVersion, inst.Name))
-		} else {
-			volumeUsedBy = append(volumeUsedBy, fmt.Sprintf("/%s/instances/%s?project=%s", version.APIVersion, inst.Name, inst.Project))
-		}
-
+	err = storagePools.VolumeUsedByInstanceDevices(s, poolName, vol.Project, &vol.StorageVolume, false, func(inst db.InstanceArgs, p api.Project, usedByDevices []string) error {
+		volumeUsedBy = append(volumeUsedBy, api.NewURL().Path(version.APIVersion, "instances", inst.Name).Project(inst.Project).String())
 		return nil
 	})
 	if err != nil {
 		return []string{}, err
 	}
 
-	err = storagePools.VolumeUsedByProfileDevices(s, poolName, projectName, vol, func(profile db.Profile, p db.Project, usedByDevices []string) error {
-		if profile.Project == project.Default {
-			volumeUsedBy = append(volumeUsedBy, fmt.Sprintf("/%s/profiles/%s", version.APIVersion, profile.Name))
-		} else {
-			volumeUsedBy = append(volumeUsedBy, fmt.Sprintf("/%s/profiles/%s?project=%s", version.APIVersion, profile.Name, profile.Project))
-		}
-
+	err = storagePools.VolumeUsedByProfileDevices(s, poolName, requestProjectName, &vol.StorageVolume, func(profileID int64, profile api.Profile, p api.Project, usedByDevices []string) error {
+		volumeUsedBy = append(volumeUsedBy, api.NewURL().Path(version.APIVersion, "profiles", profile.Name).Project(p.Name).String())
 		return nil
 	})
 	if err != nil {
@@ -161,7 +136,7 @@ func storagePoolVolumeUsedByGet(s *state.State, projectName string, poolName str
 }
 
 func storagePoolVolumeBackupLoadByName(s *state.State, projectName, poolName, backupName string) (*backup.VolumeBackup, error) {
-	b, err := s.Cluster.GetStoragePoolVolumeBackup(projectName, poolName, backupName)
+	b, err := s.DB.Cluster.GetStoragePoolVolumeBackup(projectName, poolName, backupName)
 	if err != nil {
 		return nil, err
 	}

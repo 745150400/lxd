@@ -3,7 +3,6 @@ package resources
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,7 +34,8 @@ func parseMeminfo(path string) (*meminfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Failed to open %q: %w", path, err)
 	}
-	defer f.Close()
+
+	defer func() { _ = f.Close() }()
 	memInfo := bufio.NewScanner(f)
 
 	// Get common memory information
@@ -142,7 +142,7 @@ func getMemoryBlockSizeBytes() uint64 {
 	}
 
 	// Get block size
-	content, err := ioutil.ReadFile(memoryBlockSizePath)
+	content, err := os.ReadFile(memoryBlockSizePath)
 	if err != nil {
 		return 0
 	}
@@ -161,7 +161,7 @@ func getTotalMemory(sysDevicesBase string) uint64 {
 		return 0
 	}
 
-	entries, err := ioutil.ReadDir(sysDevicesBase)
+	entries, err := os.ReadDir(sysDevicesBase)
 	if err != nil {
 		return 0
 	}
@@ -182,7 +182,7 @@ func getTotalMemory(sysDevicesBase string) uint64 {
 			continue
 		}
 
-		content, err := ioutil.ReadFile(filepath.Join(entryPath, "online"))
+		content, err := os.ReadFile(filepath.Join(entryPath, "online"))
 		if err != nil {
 			return 0
 		}
@@ -196,7 +196,7 @@ func getTotalMemory(sysDevicesBase string) uint64 {
 	return blockSize * count
 }
 
-// GetMemory returns a filled api.ResourcesMemory struct ready for use by LXD
+// GetMemory returns a filled api.ResourcesMemory struct ready for use by LXD.
 func GetMemory() (*api.ResourcesMemory, error) {
 	memory := api.ResourcesMemory{}
 
@@ -227,7 +227,7 @@ func GetMemory() (*api.ResourcesMemory, error) {
 		memory.Nodes = []api.ResourcesMemoryNode{}
 
 		// List all the nodes
-		entries, err := ioutil.ReadDir(sysDevicesNode)
+		entries, err := os.ReadDir(sysDevicesNode)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to list %q: %w", sysDevicesNode, err)
 		}

@@ -2,8 +2,6 @@ package drivers
 
 import (
 	"fmt"
-	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,7 +14,9 @@ import (
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/storage/filesystem"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/idmap"
+	"github.com/lxc/lxd/shared/logger"
 )
 
 // MinBlockBoundary minimum block boundary size to use.
@@ -25,7 +25,7 @@ const MinBlockBoundary = 8192
 // wipeDirectory empties the contents of a directory, but leaves it in place.
 func wipeDirectory(path string) error {
 	// List all entries.
-	entries, err := ioutil.ReadDir(path)
+	entries, err := os.ReadDir(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -50,7 +50,7 @@ func wipeDirectory(path string) error {
 func forceRemoveAll(path string) error {
 	err := os.RemoveAll(path)
 	if err != nil {
-		shared.RunCommand("chattr", "-ai", "-R", path)
+		_, _ = shared.RunCommand("chattr", "-ai", "-R", path)
 		err = os.RemoveAll(path)
 		if err != nil {
 			return err
@@ -100,7 +100,7 @@ func mountReadOnly(srcPath string, dstPath string) (bool, error) {
 	// Make it read-only.
 	err = TryMount("", dstPath, "none", unix.MS_BIND|unix.MS_RDONLY|unix.MS_REMOUNT, "")
 	if err != nil {
-		forceUnmount(dstPath)
+		_, _ = forceUnmount(dstPath)
 		return false, err
 	}
 
@@ -181,6 +181,7 @@ func TryUnmount(path string, flags int) error {
 			break
 		}
 
+		logger.Debug("Failed to unmount", logger.Ctx{"path": path, "attempt": i, "err": err})
 		time.Sleep(500 * time.Millisecond)
 	}
 
@@ -226,7 +227,7 @@ func fsProbe(path string) (string, error) {
 }
 
 // GetPoolMountPath returns the mountpoint of the given pool.
-// {LXD_DIR}/storage-pools/<pool>
+// {LXD_DIR}/storage-pools/<pool>.
 func GetPoolMountPath(poolName string) string {
 	return shared.VarPath("storage-pools", poolName)
 }
@@ -243,7 +244,7 @@ func GetVolumeMountPath(poolName string, volType VolumeType, volName string) str
 
 // GetVolumeSnapshotDir gets the snapshot mount directory for the parent volume.
 func GetVolumeSnapshotDir(poolName string, volType VolumeType, volName string) string {
-	parent, _, _ := shared.InstanceGetParentAndSnapshotName(volName)
+	parent, _, _ := api.GetParentAndSnapshotName(volName)
 	return shared.VarPath("storage-pools", poolName, fmt.Sprintf("%s-snapshots", string(volType)), parent)
 }
 
@@ -252,7 +253,7 @@ func GetSnapshotVolumeName(parentName, snapshotName string) string {
 	return fmt.Sprintf("%s%s%s", parentName, shared.SnapshotDelimiter, snapshotName)
 }
 
-// createParentSnapshotDirIfMissing creates the parent directory for volume snapshots
+// createParentSnapshotDirIfMissing creates the parent directory for volume snapshots.
 func createParentSnapshotDirIfMissing(poolName string, volType VolumeType, volName string) error {
 	snapshotsPath := GetVolumeSnapshotDir(poolName, volType, volName)
 
@@ -299,14 +300,15 @@ func ensureSparseFile(filePath string, sizeBytes int64) error {
 	if err != nil {
 		return fmt.Errorf("Failed to open %s: %w", filePath, err)
 	}
-	defer f.Close()
+
+	defer func() { _ = f.Close() }()
 
 	err = f.Truncate(sizeBytes)
 	if err != nil {
 		return fmt.Errorf("Failed to create sparse file %s: %w", filePath, err)
 	}
 
-	return nil
+	return f.Close()
 }
 
 // roundVolumeBlockFileSizeBytes parses the supplied size string and then rounds it to the nearest multiple of
@@ -527,7 +529,7 @@ func shrinkFileSystem(fsType string, devPath string, vol Volume, byteSize int64,
 				exitCodeFSModified := false
 				runErr, ok := err.(shared.RunError)
 				if ok {
-					exitError, ok := runErr.Err.(*exec.ExitError)
+					exitError, ok := runErr.Unwrap().(*exec.ExitError)
 					if ok {
 						if exitError.ExitCode() == 1 {
 							exitCodeFSModified = true
@@ -669,23 +671,32 @@ func regenerateFilesystemXFSUUID(devPath string) error {
 	return nil
 }
 
-// copyDevice copies one device path to another.
-func copyDevice(inputPath, outputPath string) error {
-	from, err := os.Open(inputPath)
-	if err != nil {
-		return fmt.Errorf("Error opening file for reading %q: %w", inputPath, err)
+// copyDevice copies one device path to another using dd running at low priority.
+// It expects outputPath to exist already, so will not create it.
+func copyDevice(inputPath string, outputPath string) error {
+	cmd := []string{
+		"nice", "-n19", // Run dd with low priority to reduce CPU impact on other processes.
+		"dd", fmt.Sprintf("if=%s", inputPath), fmt.Sprintf("of=%s", outputPath),
+		"bs=16M",       // Use large buffer to reduce syscalls and speed up copy.
+		"conv=nocreat", // Don't create output file if missing (expect caller to have created output file).
 	}
-	defer from.Close()
 
-	to, err := os.OpenFile(outputPath, os.O_WRONLY, 0)
-	if err != nil {
-		return fmt.Errorf("Error opening file for writing %q: %w", outputPath, err)
+	// Check for Direct I/O support.
+	from, err := os.OpenFile(inputPath, unix.O_DIRECT|unix.O_RDONLY, 0)
+	if err == nil {
+		cmd = append(cmd, "iflag=direct")
+		_ = from.Close()
 	}
-	defer to.Close()
 
-	_, err = io.Copy(to, from)
+	to, err := os.OpenFile(outputPath, unix.O_DIRECT|unix.O_RDONLY, 0)
+	if err == nil {
+		cmd = append(cmd, "oflag=direct")
+		_ = to.Close()
+	}
+
+	_, err = shared.RunCommand(cmd[0], cmd[1:]...)
 	if err != nil {
-		return fmt.Errorf("Error copying file %q to %q: %w", inputPath, outputPath, err)
+		return err
 	}
 
 	return nil
@@ -711,7 +722,7 @@ func shiftBtrfsRootfs(path string, diskIdmap *idmap.IdmapSet, shift bool) error 
 	var err error
 	roSubvols := []string{}
 	subvols, _ := BTRFSSubVolumesGet(path)
-	sort.Sort(sort.StringSlice(subvols))
+	sort.Strings(subvols)
 	for _, subvol := range subvols {
 		subvol = filepath.Join(path, subvol)
 
@@ -720,7 +731,7 @@ func shiftBtrfsRootfs(path string, diskIdmap *idmap.IdmapSet, shift bool) error 
 		}
 
 		roSubvols = append(roSubvols, subvol)
-		BTRFSSubVolumeMakeRw(subvol)
+		_ = BTRFSSubVolumeMakeRw(subvol)
 	}
 
 	if shift {
@@ -730,7 +741,7 @@ func shiftBtrfsRootfs(path string, diskIdmap *idmap.IdmapSet, shift bool) error 
 	}
 
 	for _, subvol := range roSubvols {
-		BTRFSSubVolumeMakeRo(subvol)
+		_ = BTRFSSubVolumeMakeRo(subvol)
 	}
 
 	return err
@@ -745,7 +756,7 @@ func BTRFSSubVolumesGet(path string) ([]string, error) {
 	}
 
 	// Unprivileged users can't get to fs internals
-	filepath.Walk(path, func(fpath string, fi os.FileInfo, err error) error {
+	_ = filepath.Walk(path, func(fpath string, fi os.FileInfo, err error) error {
 		// Skip walk errors
 		if err != nil {
 			return nil
@@ -832,7 +843,8 @@ func BlockDiskSizeBytes(blockDiskPath string) (int64, error) {
 		if err != nil {
 			return -1, err
 		}
-		defer f.Close()
+
+		defer func() { _ = f.Close() }()
 		fd := int(f.Fd())
 
 		// Retrieve the block device size.
@@ -856,4 +868,50 @@ func BlockDiskSizeBytes(blockDiskPath string) (int64, error) {
 // OperationLockName returns the storage specific lock name to use with locking package.
 func OperationLockName(operationName string, poolName string, volType VolumeType, contentType ContentType, volName string) string {
 	return fmt.Sprintf("%s/%s/%s/%s/%s", operationName, poolName, volType, contentType, volName)
+}
+
+// loopFileSizeDefault returns the size in Gigabytes to use as the default size for a pool loop file.
+// This is based on the free space available in LXD's VarPath().
+func loopFileSizeDefault() (uint64, error) {
+	st := unix.Statfs_t{}
+	err := unix.Statfs(shared.VarPath(), &st)
+	if err != nil {
+		return 0, fmt.Errorf("Couldn't statfs %q: %w", shared.VarPath(), err)
+	}
+
+	/* choose 5 GiB < x < 30GiB, where x is 20% of the disk size */
+	defaultSize := uint64(st.Frsize) * st.Blocks / (1024 * 1024 * 1024) / 5
+	if defaultSize > 30 {
+		defaultSize = 30
+	}
+
+	if defaultSize < 5 {
+		defaultSize = 5
+	}
+
+	return defaultSize, nil
+}
+
+// loopFileSetup sets up a loop device for the provided sourcePath.
+// It tries to enable direct I/O if supported.
+func loopDeviceSetup(sourcePath string) (string, error) {
+	out, err := shared.RunCommand("losetup", "--find", "--nooverlap", "--direct-io=on", "--show", sourcePath)
+	if err != nil {
+		if strings.Contains(err.Error(), "direct io") {
+			out, err = shared.RunCommand("losetup", "--find", "--nooverlap", "--show", sourcePath)
+			if err != nil {
+				return "", err
+			}
+		} else {
+			return "", err
+		}
+	}
+
+	return strings.TrimSpace(out), nil
+}
+
+// loopFileAutoDetach enables auto detach mode for a loop device.
+func loopDeviceAutoDetach(loopDevPath string) error {
+	_, err := shared.RunCommand("losetup", "--detach", loopDevPath)
+	return err
 }

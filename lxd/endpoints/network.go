@@ -40,7 +40,7 @@ func (e *Endpoints) NetworkCert() *shared.CertInfo {
 }
 
 // NetworkAddress returns the network addresss of the network endpoint, or an
-// empty string if there's no network endpoint
+// empty string if there's no network endpoint.
 func (e *Endpoints) NetworkAddress() string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -49,6 +49,7 @@ func (e *Endpoints) NetworkAddress() string {
 	if listener == nil {
 		return ""
 	}
+
 	return listener.Addr().String()
 }
 
@@ -64,7 +65,7 @@ func (e *Endpoints) NetworkUpdateAddress(address string) error {
 		return nil
 	}
 
-	clusterAddress := e.ClusterAddress()
+	clusterAddress := e.clusterAddress()
 
 	logger.Infof("Update network address")
 
@@ -72,7 +73,7 @@ func (e *Endpoints) NetworkUpdateAddress(address string) error {
 	defer e.mu.Unlock()
 
 	// Close the previous socket
-	e.closeListener(network)
+	_ = e.closeListener(network)
 
 	// If turning off listening, we're done.
 	if address == "" {
@@ -82,7 +83,7 @@ func (e *Endpoints) NetworkUpdateAddress(address string) error {
 	// If the new address covers the cluster one, turn off the cluster
 	// listener.
 	if clusterAddress != "" && util.IsAddressCovered(clusterAddress, address) {
-		e.closeListener(cluster)
+		_ = e.closeListener(cluster)
 	}
 
 	// Attempt to setup the new listening socket
@@ -157,9 +158,11 @@ func (e *Endpoints) NetworkUpdateTrustedProxy(trustedProxy string) {
 		if len(p) == 0 {
 			continue
 		}
+
 		proxyIP := net.ParseIP(p)
 		proxies = append(proxies, proxyIP)
 	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	listener, ok := e.listeners[network]
@@ -195,5 +198,6 @@ func networkCreateListener(address string, cert *shared.CertInfo) (net.Listener,
 	if err != nil {
 		return nil, fmt.Errorf("Bind network address: %w", err)
 	}
+
 	return listeners.NewFancyTLSListener(listener, cert), nil
 }

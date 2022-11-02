@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -54,15 +55,11 @@ func (c *cmdActivateifneeded) Run(cmd *cobra.Command, args []string) error {
 	// Don't start a full daemon, we just need database access
 	d := defaultDaemon()
 
-	// Check if either the local database or the legacy local database
-	// files exists.
+	// Check if either the local database files exists.
 	path := d.os.LocalDatabasePath()
 	if !shared.PathExists(d.os.LocalDatabasePath()) {
-		path = d.os.LegacyLocalDatabasePath()
-		if !shared.PathExists(path) {
-			logger.Debugf("No local database, so no need to start the daemon now")
-			return nil
-		}
+		logger.Debugf("No local database, so no need to start the daemon now")
+		return nil
 	}
 
 	// Open the database directly to avoid triggering any initialization
@@ -71,16 +68,23 @@ func (c *cmdActivateifneeded) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	d.db = db.ForLegacyPatches(sqldb)
+
+	d.db.Node = db.DirectAccess(sqldb)
 
 	// Load the configured address from the database
-	address, err := node.HTTPSAddress(d.db)
+	var localConfig *node.Config
+	err = d.db.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		localConfig, err = node.ConfigLoad(ctx, tx)
+		return err
+	})
 	if err != nil {
 		return err
 	}
 
+	localHTTPAddress := localConfig.HTTPSAddress()
+
 	// Look for network socket
-	if address != "" {
+	if localHTTPAddress != "" {
 		logger.Debugf("Daemon has core.https_address set, activating...")
 		_, err := lxd.ConnectLXDUnix("", nil)
 		return err
@@ -95,19 +99,18 @@ func (c *cmdActivateifneeded) Run(cmd *cobra.Command, args []string) error {
 	// Look for auto-started or previously started instances
 	path = d.os.GlobalDatabasePath()
 	if !shared.PathExists(path) {
-		path = d.os.LegacyGlobalDatabasePath()
-		if !shared.PathExists(path) {
-			logger.Debugf("No global database, so no need to start the daemon now")
-			return nil
-		}
+		logger.Debugf("No global database, so no need to start the daemon now")
+		return nil
 	}
+
 	sqldb, err = sql.Open("dqlite_direct_access", path+"?mode=ro")
 	if err != nil {
 		return err
 	}
-	defer sqldb.Close()
 
-	d.cluster, err = db.ForLocalInspectionWithPreparedStmts(sqldb)
+	defer func() { _ = sqldb.Close() }()
+
+	d.db.Cluster, err = db.ForLocalInspectionWithPreparedStmts(sqldb)
 	if err != nil {
 		return err
 	}
@@ -143,7 +146,15 @@ func (c *cmdActivateifneeded) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check for scheduled volume snapshots
-	volumes, err := d.cluster.GetStoragePoolVolumesWithType(db.StoragePoolVolumeTypeCustom)
+	var volumes []db.StorageVolumeArgs
+	err = d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		volumes, err = tx.GetStoragePoolVolumesWithType(ctx, db.StoragePoolVolumeTypeCustom)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
 	if err != nil {
 		return err
 	}

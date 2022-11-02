@@ -8,7 +8,7 @@ import (
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/revert"
-	"github.com/lxc/lxd/lxd/util"
+	"github.com/lxc/lxd/shared"
 )
 
 type nicP2P struct {
@@ -38,6 +38,7 @@ func (d *nicP2P) validateConfig(instConf instance.ConfigReader) error {
 		"ipv6.routes",
 		"boot.priority",
 	}
+
 	err := d.config.Validate(nicValidationRules([]string{}, optionalFields, instConf))
 	if err != nil {
 		return err
@@ -85,13 +86,19 @@ func (d *nicP2P) Start() (*deviceConfig.RunConfig, error) {
 	// Create veth pair and configure the peer end with custom hwaddr and mtu if supplied.
 	if d.inst.Type() == instancetype.Container {
 		if saveData["host_name"] == "" {
-			saveData["host_name"] = network.RandomDevName("veth")
+			saveData["host_name"], err = d.generateHostName("veth", d.config["hwaddr"])
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		peerName, mtu, err = networkCreateVethPair(saveData["host_name"], d.config)
 	} else if d.inst.Type() == instancetype.VM {
 		if saveData["host_name"] == "" {
-			saveData["host_name"] = network.RandomDevName("tap")
+			saveData["host_name"], err = d.generateHostName("tap", d.config["hwaddr"])
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		peerName = saveData["host_name"] // VMs use the host_name to link to the TAP FD.
@@ -102,13 +109,13 @@ func (d *nicP2P) Start() (*deviceConfig.RunConfig, error) {
 		return nil, err
 	}
 
-	revert.Add(func() { network.InterfaceRemove(saveData["host_name"]) })
+	revert.Add(func() { _ = network.InterfaceRemove(saveData["host_name"]) })
 
 	// Populate device config with volatile fields if needed.
 	networkVethFillFromVolatile(d.config, saveData)
 
 	// Apply host-side routes to veth interface.
-	err = networkNICRouteAdd(d.config["host_name"], append(util.SplitNTrimSpace(d.config["ipv4.routes"], ",", -1, true), util.SplitNTrimSpace(d.config["ipv6.routes"], ",", -1, true)...)...)
+	err = networkNICRouteAdd(d.config["host_name"], append(shared.SplitNTrimSpace(d.config["ipv4.routes"], ",", -1, true), shared.SplitNTrimSpace(d.config["ipv6.routes"], ",", -1, true)...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -164,10 +171,10 @@ func (d *nicP2P) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 	networkVethFillFromVolatile(oldConfig, v)
 
 	// Remove old host-side routes from veth interface.
-	networkNICRouteDelete(oldConfig["host_name"], append(util.SplitNTrimSpace(oldConfig["ipv4.routes"], ",", -1, true), util.SplitNTrimSpace(oldConfig["ipv6.routes"], ",", -1, true)...)...)
+	networkNICRouteDelete(oldConfig["host_name"], append(shared.SplitNTrimSpace(oldConfig["ipv4.routes"], ",", -1, true), shared.SplitNTrimSpace(oldConfig["ipv6.routes"], ",", -1, true)...)...)
 
 	// Apply host-side routes to veth interface.
-	err = networkNICRouteAdd(d.config["host_name"], append(util.SplitNTrimSpace(d.config["ipv4.routes"], ",", -1, true), util.SplitNTrimSpace(d.config["ipv6.routes"], ",", -1, true)...)...)
+	err = networkNICRouteAdd(d.config["host_name"], append(shared.SplitNTrimSpace(d.config["ipv4.routes"], ",", -1, true), shared.SplitNTrimSpace(d.config["ipv6.routes"], ",", -1, true)...)...)
 	if err != nil {
 		return err
 	}
@@ -192,9 +199,11 @@ func (d *nicP2P) Stop() (*deviceConfig.RunConfig, error) {
 
 // postStop is run after the device is removed from the instance.
 func (d *nicP2P) postStop() error {
-	defer d.volatileSet(map[string]string{
-		"host_name": "",
-	})
+	defer func() {
+		_ = d.volatileSet(map[string]string{
+			"host_name": "",
+		})
+	}()
 
 	v := d.volatileGet()
 

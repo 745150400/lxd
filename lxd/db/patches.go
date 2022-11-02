@@ -1,9 +1,9 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
+	"context"
 	"database/sql"
 
 	"github.com/lxc/lxd/lxd/db/query"
@@ -12,9 +12,9 @@ import (
 // GetAppliedPatches returns the names of all patches currently applied on this node.
 func (n *Node) GetAppliedPatches() ([]string, error) {
 	var response []string
-	err := query.Transaction(n.db, func(tx *sql.Tx) error {
+	err := query.Transaction(context.TODO(), n.db, func(ctx context.Context, tx *sql.Tx) error {
 		var err error
-		response, err = query.SelectStrings(tx, "SELECT name FROM patches")
+		response, err = query.SelectStrings(ctx, tx, "SELECT name FROM patches")
 		return err
 	})
 	if err != nil {

@@ -8,8 +8,6 @@ import (
 	"strings"
 	"time"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
@@ -18,6 +16,7 @@ import (
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/validate"
 )
 
@@ -81,8 +80,8 @@ func (d *nicRouted) validateConfig(instConf instance.ConfigReader) error {
 	}
 
 	rules := nicValidationRules(requiredFields, optionalFields, instConf)
-	rules["ipv4.address"] = validate.Optional(validate.IsNetworkAddressV4List)
-	rules["ipv6.address"] = validate.Optional(validate.IsNetworkAddressV6List)
+	rules["ipv4.address"] = validate.Optional(validate.IsListOf(validate.IsNetworkAddressV4))
+	rules["ipv6.address"] = validate.Optional(validate.IsListOf(validate.IsNetworkAddressV6))
 	rules["gvrp"] = validate.Optional(validate.IsBool)
 	rules["ipv4.neighbor_probe"] = validate.Optional(validate.IsBool)
 	rules["ipv6.neighbor_probe"] = validate.Optional(validate.IsBool)
@@ -99,7 +98,8 @@ func (d *nicRouted) validateConfig(instConf instance.ConfigReader) error {
 		if d.config[key] != "" {
 			for _, addr := range strings.Split(d.config[key], ",") {
 				addr = strings.TrimSpace(addr)
-				if _, dupe := ips[addr]; dupe {
+				_, dupe := ips[addr]
+				if dupe {
 					return fmt.Errorf("Duplicate address %q in %q", addr, key)
 				}
 
@@ -154,6 +154,7 @@ func (d *nicRouted) validateEnvironment() error {
 			if err != nil {
 				return fmt.Errorf("Error reading net sysctl %s: %w", ipv6FwdPath, err)
 			}
+
 			if sysctlVal != "1\n" {
 				return fmt.Errorf("Routed mode requires sysctl net.ipv6.conf.%s.forwarding=1", "all")
 			}
@@ -166,6 +167,7 @@ func (d *nicRouted) validateEnvironment() error {
 			if err != nil {
 				return fmt.Errorf("Error reading net sysctl %s: %w", ipv6ProxyNdpPath, err)
 			}
+
 			if sysctlVal != "1\n" {
 				return fmt.Errorf("Routed mode requires sysctl net.ipv6.conf.%s.proxy_ndp=1", "all")
 			}
@@ -178,6 +180,7 @@ func (d *nicRouted) validateEnvironment() error {
 			if err != nil {
 				return fmt.Errorf("Error reading net sysctl %s: %w", ipv4FwdPath, err)
 			}
+
 			if sysctlVal != "1\n" {
 				// Replace . in parent name with / for sysctl formatting.
 				return fmt.Errorf("Routed mode requires sysctl net.ipv4.conf.%s.forwarding=1", strings.Replace(d.effectiveParentName, ".", "/", -1))
@@ -191,6 +194,7 @@ func (d *nicRouted) validateEnvironment() error {
 			if err != nil {
 				return fmt.Errorf("Error reading net sysctl %s: %w", ipv6FwdPath, err)
 			}
+
 			if sysctlVal != "1\n" {
 				// Replace . in parent name with / for sysctl formatting.
 				return fmt.Errorf("Routed mode requires sysctl net.ipv6.conf.%s.forwarding=1", strings.Replace(d.effectiveParentName, ".", "/", -1))
@@ -201,6 +205,7 @@ func (d *nicRouted) validateEnvironment() error {
 			if err != nil {
 				return fmt.Errorf("Error reading net sysctl %s: %w", ipv6ProxyNdpPath, err)
 			}
+
 			if sysctlVal != "1\n" {
 				// Replace . in parent name with / for sysctl formatting.
 				return fmt.Errorf("Routed mode requires sysctl net.ipv6.conf.%s.proxy_ndp=1", strings.Replace(d.effectiveParentName, ".", "/", -1))
@@ -216,14 +221,14 @@ func (d *nicRouted) checkIPAvailability(parent string) error {
 	var addresses []net.IP
 
 	if shared.IsTrueOrEmpty(d.config["ipv4.neighbor_probe"]) {
-		ipv4Addrs := util.SplitNTrimSpace(d.config["ipv4.address"], ",", -1, true)
+		ipv4Addrs := shared.SplitNTrimSpace(d.config["ipv4.address"], ",", -1, true)
 		for _, addr := range ipv4Addrs {
 			addresses = append(addresses, net.ParseIP(addr))
 		}
 	}
 
 	if shared.IsTrueOrEmpty(d.config["ipv6.neighbor_probe"]) {
-		ipv6Addrs := util.SplitNTrimSpace(d.config["ipv6.address"], ",", -1, true)
+		ipv6Addrs := shared.SplitNTrimSpace(d.config["ipv6.address"], ",", -1, true)
 		for _, addr := range ipv6Addrs {
 			addresses = append(addresses, net.ParseIP(addr))
 		}
@@ -236,7 +241,7 @@ func (d *nicRouted) checkIPAvailability(parent string) error {
 			defer cancel()
 			inUse, err := isIPAvailable(ctx, address, parent)
 			if err != nil {
-				d.logger.Warn("Failed checking IP address available on parent network", log.Ctx{"IP": address, "parent": parent, "err": err})
+				d.logger.Warn("Failed checking IP address available on parent network", logger.Ctx{"IP": address, "parent": parent, "err": err})
 			}
 
 			if inUse {
@@ -286,7 +291,7 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 		// If we created a VLAN interface, we need to setup the sysctls on that interface.
 		if shared.IsTrue(saveData["last_state.created"]) {
 			revert.Add(func() {
-				networkRemoveInterfaceIfNeeded(d.state, d.effectiveParentName, d.inst, d.config["parent"], d.config["vlan"])
+				_ = networkRemoveInterfaceIfNeeded(d.state, d.effectiveParentName, d.inst, d.config["parent"], d.config["vlan"])
 			})
 
 			err := d.setupParentSysctls(d.effectiveParentName)
@@ -311,23 +316,30 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 	// Create veth pair and configure the peer end with custom hwaddr and mtu if supplied.
 	if d.inst.Type() == instancetype.Container {
 		if saveData["host_name"] == "" {
-			saveData["host_name"] = network.RandomDevName("veth")
+			saveData["host_name"], err = d.generateHostName("veth", d.config["hwaddr"])
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		peerName, mtu, err = networkCreateVethPair(saveData["host_name"], d.config)
 	} else if d.inst.Type() == instancetype.VM {
 		if saveData["host_name"] == "" {
-			saveData["host_name"] = network.RandomDevName("tap")
+			saveData["host_name"], err = d.generateHostName("tap", d.config["hwaddr"])
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		peerName = saveData["host_name"] // VMs use the host_name to link to the TAP FD.
 		mtu, err = networkCreateTap(saveData["host_name"], d.config)
 	}
+
 	if err != nil {
 		return nil, err
 	}
 
-	revert.Add(func() { network.InterfaceRemove(saveData["host_name"]) })
+	revert.Add(func() { _ = network.InterfaceRemove(saveData["host_name"]) })
 
 	// Populate device config with volatile fields if needed.
 	networkVethFillFromVolatile(d.config, saveData)
@@ -351,7 +363,7 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 	}
 
 	// Apply firewall rules for reverse path filtering of IPv4 and IPv6.
-	err = d.state.Firewall.InstanceSetupRPFilter(d.inst.Project(), d.inst.Name(), d.name, saveData["host_name"])
+	err = d.state.Firewall.InstanceSetupRPFilter(d.inst.Project().Name, d.inst.Name(), d.name, saveData["host_name"])
 	if err != nil {
 		return nil, fmt.Errorf("Error setting up reverse path filter: %w", err)
 	}
@@ -365,7 +377,7 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 			ipFamilyArg = ip.FamilyV6
 		}
 
-		addresses := util.SplitNTrimSpace(d.config[fmt.Sprintf("%s.address", keyPrefix)], ",", -1, true)
+		addresses := shared.SplitNTrimSpace(d.config[fmt.Sprintf("%s.address", keyPrefix)], ",", -1, true)
 
 		// Add host-side gateway addresses.
 		if len(addresses) > 0 {
@@ -377,6 +389,7 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 				Address: fmt.Sprintf("%s/%d", d.ipHostAddress(keyPrefix), subnetSize),
 				Family:  ipFamilyArg,
 			}
+
 			err = addr.Add()
 			if err != nil {
 				return nil, fmt.Errorf("Failed adding host gateway IP %q: %w", addr.Address, err)
@@ -398,6 +411,7 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 				Table:   "main",
 				Family:  ipFamilyArg,
 			}
+
 			err = r.Add()
 			if err != nil {
 				return nil, fmt.Errorf("Failed adding host route %q: %w", r.Route, err)
@@ -414,6 +428,7 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 					Table:   d.config[fmt.Sprintf("%s.host_table", keyPrefix)],
 					Family:  ipFamilyArg,
 				}
+
 				err = r.Add()
 				if err != nil {
 					return nil, fmt.Errorf("Failed adding host route %q to table %q: %w", r.Route, r.Table, err)
@@ -426,17 +441,18 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 					DevName: d.effectiveParentName,
 					Addr:    net.ParseIP(addrStr),
 				}
+
 				err = np.Add()
 				if err != nil {
 					return nil, fmt.Errorf("Failed adding neighbour proxy %q to %q: %w", np.Addr.String(), np.DevName, err)
 				}
 
-				revert.Add(func() { np.Delete() })
+				revert.Add(func() { _ = np.Delete() })
 			}
 		}
 
 		if d.config[fmt.Sprintf("%s.routes", keyPrefix)] != "" {
-			routes := util.SplitNTrimSpace(d.config[fmt.Sprintf("%s.routes", keyPrefix)], ",", -1, true)
+			routes := shared.SplitNTrimSpace(d.config[fmt.Sprintf("%s.routes", keyPrefix)], ",", -1, true)
 
 			if len(addresses) == 0 {
 				return nil, fmt.Errorf("%s.routes requires %s.address to be set", keyPrefix, keyPrefix)
@@ -451,12 +467,12 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 					Family:  ipFamilyArg,
 					Via:     addresses[0],
 				}
+
 				err = r.Add()
 				if err != nil {
 					return nil, fmt.Errorf("Failed adding route %q: %w", r.Route, err)
 				}
 			}
-
 		}
 	}
 
@@ -477,7 +493,7 @@ func (d *nicRouted) Start() (*deviceConfig.RunConfig, error) {
 		}...)
 
 		for _, keyPrefix := range []string{"ipv4", "ipv6"} {
-			ipAddresses := util.SplitNTrimSpace(d.config[fmt.Sprintf("%s.address", keyPrefix)], ",", -1, true)
+			ipAddresses := shared.SplitNTrimSpace(d.config[fmt.Sprintf("%s.address", keyPrefix)], ",", -1, true)
 
 			// Use a fixed address as the auto next-hop default gateway if using this IP family.
 			if len(ipAddresses) > 0 && nicHasAutoGateway(d.config[fmt.Sprintf("%s.gateway", keyPrefix)]) {
@@ -581,10 +597,12 @@ func (d *nicRouted) Stop() (*deviceConfig.RunConfig, error) {
 
 // postStop is run after the device is removed from the instance.
 func (d *nicRouted) postStop() error {
-	defer d.volatileSet(map[string]string{
-		"last_state.created": "",
-		"host_name":          "",
-	})
+	defer func() {
+		_ = d.volatileSet(map[string]string{
+			"last_state.created": "",
+			"host_name":          "",
+		})
+	}()
 
 	errs := []error{}
 
@@ -608,13 +626,13 @@ func (d *nicRouted) postStop() error {
 	// Delete IP neighbour proxy entries on the parent.
 	if d.effectiveParentName != "" {
 		for _, key := range []string{"ipv4.address", "ipv6.address"} {
-			for _, addr := range util.SplitNTrimSpace(d.config[key], ",", -1, true) {
+			for _, addr := range shared.SplitNTrimSpace(d.config[key], ",", -1, true) {
 				neighProxy := &ip.NeighProxy{
 					DevName: d.effectiveParentName,
 					Addr:    net.ParseIP(addr),
 				}
 
-				neighProxy.Delete()
+				_ = neighProxy.Delete()
 			}
 		}
 	}
@@ -628,7 +646,7 @@ func (d *nicRouted) postStop() error {
 	}
 
 	// Remove reverse path filters.
-	err := d.state.Firewall.InstanceClearRPFilter(d.inst.Project(), d.inst.Name(), d.name)
+	err := d.state.Firewall.InstanceClearRPFilter(d.inst.Project().Name, d.inst.Name(), d.name)
 	if err != nil {
 		errs = append(errs, err)
 	}

@@ -1,18 +1,18 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
 	"database/sql"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/suite"
 
+	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 )
 
 const fixtures string = `
@@ -57,7 +57,7 @@ func (s *dbTestSuite) CreateTestDb() (*Cluster, func()) {
 
 	// Setup logging if main() hasn't been called/when testing
 	if logger.Log == nil {
-		logger.Log, err = logging.GetLogger("", "", true, true, nil)
+		err = logger.InitLogger("", "", true, true, nil)
 		s.Nil(err)
 	}
 
@@ -72,6 +72,7 @@ func (s *dbTestSuite) CreateTestTx() (*sql.Tx, func()) {
 	commit := func() {
 		s.Nil(tx.Commit())
 	}
+
 	return tx, commit
 }
 
@@ -188,7 +189,7 @@ func (s *dbTestSuite) Test_ImageGet_finds_image_for_fingerprint() {
 	var result *api.Image
 	project := "default"
 
-	_, result, err = s.db.GetImage("fingerprint", ImageFilter{Project: &project})
+	_, result, err = s.db.GetImage("fingerprint", cluster.ImageFilter{Project: &project})
 	s.Nil(err)
 	s.NotNil(result)
 	s.Equal(result.Filename, "filename")
@@ -201,8 +202,8 @@ func (s *dbTestSuite) Test_ImageGet_for_missing_fingerprint() {
 	project := "default"
 	var err error
 
-	_, _, err = s.db.GetImage("unknown", ImageFilter{Project: &project})
-	s.Equal(err, ErrNoSuchObject)
+	_, _, err = s.db.GetImage("unknown", cluster.ImageFilter{Project: &project})
+	s.True(api.StatusErrorCheck(err, http.StatusNotFound))
 }
 
 func (s *dbTestSuite) Test_ImageExists_true() {
@@ -233,7 +234,7 @@ func (s *dbTestSuite) Test_GetImageAlias_alias_does_not_exists() {
 	var err error
 
 	_, _, err = s.db.GetImageAlias("default", "whatever", true)
-	s.Equal(err, ErrNoSuchObject)
+	s.True(api.StatusErrorCheck(err, http.StatusNotFound))
 }
 
 func (s *dbTestSuite) Test_CreateImageAlias() {
@@ -249,7 +250,7 @@ func (s *dbTestSuite) Test_CreateImageAlias() {
 
 func (s *dbTestSuite) Test_GetCachedImageSourceFingerprint() {
 	project := "default"
-	imageID, _, err := s.db.GetImage("fingerprint", ImageFilter{Project: &project})
+	imageID, _, err := s.db.GetImage("fingerprint", cluster.ImageFilter{Project: &project})
 	s.Nil(err)
 
 	err = s.db.CreateImageSource(imageID, "server.remote", "simplestreams", "", "test")
@@ -262,12 +263,12 @@ func (s *dbTestSuite) Test_GetCachedImageSourceFingerprint() {
 
 func (s *dbTestSuite) Test_GetCachedImageSourceFingerprint_no_match() {
 	project := "default"
-	imageID, _, err := s.db.GetImage("fingerprint", ImageFilter{Project: &project})
+	imageID, _, err := s.db.GetImage("fingerprint", cluster.ImageFilter{Project: &project})
 	s.Nil(err)
 
 	err = s.db.CreateImageSource(imageID, "server.remote", "simplestreams", "", "test")
 	s.Nil(err)
 
 	_, err = s.db.GetCachedImageSourceFingerprint("server.remote", "lxd", "test", "container", 0)
-	s.Equal(err, ErrNoSuchObject)
+	s.True(api.StatusErrorCheck(err, http.StatusNotFound))
 }

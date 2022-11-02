@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
+	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,6 @@ import (
 	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/state"
-	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/units"
@@ -53,12 +53,12 @@ func NetworkSetDevMTU(devName string, mtu uint32) error {
 
 // NetworkGetDevMAC retrieves the current MAC setting for a named network device.
 func NetworkGetDevMAC(devName string) (string, error) {
-	content, err := ioutil.ReadFile(fmt.Sprintf("/sys/class/net/%s/address", devName))
+	content, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/address", devName))
 	if err != nil {
 		return "", err
 	}
 
-	return strings.TrimSpace(fmt.Sprintf("%s", content)), nil
+	return strings.TrimSpace(string(content)), nil
 }
 
 // NetworkSetDevMAC sets the MAC setting for a named network device if different from current.
@@ -89,7 +89,7 @@ func networkRemoveInterfaceIfNeeded(state *state.State, nic string, current inst
 	}
 
 	for _, inst := range instances {
-		if inst.Name() == current.Name() && inst.Project() == current.Project() {
+		if inst.Name() == current.Name() && inst.Project().Name == current.Project().Name {
 			continue
 		}
 
@@ -150,6 +150,7 @@ func networkSnapshotPhysicalNIC(hostName string, volatile map[string]string) err
 	if err != nil {
 		return err
 	}
+
 	volatile["last_state.mtu"] = fmt.Sprintf("%d", mtu)
 
 	// Store current MAC for restoration on detach
@@ -157,6 +158,7 @@ func networkSnapshotPhysicalNIC(hostName string, volatile map[string]string) err
 	if err != nil {
 		return err
 	}
+
 	volatile["last_state.hwaddr"] = mac
 	return nil
 }
@@ -212,6 +214,7 @@ func networkCreateVethPair(hostName string, m deviceConfig.Device) (string, uint
 		},
 		PeerName: peerName,
 	}
+
 	err := veth.Add()
 	if err != nil {
 		return "", 0, fmt.Errorf("Failed to create the veth interfaces %q and %q: %w", hostName, peerName, err)
@@ -219,7 +222,7 @@ func networkCreateVethPair(hostName string, m deviceConfig.Device) (string, uint
 
 	err = veth.SetUp()
 	if err != nil {
-		network.InterfaceRemove(hostName)
+		_ = network.InterfaceRemove(hostName)
 		return "", 0, fmt.Errorf("Failed to bring up the veth interface %q: %w", hostName, err)
 	}
 
@@ -228,7 +231,7 @@ func networkCreateVethPair(hostName string, m deviceConfig.Device) (string, uint
 		link := &ip.Link{Name: peerName}
 		err := link.SetAddress(m["hwaddr"])
 		if err != nil {
-			network.InterfaceRemove(peerName)
+			_ = network.InterfaceRemove(peerName)
 			return "", 0, fmt.Errorf("Failed to set the MAC address: %w", err)
 		}
 	}
@@ -252,13 +255,13 @@ func networkCreateVethPair(hostName string, m deviceConfig.Device) (string, uint
 	if mtu > 0 {
 		err = NetworkSetDevMTU(peerName, mtu)
 		if err != nil {
-			network.InterfaceRemove(peerName)
+			_ = network.InterfaceRemove(peerName)
 			return "", 0, fmt.Errorf("Failed to set the MTU %d: %w", mtu, err)
 		}
 
 		err = NetworkSetDevMTU(hostName, mtu)
 		if err != nil {
-			network.InterfaceRemove(peerName)
+			_ = network.InterfaceRemove(peerName)
 			return "", 0, fmt.Errorf("Failed to set the MTU %d: %w", mtu, err)
 		}
 	}
@@ -274,6 +277,7 @@ func networkCreateTap(hostName string, m deviceConfig.Device) (uint32, error) {
 		Mode:       "tap",
 		MultiQueue: true,
 	}
+
 	err := tuntap.Add()
 	if err != nil {
 		return 0, fmt.Errorf("Failed to create the tap interfaces %q: %w", hostName, err)
@@ -287,7 +291,8 @@ func networkCreateTap(hostName string, m deviceConfig.Device) (uint32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("Failed to bring up the tap interface %q: %w", hostName, err)
 	}
-	revert.Add(func() { network.InterfaceRemove(hostName) })
+
+	revert.Add(func() { _ = network.InterfaceRemove(hostName) })
 
 	// Set the MTU on peer. If not specified and has parent, will inherit MTU from parent.
 	var mtu uint32
@@ -359,6 +364,7 @@ func networkNICRouteAdd(routeDev string, routes ...string) error {
 			Proto:   "boot",
 			Family:  ipVersion,
 		}
+
 		err = r.Add()
 		if err != nil {
 			return err
@@ -371,7 +377,8 @@ func networkNICRouteAdd(routeDev string, routes ...string) error {
 				Proto:   "boot",
 				Family:  ipVersion,
 			}
-			r.Flush()
+
+			_ = r.Flush()
 		})
 	}
 
@@ -411,7 +418,8 @@ func networkNICRouteDelete(routeDev string, routes ...string) {
 			Proto:   "boot",
 			Family:  ipVersion,
 		}
-		r.Flush()
+
+		err = r.Flush()
 		if err != nil {
 			logger.Errorf("Failed to remove static route %q to %q: %v", route, routeDev, err)
 			continue
@@ -454,9 +462,9 @@ func networkSetupHostVethLimits(m deviceConfig.Device) error {
 
 	// Clean any existing entry
 	qdisc := &ip.Qdisc{Dev: veth, Root: true}
-	qdisc.Delete()
+	_ = qdisc.Delete()
 	qdisc = &ip.Qdisc{Dev: veth, Ingress: true}
-	qdisc.Delete()
+	_ = qdisc.Delete()
 
 	// Apply new limits
 	if m["limits.ingress"] != "" {
@@ -533,7 +541,7 @@ func bgpAddPrefix(d *deviceCommon, n network.Network, config map[string]string) 
 	// Add the prefixes.
 	bgpOwner := fmt.Sprintf("instance_%d_%s", d.inst.ID(), d.name)
 	if config["ipv4.routes.external"] != "" {
-		for _, prefix := range util.SplitNTrimSpace(config["ipv4.routes.external"], ",", -1, true) {
+		for _, prefix := range shared.SplitNTrimSpace(config["ipv4.routes.external"], ",", -1, true) {
 			_, prefixNet, err := net.ParseCIDR(prefix)
 			if err != nil {
 				return err
@@ -547,7 +555,7 @@ func bgpAddPrefix(d *deviceCommon, n network.Network, config map[string]string) 
 	}
 
 	if config["ipv6.routes.external"] != "" {
-		for _, prefix := range util.SplitNTrimSpace(config["ipv6.routes.external"], ",", -1, true) {
+		for _, prefix := range shared.SplitNTrimSpace(config["ipv6.routes.external"], ",", -1, true) {
 			_, prefixNet, err := net.ParseCIDR(prefix)
 			if err != nil {
 				return err
@@ -631,7 +639,7 @@ func networkSRIOVSetupVF(d deviceCommon, vfParent string, vfDevice string, vfID 
 		return vfPCIDev, 0, err
 	}
 
-	revert.Add(func() { pcidev.DeviceProbe(vfPCIDev) })
+	revert.Add(func() { _ = pcidev.DeviceProbe(vfPCIDev) })
 
 	// Setup VF VLAN if specified.
 	if d.config["vlan"] != "" {
@@ -780,7 +788,7 @@ func networkSRIOVRestoreVF(d deviceCommon, useSpoofCheck bool, volatile map[stri
 
 	// However we return from this function, we must try to rebind the VF so its not orphaned.
 	// The OS won't let an already bound device be bound again so is safe to call twice.
-	revert.Add(func() { pcidev.DeviceProbe(vfPCIDev) })
+	revert.Add(func() { _ = pcidev.DeviceProbe(vfPCIDev) })
 
 	// Reset VF VLAN if specified
 	if volatile["last_state.vf.vlan"] != "" {
@@ -919,7 +927,7 @@ func isIPAvailable(ctx context.Context, address net.IP, parentInterface string) 
 
 	// Handle IPv4 address.
 	if address.To4() != nil {
-		timeout := deadline.Sub(time.Now())
+		timeout := time.Until(deadline)
 		arping.SetTimeout(timeout)
 		_, _, err := arping.PingOverIfaceByName(address, parentInterface)
 		if err != nil {
@@ -944,27 +952,33 @@ func isIPAvailable(ctx context.Context, address net.IP, parentInterface string) 
 		return false, err
 	}
 
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
-	solicitedNodeMulticast, err := ndp.SolicitedNodeMulticast(address)
+	netipAddr, ok := netip.AddrFromSlice(address)
+	if !ok {
+		return false, fmt.Errorf("Couldn't convert address to netip")
+	}
+
+	solicitedNodeMulticast, err := ndp.SolicitedNodeMulticast(netipAddr)
 	if err != nil {
 		return false, err
 	}
 
 	neighbourSolicitationMessage := &ndp.NeighborSolicitation{
-		TargetAddress: address,
+		TargetAddress: netipAddr,
 	}
 
-	conn.SetDeadline(deadline)
+	_ = conn.SetDeadline(deadline)
 	err = conn.WriteTo(neighbourSolicitationMessage, nil, solicitedNodeMulticast)
 	if err != nil {
 		return false, err
 	}
 
-	conn.SetDeadline(deadline)
+	_ = conn.SetDeadline(deadline)
 	msg, _, _, err := conn.ReadFrom()
 	if err != nil {
-		if cause, ok := err.(net.Error); ok && cause.Timeout() {
+		cause, ok := err.(net.Error)
+		if ok && cause.Timeout() {
 			return false, nil
 		}
 
@@ -972,7 +986,7 @@ func isIPAvailable(ctx context.Context, address net.IP, parentInterface string) 
 	}
 
 	neighbourAdvertisement, ok := msg.(*ndp.NeighborAdvertisement)
-	if ok && neighbourAdvertisement.TargetAddress.Equal(address) {
+	if ok && neighbourAdvertisement.TargetAddress == netipAddr {
 		return true, nil
 	}
 

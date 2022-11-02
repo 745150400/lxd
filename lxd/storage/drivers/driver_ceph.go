@@ -2,18 +2,18 @@ package drivers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
-
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/units"
 	"github.com/lxc/lxd/shared/validate"
 )
@@ -30,12 +30,8 @@ type ceph struct {
 func (d *ceph) load() error {
 	// Register the patches.
 	d.patches = map[string]func() error{
-		"storage_create_vm":                        nil,
-		"storage_zfs_mount":                        nil,
-		"storage_create_vm_again":                  nil,
-		"storage_zfs_volmode":                      nil,
-		"storage_rename_custom_volume_add_project": nil,
-		"storage_lvm_skipactivation":               nil,
+		"storage_lvm_skipactivation":       nil,
+		"storage_missing_snapshot_records": nil,
 	}
 
 	// Done if previously loaded.
@@ -57,6 +53,7 @@ func (d *ceph) load() error {
 		if err != nil {
 			return err
 		}
+
 		out = strings.TrimSpace(out)
 
 		fields := strings.Split(out, " ")
@@ -102,11 +99,11 @@ func (d *ceph) Create() error {
 
 	// Set default properties if missing.
 	if d.config["ceph.cluster_name"] == "" {
-		d.config["ceph.cluster_name"] = "ceph"
+		d.config["ceph.cluster_name"] = CephDefaultCluster
 	}
 
 	if d.config["ceph.user.name"] == "" {
-		d.config["ceph.user.name"] = "admin"
+		d.config["ceph.user.name"] = CephDefaultUser
 	}
 
 	if d.config["ceph.osd.pg_num"] == "" {
@@ -150,7 +147,7 @@ func (d *ceph) Create() error {
 			return err
 		}
 
-		revert.Add(func() { d.osdDeletePool() })
+		revert.Add(func() { _ = d.osdDeletePool() })
 
 		// Initialize the pool. This is not necessary but allows the pool to be monitored.
 		_, err = shared.TryRunCommand("rbd",
@@ -160,7 +157,7 @@ func (d *ceph) Create() error {
 			"init",
 			d.config["ceph.osd.pool_name"])
 		if err != nil {
-			d.logger.Warn("Failed to initialize pool", log.Ctx{"pool": d.config["ceph.osd.pool_name"], "cluster": d.config["ceph.cluster_name"]})
+			d.logger.Warn("Failed to initialize pool", logger.Ctx{"pool": d.config["ceph.osd.pool_name"], "cluster": d.config["ceph.cluster_name"]})
 		}
 
 		// Create placeholder storage volume. Other LXD instances will use this to detect whether this osd
@@ -169,10 +166,13 @@ func (d *ceph) Create() error {
 		if err != nil {
 			return err
 		}
+
 		d.config["volatile.pool.pristine"] = "true"
 	} else {
 		ok := d.HasVolume(placeholderVol)
 		if ok {
+			// ceph.osd.force_reuse is deprecated and should not be used. OSD pools are a logical
+			// construct there is no good reason not to create one for dedicated use by LXD.
 			if shared.IsFalseOrEmpty(d.config["ceph.osd.force_reuse"]) {
 				return fmt.Errorf("Pool '%s' in cluster '%s' seems to be in use by another LXD instance. Use 'ceph.osd.force_reuse=true' to force", d.config["ceph.osd.pool_name"], d.config["ceph.cluster_name"])
 			}
@@ -227,7 +227,7 @@ func (d *ceph) Delete(op *operations.Operation) error {
 	// Test if the pool exists.
 	poolExists := d.osdPoolExists()
 	if !poolExists {
-		d.logger.Warn("Pool does not exist", log.Ctx{"pool": d.config["ceph.osd.pool_name"], "cluster": d.config["ceph.cluster_name"]})
+		d.logger.Warn("Pool does not exist", logger.Ctx{"pool": d.config["ceph.osd.pool_name"], "cluster": d.config["ceph.cluster_name"]})
 	}
 
 	// Check whether we own the pool and only remove in this case.
@@ -259,7 +259,7 @@ func (d *ceph) Delete(op *operations.Operation) error {
 func (d *ceph) Validate(config map[string]string) error {
 	rules := map[string]func(value string) error{
 		"ceph.cluster_name":          validate.IsAny,
-		"ceph.osd.force_reuse":       validate.Optional(validate.IsBool),
+		"ceph.osd.force_reuse":       validate.Optional(validate.IsBool), // Deprecated, should not be used.
 		"ceph.osd.pg_num":            validate.IsAny,
 		"ceph.osd.pool_name":         validate.IsAny,
 		"ceph.osd.data_pool_name":    validate.IsAny,
@@ -272,7 +272,7 @@ func (d *ceph) Validate(config map[string]string) error {
 		"volume.block.mount_options": validate.IsAny,
 	}
 
-	return d.validatePool(config, rules)
+	return d.validatePool(config, rules, d.commonVolumeRules())
 }
 
 // Update applies any driver changes required from a configuration change.
@@ -296,7 +296,7 @@ func (d *ceph) Unmount() (bool, error) {
 func (d *ceph) GetResources() (*api.ResourcesStoragePool, error) {
 	var stdout bytes.Buffer
 
-	err := shared.RunCommandWithFds(nil, &stdout,
+	err := shared.RunCommandWithFds(context.TODO(), nil, &stdout,
 		"ceph",
 		"--name", fmt.Sprintf("client.%s", d.config["ceph.user.name"]),
 		"--cluster", d.config["ceph.cluster_name"],

@@ -40,11 +40,11 @@ func (c *cmdAlias) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Add
+// Add.
 type cmdAliasAdd struct {
 	global *cmdGlobal
 	alias  *cmdAlias
@@ -87,7 +87,7 @@ func (c *cmdAliasAdd) Run(cmd *cobra.Command, args []string) error {
 	return conf.SaveConfig(c.global.confPath)
 }
 
-// List
+// List.
 type cmdAliasList struct {
 	global *cmdGlobal
 	alias  *cmdAlias
@@ -123,6 +123,7 @@ func (c *cmdAliasList) Run(cmd *cobra.Command, args []string) error {
 	for k, v := range conf.Aliases {
 		data = append(data, []string{k, v})
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -133,7 +134,7 @@ func (c *cmdAliasList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, conf.Aliases)
 }
 
-// Rename
+// Rename.
 type cmdAliasRename struct {
 	global *cmdGlobal
 	alias  *cmdAlias
@@ -184,7 +185,7 @@ func (c *cmdAliasRename) Run(cmd *cobra.Command, args []string) error {
 	return conf.SaveConfig(c.global.confPath)
 }
 
-// Remove
+// Remove.
 type cmdAliasRemove struct {
 	global *cmdGlobal
 	alias  *cmdAlias

@@ -35,9 +35,11 @@ func Load() {
 		if !os.IsNotExist(err) {
 			log.Printf("usbid: failed to load: %s", err)
 		}
+
 		return
 	}
-	defer usbids.Close()
+
+	defer func() { _ = usbids.Close() }()
 
 	ids, cls, err := ParseIDs(usbids)
 	if err != nil {

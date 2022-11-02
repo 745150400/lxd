@@ -129,14 +129,24 @@ var networkPeerCmd = APIEndpoint{
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkPeersGet(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, reqProject, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	n, err := network.LoadByName(d.State(), projectName, mux.Vars(r)["networkName"])
+	networkName, err := url.PathUnescape(mux.Vars(r)["networkName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	n, err := network.LoadByName(d.State(), projectName, networkName)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+	}
+
+	// Check if project allows access to network.
+	if !project.NetworkAllowed(reqProject.Config, networkName, n.IsManaged()) {
+		return response.SmartError(api.StatusErrorf(http.StatusNotFound, "Network not found"))
 	}
 
 	if !n.Info().Peering {
@@ -144,7 +154,7 @@ func networkPeersGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	if util.IsRecursionRequest(r) {
-		records, err := d.State().Cluster.GetNetworkPeers(n.ID())
+		records, err := d.State().DB.Cluster.GetNetworkPeers(n.ID())
 		if err != nil {
 			return response.SmartError(fmt.Errorf("Failed loading network peers: %w", err))
 		}
@@ -158,7 +168,7 @@ func networkPeersGet(d *Daemon, r *http.Request) response.Response {
 		return response.SyncResponse(true, peers)
 	}
 
-	peerNames, err := d.State().Cluster.GetNetworkPeerNames(n.ID())
+	peerNames, err := d.State().DB.Cluster.GetNetworkPeerNames(n.ID())
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network peers: %w", err))
 	}
@@ -211,7 +221,7 @@ func networkPeersPost(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, reqProject, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -223,9 +233,19 @@ func networkPeersPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	n, err := network.LoadByName(d.State(), projectName, mux.Vars(r)["networkName"])
+	networkName, err := url.PathUnescape(mux.Vars(r)["networkName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	n, err := network.LoadByName(d.State(), projectName, networkName)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+	}
+
+	// Check if project allows access to network.
+	if !project.NetworkAllowed(reqProject.Config, networkName, n.IsManaged()) {
+		return response.SmartError(api.StatusErrorf(http.StatusNotFound, "Network not found"))
 	}
 
 	if !n.Info().Peering {
@@ -237,10 +257,10 @@ func networkPeersPost(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(fmt.Errorf("Failed creating peer: %w", err))
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.NetworkPeerCreated.Event(n, req.Name, request.CreateRequestor(r), nil))
+	lc := lifecycle.NetworkPeerCreated.Event(n, req.Name, request.CreateRequestor(r), nil)
+	d.State().Events.SendLifecycle(projectName, lc)
 
-	url := fmt.Sprintf("/%s/networks/%s/peers/%s", version.APIVersion, url.PathEscape(n.Name()), url.PathEscape(req.Name))
-	return response.SyncResponseLocation(true, nil, url)
+	return response.SyncResponseLocation(true, nil, lc.Source)
 }
 
 // swagger:operation DELETE /1.0/networks/{networkName}/peers/{peerName} network-peers network_peer_delete
@@ -273,21 +293,34 @@ func networkPeerDelete(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, reqProject, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	n, err := network.LoadByName(d.State(), projectName, mux.Vars(r)["networkName"])
+	networkName, err := url.PathUnescape(mux.Vars(r)["networkName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	n, err := network.LoadByName(d.State(), projectName, networkName)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+	}
+
+	// Check if project allows access to network.
+	if !project.NetworkAllowed(reqProject.Config, networkName, n.IsManaged()) {
+		return response.SmartError(api.StatusErrorf(http.StatusNotFound, "Network not found"))
 	}
 
 	if !n.Info().Peering {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support peering", n.Type()))
 	}
 
-	peerName := mux.Vars(r)["peerName"]
+	peerName, err := url.PathUnescape(mux.Vars(r)["peerName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	err = n.PeerDelete(peerName)
 	if err != nil {
@@ -345,23 +378,36 @@ func networkPeerGet(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, reqProject, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	n, err := network.LoadByName(d.State(), projectName, mux.Vars(r)["networkName"])
+	networkName, err := url.PathUnescape(mux.Vars(r)["networkName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	n, err := network.LoadByName(d.State(), projectName, networkName)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+	}
+
+	// Check if project allows access to network.
+	if !project.NetworkAllowed(reqProject.Config, networkName, n.IsManaged()) {
+		return response.SmartError(api.StatusErrorf(http.StatusNotFound, "Network not found"))
 	}
 
 	if !n.Info().Peering {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support peering", n.Type()))
 	}
 
-	peerName := mux.Vars(r)["peerName"]
+	peerName, err := url.PathUnescape(mux.Vars(r)["peerName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
-	_, peer, err := d.State().Cluster.GetNetworkPeer(n.ID(), peerName)
+	_, peer, err := d.State().DB.Cluster.GetNetworkPeer(n.ID(), peerName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -446,21 +492,34 @@ func networkPeerPut(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, reqProject, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	n, err := network.LoadByName(d.State(), projectName, mux.Vars(r)["networkName"])
+	networkName, err := url.PathUnescape(mux.Vars(r)["networkName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	n, err := network.LoadByName(d.State(), projectName, networkName)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+	}
+
+	// Check if project allows access to network.
+	if !project.NetworkAllowed(reqProject.Config, networkName, n.IsManaged()) {
+		return response.SmartError(api.StatusErrorf(http.StatusNotFound, "Network not found"))
 	}
 
 	if !n.Info().Peering {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support peering", n.Type()))
 	}
 
-	peerName := mux.Vars(r)["peerName"]
+	peerName, err := url.PathUnescape(mux.Vars(r)["peerName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Decode the request.
 	req := api.NetworkPeerPut{}

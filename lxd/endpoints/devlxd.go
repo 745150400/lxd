@@ -1,5 +1,4 @@
 //go:build linux && cgo
-// +build linux,cgo
 
 package endpoints
 
@@ -35,7 +34,7 @@ func createDevLxdlListener(dir string) (net.Listener, error) {
 
 	err = socketUnixSetPermissions(path, 0666)
 	if err != nil {
-		listener.Close()
+		_ = listener.Close()
 		return nil, err
 	}
 

@@ -4,9 +4,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/lxc/lxd/lxd/filter"
 	"github.com/lxc/lxd/shared/api"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestValueOf_Instance(t *testing.T) {
@@ -34,7 +35,7 @@ func TestValueOf_Instance(t *testing.T) {
 		Status: "Running",
 	}
 
-	cases := map[string]interface{}{}
+	cases := map[string]any{}
 	cases["architecture"] = "x86_64"
 	cases["created_at"] = date
 	cases["config.image.os"] = "BusyBox"
@@ -50,5 +51,4 @@ func TestValueOf_Instance(t *testing.T) {
 			assert.Equal(t, cases[field], value)
 		})
 	}
-
 }

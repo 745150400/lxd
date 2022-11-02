@@ -3,7 +3,6 @@ package pci
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -29,7 +28,8 @@ func ParseUeventFile(ueventFilePath string) (Device, error) {
 	if err != nil {
 		return dev, err
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -61,7 +61,7 @@ func ParseUeventFile(ueventFilePath string) (Device, error) {
 // DeviceUnbind unbinds a PCI device from the OS using its PCI Slot Name.
 func DeviceUnbind(pciDev Device) error {
 	driverUnbindPath := fmt.Sprintf("/sys/bus/pci/devices/%s/driver/unbind", pciDev.SlotName)
-	err := ioutil.WriteFile(driverUnbindPath, []byte(pciDev.SlotName), 0600)
+	err := os.WriteFile(driverUnbindPath, []byte(pciDev.SlotName), 0600)
 	if err != nil {
 		if !os.IsNotExist(err) || !shared.PathExists(fmt.Sprintf("/sys/bus/pci/devices/%s/", pciDev.SlotName)) {
 			return fmt.Errorf("Failed unbinding device %q via %q: %w", pciDev.SlotName, driverUnbindPath, err)
@@ -76,7 +76,7 @@ func DeviceSetDriverOverride(pciDev Device, driverOverride string) error {
 	overridePath := filepath.Join("/sys/bus/pci/devices", pciDev.SlotName, "driver_override")
 
 	// The "\n" at end is important to allow the driver override to be cleared by passing "" in.
-	err := ioutil.WriteFile(overridePath, []byte(fmt.Sprintf("%s\n", driverOverride)), 0600)
+	err := os.WriteFile(overridePath, []byte(fmt.Sprintf("%s\n", driverOverride)), 0600)
 	if err != nil {
 		return fmt.Errorf("Failed setting driver override %q for device %q via %q: %w", driverOverride, pciDev.SlotName, overridePath, err)
 	}
@@ -87,7 +87,7 @@ func DeviceSetDriverOverride(pciDev Device, driverOverride string) error {
 // DeviceProbe probes a PCI device using its PCI Slot Name.
 func DeviceProbe(pciDev Device) error {
 	driveProbePath := "/sys/bus/pci/drivers_probe"
-	err := ioutil.WriteFile(driveProbePath, []byte(pciDev.SlotName), 0600)
+	err := os.WriteFile(driveProbePath, []byte(pciDev.SlotName), 0600)
 	if err != nil {
 		return fmt.Errorf("Failed probing device %q via %q: %w", pciDev.SlotName, driveProbePath, err)
 	}
@@ -109,9 +109,9 @@ func DeviceDriverOverride(pciDev Device, driverOverride string) error {
 
 	revert.Add(func() {
 		// Reset the driver override and rebind to original driver (if needed).
-		DeviceUnbind(pciDev)
-		DeviceSetDriverOverride(pciDev, pciDev.Driver)
-		DeviceProbe(pciDev)
+		_ = DeviceUnbind(pciDev)
+		_ = DeviceSetDriverOverride(pciDev, pciDev.Driver)
+		_ = DeviceProbe(pciDev)
 	})
 
 	// Set driver override.

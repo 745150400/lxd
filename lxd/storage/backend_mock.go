@@ -2,9 +2,11 @@ package storage
 
 import (
 	"io"
+	"net/url"
 	"time"
 
 	"github.com/lxc/lxd/lxd/backup"
+	backupConfig "github.com/lxc/lxd/lxd/backup/config"
 	"github.com/lxc/lxd/lxd/cluster/request"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/migration"
@@ -12,6 +14,7 @@ import (
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/lxd/storage/drivers"
+	"github.com/lxc/lxd/lxd/storage/s3/miniod"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/instancewriter"
 	"github.com/lxc/lxd/shared/logger"
@@ -34,6 +37,14 @@ func (b *mockBackend) Name() string {
 
 func (b *mockBackend) Description() string {
 	return ""
+}
+
+func (b *mockBackend) ValidateName(value string) error {
+	return nil
+}
+
+func (b *mockBackend) Validate(config map[string]string) error {
+	return nil
 }
 
 func (b *mockBackend) Status() string {
@@ -97,10 +108,6 @@ func (b *mockBackend) GetVolume(volType drivers.VolumeType, contentType drivers.
 	return drivers.Volume{}
 }
 
-func (b *mockBackend) FillInstanceConfig(inst instance.Instance, config map[string]string) error {
-	return nil
-}
-
 func (b *mockBackend) CreateInstance(inst instance.Instance, op *operations.Operation) error {
 	return nil
 }
@@ -133,19 +140,27 @@ func (b *mockBackend) UpdateInstance(inst instance.Instance, newDesc string, new
 	return nil
 }
 
+func (b *mockBackend) GenerateCustomVolumeBackupConfig(projectName string, volName string, snapshots bool, op *operations.Operation) (*backupConfig.Config, error) {
+	return nil, nil
+}
+
+func (b *mockBackend) GenerateInstanceBackupConfig(inst instance.Instance, snapshots bool, op *operations.Operation) (*backupConfig.Config, error) {
+	return nil, nil
+}
+
 func (b *mockBackend) UpdateInstanceBackupFile(inst instance.Instance, op *operations.Operation) error {
 	return nil
 }
 
-func (b *mockBackend) CheckInstanceBackupFileSnapshots(backupConf *backup.Config, projectName string, deleteMissing bool, op *operations.Operation) ([]*api.InstanceSnapshot, error) {
+func (b *mockBackend) CheckInstanceBackupFileSnapshots(backupConf *backupConfig.Config, projectName string, deleteMissing bool, op *operations.Operation) ([]*api.InstanceSnapshot, error) {
 	return nil, nil
 }
 
-func (b *mockBackend) ListUnknownVolumes(op *operations.Operation) (map[string][]*backup.Config, error) {
+func (b *mockBackend) ListUnknownVolumes(op *operations.Operation) (map[string][]*backupConfig.Config, error) {
 	return nil, nil
 }
 
-func (b *mockBackend) ImportInstance(inst instance.Instance, op *operations.Operation) error {
+func (b *mockBackend) ImportInstance(inst instance.Instance, poolVol *backupConfig.Config, op *operations.Operation) error {
 	return nil
 }
 
@@ -177,8 +192,8 @@ func (b *mockBackend) MountInstance(inst instance.Instance, op *operations.Opera
 	return &MountInfo{}, nil
 }
 
-func (b *mockBackend) UnmountInstance(inst instance.Instance, op *operations.Operation) (bool, error) {
-	return true, nil
+func (b *mockBackend) UnmountInstance(inst instance.Instance, op *operations.Operation) error {
+	return nil
 }
 
 func (b *mockBackend) CreateInstanceSnapshot(i instance.Instance, src instance.Instance, op *operations.Operation) error {
@@ -201,8 +216,8 @@ func (b *mockBackend) MountInstanceSnapshot(inst instance.Instance, op *operatio
 	return &MountInfo{}, nil
 }
 
-func (b *mockBackend) UnmountInstanceSnapshot(inst instance.Instance, op *operations.Operation) (bool, error) {
-	return true, nil
+func (b *mockBackend) UnmountInstanceSnapshot(inst instance.Instance, op *operations.Operation) error {
+	return nil
 }
 
 func (b *mockBackend) UpdateInstanceSnapshot(inst instance.Instance, newDesc string, newConfig map[string]string, op *operations.Operation) error {
@@ -221,6 +236,38 @@ func (b *mockBackend) UpdateImage(fingerprint, newDesc string, newConfig map[str
 	return nil
 }
 
+func (b *mockBackend) CreateBucket(projectName string, bucket api.StorageBucketsPost, op *operations.Operation) error {
+	return nil
+}
+
+func (b *mockBackend) UpdateBucket(projectName string, bucketName string, bucket api.StorageBucketPut, op *operations.Operation) error {
+	return nil
+}
+
+func (b *mockBackend) DeleteBucket(projectName string, bucketName string, op *operations.Operation) error {
+	return nil
+}
+
+func (b *mockBackend) CreateBucketKey(projectName string, bucketName string, key api.StorageBucketKeysPost, op *operations.Operation) (*api.StorageBucketKey, error) {
+	return nil, nil
+}
+
+func (b *mockBackend) UpdateBucketKey(projectName string, bucketName string, keyName string, key api.StorageBucketKeyPut, op *operations.Operation) error {
+	return nil
+}
+
+func (b *mockBackend) DeleteBucketKey(projectName string, bucketName string, keyName string, op *operations.Operation) error {
+	return nil
+}
+
+func (b *mockBackend) ActivateBucket(bucketName string, op *operations.Operation) (*miniod.Process, error) {
+	return nil, nil
+}
+
+func (b *mockBackend) GetBucketURL(bucketName string) *url.URL {
+	return nil
+}
+
 func (b *mockBackend) CreateCustomVolume(projectName string, volName string, desc string, config map[string]string, contentType drivers.ContentType, op *operations.Operation) error {
 	return nil
 }
@@ -234,7 +281,7 @@ func (b *mockBackend) RenameCustomVolume(projectName string, volName string, new
 }
 
 func (b *mockBackend) UpdateCustomVolume(projectName string, volName string, newDesc string, newConfig map[string]string, op *operations.Operation) error {
-	return drivers.ErrNotImplemented
+	return nil
 }
 
 func (b *mockBackend) DeleteCustomVolume(projectName string, volName string, op *operations.Operation) error {
@@ -265,7 +312,7 @@ func (b *mockBackend) UnmountCustomVolume(projectName string, volName string, op
 	return true, nil
 }
 
-func (b *mockBackend) ImportCustomVolume(projectName string, poolVol backup.Config, op *operations.Operation) error {
+func (b *mockBackend) ImportCustomVolume(projectName string, poolVol *backupConfig.Config, op *operations.Operation) error {
 	return nil
 }
 

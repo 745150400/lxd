@@ -103,6 +103,33 @@ test_remote_url_with_token() {
   [ "$(curl -k -s --key "${TEST_DIR}/token-client.key" --cert "${TEST_DIR}/token-client.crt" "https://${LXD_ADDR}/1.0/instances" | jq '.error_code')" -eq 403 ]
 
   lxc config trust rm "$(lxc config trust list -f json | jq -r '.[].fingerprint')"
+
+  # Set token expiry to 5 seconds
+  lxc config set core.remote_token_expiry 5S
+
+  # Generate new token
+  token="$(lxc config trust add --name foo | tail -n1)"
+
+  # Try adding remote. This should succeed.
+  lxc_remote remote add test "${token}"
+
+  # Remove all trusted clients
+  lxc config trust rm "$(lxc config trust list -f json | jq -r '.[].fingerprint')"
+
+  # Remove remote
+  lxc_remote remote rm test
+
+  # Generate new token
+  token="$(lxc config trust add --name foo | tail -n1)"
+
+  # This will cause the token to expire
+  sleep 5
+
+  # Try adding remote. This should fail.
+  ! lxc_remote remote add test "${token}" || false
+
+  # Unset token expiry
+  lxc config unset core.remote_token_expiry
 }
 
 test_remote_admin() {
@@ -154,7 +181,7 @@ test_remote_admin() {
 }
 
 test_remote_usage() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD2_DIR LXD2_ADDR
   LXD2_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD2_DIR}"
@@ -298,6 +325,21 @@ test_remote_usage() {
   lxc_remote image show lxd2:"${sum}" --project foo
   lxc_remote image delete "lxd2:${sum}" --project foo
   lxc_remote project delete lxd2:foo
+
+  # Test image copy with --profile option
+  lxc_remote profile create lxd2:foo
+  lxc_remote image copy "localhost:${sum}" lxd2: --profile foo
+  lxc_remote image show lxd2:"${sum}" | grep -q '\- foo'
+  lxc_remote image delete "lxd2:${sum}"
+
+  lxc_remote image copy "localhost:${sum}" lxd2: --profile foo --mode=push
+  lxc_remote image show lxd2:"${sum}" | grep -q '\- foo'
+  lxc_remote image delete "lxd2:${sum}"
+
+  lxc_remote image copy "localhost:${sum}" lxd2: --profile foo --mode=relay
+  lxc_remote image show lxd2:"${sum}" | grep -q '\- foo'
+  lxc_remote image delete "lxd2:${sum}"
+  lxc_remote profile delete lxd2:foo
 
   lxc_remote image alias delete localhost:foo
 

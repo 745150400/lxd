@@ -1,5 +1,4 @@
 //go:build linux && cgo
-// +build linux,cgo
 
 package netutils
 
@@ -63,7 +62,7 @@ const UnixFdsReceivedMore uint = C.UNIX_FDS_RECEIVED_MORE
 const UnixFdsReceivedNone uint = C.UNIX_FDS_RECEIVED_NONE
 
 // NetnsGetifaddrs returns a map of InstanceStateNetwork for a particular process.
-func NetnsGetifaddrs(initPID int32) (map[string]api.InstanceStateNetwork, error) {
+func NetnsGetifaddrs(initPID int32, hostInterfaces []net.Interface) (map[string]api.InstanceStateNetwork, error) {
 	var netnsidAware C.bool
 	var ifaddrs *C.struct_netns_ifaddrs
 	var netnsID C.__s32
@@ -73,7 +72,8 @@ func NetnsGetifaddrs(initPID int32) (map[string]api.InstanceStateNetwork, error)
 		if err != nil {
 			return nil, err
 		}
-		defer f.Close()
+
+		defer func() { _ = f.Close() }()
 
 		netnsID = C.netns_get_nsid(C.__s32(f.Fd()))
 		if netnsID < 0 {
@@ -87,6 +87,7 @@ func NetnsGetifaddrs(initPID int32) (map[string]api.InstanceStateNetwork, error)
 	if ret < 0 {
 		return nil, fmt.Errorf("Failed to retrieve network interfaces and addresses")
 	}
+
 	defer C.netns_freeifaddrs(ifaddrs)
 
 	if netnsID >= 0 && !netnsidAware {
@@ -126,14 +127,17 @@ func NetnsGetifaddrs(initPID int32) (map[string]api.InstanceStateNetwork, error)
 		if (addr.ifa_flags & C.IFF_UP) > 0 {
 			netState = "up"
 		}
+
 		addNetwork.State = netState
 		addNetwork.Type = netType
 		addNetwork.Mtu = int(addr.ifa_mtu)
 
 		if initPID != 0 && int(addr.ifa_ifindex_peer) > 0 {
-			hostInterface, err := net.InterfaceByIndex(int(addr.ifa_ifindex_peer))
-			if err == nil {
-				addNetwork.HostName = hostInterface.Name
+			for _, hostInterface := range hostInterfaces {
+				if hostInterface.Index == int(addr.ifa_ifindex_peer) {
+					addNetwork.HostName = hostInterface.Name
+					break
+				}
 			}
 		}
 
@@ -206,6 +210,7 @@ func NetnsGetifaddrs(initPID int32) (map[string]api.InstanceStateNetwork, error)
 			addNetwork.Counters.PacketsDroppedInbound = int64(addr.ifa_stats64.rx_dropped)
 			addNetwork.Counters.PacketsDroppedOutbound = int64(addr.ifa_stats64.tx_dropped)
 		}
+
 		ifName := C.GoString(addr.ifa_name)
 
 		networks[ifName] = addNetwork

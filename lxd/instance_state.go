@@ -3,12 +3,14 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/gorilla/mux"
 
-	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/operationtype"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/response"
@@ -68,13 +70,21 @@ func instanceState(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to a container on a different node
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
@@ -83,7 +93,9 @@ func instanceState(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.SmartError(err)
 	}
-	state, err := c.RenderState()
+
+	hostInterfaces, _ := net.Interfaces()
+	state, err := c.RenderState(hostInterfaces)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -130,13 +142,21 @@ func instanceStatePut(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to a container on a different node
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
@@ -145,17 +165,18 @@ func instanceStatePut(d *Daemon, r *http.Request) response.Response {
 
 	// We default to -1 (i.e. no timeout) here instead of 0 (instant timeout).
 	req.Timeout = -1
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	err = json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
 		return response.BadRequest(err)
 	}
 
 	// Check if the cluster member is evacuated.
-	if d.cluster.LocalNodeIsEvacuated() && req.Action != "stop" {
+	if d.db.Cluster.LocalNodeIsEvacuated() && req.Action != "stop" {
 		return response.Forbidden(fmt.Errorf("Cluster member is evacuated"))
 	}
 
-	// Don't mess with containers while in setup mode.
-	<-d.readyChan
+	// Don't mess with instances while in setup mode.
+	<-d.waitReady.Done()
 
 	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
 	if err != nil {
@@ -184,21 +205,21 @@ func instanceStatePut(d *Daemon, r *http.Request) response.Response {
 	return operations.OperationResponse(op)
 }
 
-func instanceActionToOptype(action string) (db.OperationType, error) {
+func instanceActionToOptype(action string) (operationtype.Type, error) {
 	switch shared.InstanceAction(action) {
 	case shared.Start:
-		return db.OperationInstanceStart, nil
+		return operationtype.InstanceStart, nil
 	case shared.Stop:
-		return db.OperationInstanceStop, nil
+		return operationtype.InstanceStop, nil
 	case shared.Restart:
-		return db.OperationInstanceRestart, nil
+		return operationtype.InstanceRestart, nil
 	case shared.Freeze:
-		return db.OperationInstanceFreeze, nil
+		return operationtype.InstanceFreeze, nil
 	case shared.Unfreeze:
-		return db.OperationInstanceUnfreeze, nil
+		return operationtype.InstanceUnfreeze, nil
 	}
 
-	return db.OperationUnknown, fmt.Errorf("Unknown action: '%s'", action)
+	return operationtype.Unknown, fmt.Errorf("Unknown action: '%s'", action)
 }
 
 func doInstanceStatePut(inst instance.Instance, req api.InstanceStatePut) error {
@@ -213,6 +234,7 @@ func doInstanceStatePut(inst instance.Instance, req api.InstanceStatePut) error 
 		} else {
 			return inst.Shutdown(time.Duration(req.Timeout) * time.Second)
 		}
+
 	case shared.Restart:
 		timeout := req.Timeout
 		if req.Force {

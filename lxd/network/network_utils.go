@@ -3,9 +3,9 @@ package network
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"math/rand"
 	"net"
@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/device/nictype"
 	"github.com/lxc/lxd/lxd/dnsmasq"
@@ -64,9 +65,15 @@ func RandomDevName(prefix string) string {
 	return iface
 }
 
-// usedByInstanceDevices looks for instance NIC devices using the network and runs the supplied usageFunc for each.
-func usedByInstanceDevices(s *state.State, networkProjectName string, networkName string, usageFunc func(inst db.Instance, nicName string, nicConfig map[string]string) error) error {
-	return s.Cluster.InstanceList(nil, func(inst db.Instance, p db.Project, profiles []api.Profile) error {
+// MACDevName returns interface name with prefix 'lxd' and MAC without leading 2 digits.
+func MACDevName(mac net.HardwareAddr) string {
+	devName := strings.Join(strings.Split(mac.String(), ":"), "")
+	return fmt.Sprintf("lxd%s", devName[2:])
+}
+
+// UsedByInstanceDevices looks for instance NIC devices using the network and runs the supplied usageFunc for each.
+func UsedByInstanceDevices(s *state.State, networkProjectName string, networkName string, usageFunc func(inst db.InstanceArgs, nicName string, nicConfig map[string]string) error) error {
+	return s.DB.Cluster.InstanceList(func(inst db.InstanceArgs, p api.Project) error {
 		// Get the instance's effective network project name.
 		instNetworkProject := project.NetworkProjectFromRecord(&p)
 
@@ -76,7 +83,7 @@ func usedByInstanceDevices(s *state.State, networkProjectName string, networkNam
 		}
 
 		// Look for NIC devices using this network.
-		devices := db.ExpandInstanceDevices(deviceConfig.NewDevices(db.DevicesToAPI(inst.Devices)), profiles)
+		devices := db.ExpandInstanceDevices(inst.Devices.Clone(), inst.Profiles)
 		for devName, devConfig := range devices {
 			if isInUseByDevice(networkName, devConfig) {
 				err := usageFunc(inst, devName, devConfig)
@@ -98,7 +105,7 @@ func UsedBy(s *state.State, networkProjectName string, networkID int64, networkN
 
 	// If managed network being passed in, check if it has any peerings in a created state.
 	if networkID > 0 {
-		peers, err := s.Cluster.GetNetworkPeers(networkID)
+		peers, err := s.DB.Cluster.GetNetworkPeers(networkID)
 		if err != nil {
 			return nil, fmt.Errorf("Failed getting network peers: %w", err)
 		}
@@ -120,8 +127,8 @@ func UsedBy(s *state.State, networkProjectName string, networkID int64, networkN
 		// Get all managed networks across all projects.
 		var projectNetworks map[string]map[int64]api.Network
 
-		err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-			projectNetworks, err = tx.GetCreatedNetworks()
+		err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			projectNetworks, err = tx.GetCreatedNetworks(ctx)
 			return err
 		})
 		if err != nil {
@@ -148,11 +155,40 @@ func UsedBy(s *state.State, networkProjectName string, networkID int64, networkN
 	}
 
 	// Look for profiles. Next cheapest to do.
-	var profiles []db.Profile
-	err = s.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		profiles, err = tx.GetProfiles(db.ProfileFilter{})
+	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		profiles, err := cluster.GetProfiles(ctx, tx.Tx())
 		if err != nil {
 			return err
+		}
+
+		for _, profile := range profiles {
+			profileDevices, err := cluster.GetProfileDevices(ctx, tx.Tx(), profile.ID)
+			if err != nil {
+				return err
+			}
+
+			profileProject, err := cluster.GetProject(ctx, tx.Tx(), profile.Project)
+			if err != nil {
+				return err
+			}
+
+			apiProfileProject, err := profileProject.ToAPI(ctx, tx.Tx())
+			if err != nil {
+				return err
+			}
+
+			inUse, err := usedByProfileDevices(s, profileDevices, apiProfileProject, networkProjectName, networkName)
+			if err != nil {
+				return err
+			}
+
+			if inUse {
+				usedBy = append(usedBy, api.NewURL().Path(version.APIVersion, "profiles", profile.Name).Project(profile.Project).String())
+
+				if firstOnly {
+					return nil
+				}
+			}
 		}
 
 		return nil
@@ -161,23 +197,8 @@ func UsedBy(s *state.State, networkProjectName string, networkID int64, networkN
 		return nil, err
 	}
 
-	for _, profile := range profiles {
-		inUse, err := usedByProfileDevices(s, profile, networkProjectName, networkName)
-		if err != nil {
-			return nil, err
-		}
-
-		if inUse {
-			usedBy = append(usedBy, api.NewURL().Path(version.APIVersion, "profiles", profile.Name).Project(profile.Project).String())
-
-			if firstOnly {
-				return usedBy, nil
-			}
-		}
-	}
-
 	// Check if any instance devices use this network.
-	err = usedByInstanceDevices(s, networkProjectName, networkName, func(inst db.Instance, nicName string, nicConfig map[string]string) error {
+	err = UsedByInstanceDevices(s, networkProjectName, networkName, func(inst db.InstanceArgs, nicName string, nicConfig map[string]string) error {
 		usedBy = append(usedBy, api.NewURL().Path(version.APIVersion, "instances", inst.Name).Project(inst.Project).String())
 
 		if firstOnly {
@@ -200,20 +221,17 @@ func UsedBy(s *state.State, networkProjectName string, networkID int64, networkN
 
 // usedByProfileDevices indicates if network is referenced by a profile's NIC devices.
 // Checks if the device's parent or network properties match the network name.
-func usedByProfileDevices(s *state.State, profile db.Profile, networkProjectName string, networkName string) (bool, error) {
+func usedByProfileDevices(s *state.State, profileDevices map[string]cluster.Device, profileProject *api.Project, networkProjectName string, networkName string) (bool, error) {
 	// Get the translated network project name from the profiles's project.
-	profileNetworkProjectName, _, err := project.NetworkProject(s.Cluster, profile.Project)
-	if err != nil {
-		return false, err
-	}
 
 	// Skip profiles who's translated network project doesn't match the requested network's project.
 	// Because its devices can't be using this network.
+	profileNetworkProjectName := project.NetworkProjectFromRecord(profileProject)
 	if networkProjectName != profileNetworkProjectName {
 		return false, nil
 	}
 
-	for _, d := range deviceConfig.NewDevices(db.DevicesToAPI(profile.Devices)) {
+	for _, d := range deviceConfig.NewDevices(cluster.DevicesToAPI(profileDevices)) {
 		if isInUseByDevice(networkName, d) {
 			return true, nil
 		}
@@ -241,7 +259,7 @@ func isInUseByDevice(networkName string, d deviceConfig.Device) bool {
 
 // GetDevMTU retrieves the current MTU setting for a named network device.
 func GetDevMTU(devName string) (uint32, error) {
-	content, err := ioutil.ReadFile(fmt.Sprintf("/sys/class/net/%s/mtu", devName))
+	content, err := os.ReadFile(fmt.Sprintf("/sys/class/net/%s/mtu", devName))
 	if err != nil {
 		return 0, err
 	}
@@ -261,7 +279,8 @@ func DefaultGatewaySubnetV4() (*net.IPNet, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	ifaceName := ""
 
@@ -332,7 +351,7 @@ func UpdateDNSMasqStatic(s *state.State, networkName string) error {
 		var err error
 
 		// Pass project.Default here, as currently dnsmasq (bridged) networks do not support projects.
-		networks, err = s.Cluster.GetNetworks(project.Default)
+		networks, err = s.DB.Cluster.GetNetworks(project.Default)
 		if err != nil {
 			return err
 		}
@@ -356,7 +375,7 @@ func UpdateDNSMasqStatic(s *state.State, networkName string) error {
 				continue
 			}
 
-			nicType, err := nictype.NICType(s, inst.Project(), d)
+			nicType, err := nictype.NICType(s, inst.Project().Name, d)
 			if err != nil || nicType != "bridged" {
 				continue
 			}
@@ -384,7 +403,7 @@ func UpdateDNSMasqStatic(s *state.State, networkName string) error {
 			}
 
 			if (shared.IsTrue(d["security.ipv4_filtering"]) && d["ipv4.address"] == "") || (shared.IsTrue(d["security.ipv6_filtering"]) && d["ipv6.address"] == "") {
-				deviceStaticFileName := dnsmasq.StaticAllocationFileName(inst.Project(), inst.Name(), deviceName)
+				deviceStaticFileName := dnsmasq.StaticAllocationFileName(inst.Project().Name, inst.Name(), deviceName)
 				_, curIPv4, curIPv6, err := dnsmasq.DHCPStaticAllocation(d["parent"], deviceStaticFileName)
 				if err != nil && !os.IsNotExist(err) {
 					return err
@@ -399,13 +418,13 @@ func UpdateDNSMasqStatic(s *state.State, networkName string) error {
 				}
 			}
 
-			entries[d["parent"]] = append(entries[d["parent"]], []string{d["hwaddr"], inst.Project(), inst.Name(), d["ipv4.address"], d["ipv6.address"], deviceName})
+			entries[d["parent"]] = append(entries[d["parent"]], []string{d["hwaddr"], inst.Project().Name, inst.Name(), d["ipv4.address"], d["ipv6.address"], deviceName})
 		}
 	}
 
 	// Update the host files.
 	for _, network := range networks {
-		entries, _ := entries[network]
+		entries := entries[network]
 
 		// Skip networks we don't manage (or don't have DHCP enabled).
 		if !shared.PathExists(shared.VarPath("networks", network, "dnsmasq.pid")) {
@@ -421,7 +440,7 @@ func UpdateDNSMasqStatic(s *state.State, networkName string) error {
 		config := n.Config()
 
 		// Wipe everything clean.
-		files, err := ioutil.ReadDir(shared.VarPath("networks", network, "dnsmasq.hosts"))
+		files, err := os.ReadDir(shared.VarPath("networks", network, "dnsmasq.hosts"))
 		if err != nil {
 			return err
 		}
@@ -500,7 +519,8 @@ func ForkdnsServersList(networkName string) ([]string, error) {
 	if err != nil {
 		return servers, err
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -509,7 +529,9 @@ func ForkdnsServersList(networkName string) ([]string, error) {
 			servers = append(servers, fields[0])
 		}
 	}
-	if err := scanner.Err(); err != nil {
+
+	err = scanner.Err()
+	if err != nil {
 		return servers, err
 	}
 
@@ -570,7 +592,8 @@ func inRoutingTable(subnet *net.IPNet) bool {
 	if err != nil {
 		return false
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewReader(file)
 	for {
@@ -644,12 +667,7 @@ func pingIP(ip net.IP) bool {
 	}
 
 	_, err := shared.RunCommand(cmd, "-n", "-q", ip.String(), "-c", "1", "-W", "1")
-	if err != nil {
-		// Remote didn't answer.
-		return false
-	}
-
-	return true
+	return err == nil
 }
 
 func pingSubnet(subnet *net.IPNet) bool {
@@ -732,7 +750,8 @@ func GetHostDevice(parent string, vlan string) string {
 	if err != nil {
 		return defaultVlan
 	}
-	defer f.Close()
+
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -777,7 +796,7 @@ func GetLeaseAddresses(networkName string, hwaddr string) ([]net.IP, error) {
 		return nil, fmt.Errorf("Leases file not found for network %q", networkName)
 	}
 
-	content, err := ioutil.ReadFile(leaseFile)
+	content, err := os.ReadFile(leaseFile)
 	if err != nil {
 		return nil, err
 	}
@@ -817,8 +836,9 @@ func GetMACSlice(hwaddr string) []string {
 	var buf []string
 
 	if !strings.Contains(hwaddr, ":") {
-		if s, err := strconv.ParseUint(hwaddr, 10, 64); err == nil {
-			hwaddr = fmt.Sprintln(fmt.Sprintf("%x", s))
+		s, err := strconv.ParseUint(hwaddr, 10, 64)
+		if err == nil {
+			hwaddr = fmt.Sprintf("%x\n", s)
 			var tuple string
 			for i, r := range hwaddr {
 				tuple = tuple + string(r)
@@ -1032,7 +1052,7 @@ func VLANInterfaceCreate(parent string, vlanDevice string, vlanID string, gvrp b
 	}
 
 	// Attempt to disable IPv6 router advertisement acceptance.
-	util.SysctlSet(fmt.Sprintf("net/ipv6/conf/%s/accept_ra", vlanDevice), "0")
+	_ = util.SysctlSet(fmt.Sprintf("net/ipv6/conf/%s/accept_ra", vlanDevice), "0")
 
 	// We created a new vlan interface, return true.
 	return true, nil
@@ -1097,11 +1117,7 @@ func SubnetContainsIP(outerSubnet *net.IPNet, ip net.IP) bool {
 
 	ipSubnet.IP = ip
 
-	if SubnetContains(outerSubnet, ipSubnet) {
-		return true
-	}
-
-	return false
+	return SubnetContains(outerSubnet, ipSubnet)
 }
 
 // SubnetIterate iterates through each IP in a subnet calling a function for each IP.
@@ -1163,7 +1179,7 @@ func InterfaceBindWait(ifName string) error {
 	return fmt.Errorf("Bind of interface %q took too long", ifName)
 }
 
-// IPRangesOverlap checks whether two ip ranges have ip addresses in common
+// IPRangesOverlap checks whether two ip ranges have ip addresses in common.
 func IPRangesOverlap(r1, r2 *shared.IPRange) bool {
 	if r1.End == nil {
 		return r2.ContainsIP(r1.Start)

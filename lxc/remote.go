@@ -5,6 +5,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"sort"
@@ -63,11 +64,11 @@ func (c *cmdRemote) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Add
+// Add.
 type cmdRemoteAdd struct {
 	global *cmdGlobal
 	remote *cmdRemote
@@ -153,13 +154,9 @@ func (c *cmdRemoteAdd) findProject(d lxd.InstanceServer, project string) (string
 func (c *cmdRemoteAdd) RunToken(server string, token string, rawToken *api.CertificateAddToken) error {
 	conf := c.global.conf
 
-	var certificate *x509.Certificate
-	var err error
-	var d lxd.InstanceServer
-
 	if !conf.HasClientCertificate() {
 		fmt.Fprintf(os.Stderr, i18n.G("Generating a client certificate. This may take a minute...")+"\n")
-		err = conf.GenerateClientCertificate()
+		err := conf.GenerateClientCertificate()
 		if err != nil {
 			return err
 		}
@@ -168,65 +165,107 @@ func (c *cmdRemoteAdd) RunToken(server string, token string, rawToken *api.Certi
 	for _, addr := range rawToken.Addresses {
 		addr = fmt.Sprintf("https://%s", addr)
 
-		conf.Remotes[server] = config.Remote{Addr: addr, Protocol: c.flagProtocol, AuthType: c.flagAuthType, Domain: c.flagDomain}
-
-		d, err = conf.GetInstanceServer(server)
+		err := c.addRemoteFromToken(addr, server, token, rawToken.Fingerprint)
 		if err != nil {
-			certificate, err = shared.GetRemoteCertificate(addr, c.global.conf.UserAgent)
-			if err != nil {
+			if api.StatusErrorCheck(err, http.StatusServiceUnavailable) {
 				continue
 			}
 
-			certDigest := shared.CertFingerprint(certificate)
-			if rawToken.Fingerprint != certDigest {
-				return fmt.Errorf(i18n.G("Certificate fingerprint mismatch between certificate token and server %q"), addr)
-			}
-
-			dnam := conf.ConfigPath("servercerts")
-			err := os.MkdirAll(dnam, 0750)
-			if err != nil {
-				return fmt.Errorf(i18n.G("Could not create server cert dir"))
-			}
-
-			certf := conf.ServerCertPath(server)
-
-			certOut, err := os.Create(certf)
-			if err != nil {
-				return fmt.Errorf(i18n.G("Failed to create %q: %w"), certf, err)
-			}
-
-			pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw})
-			certOut.Close()
+			return err
 		}
 
-		d, err = conf.GetInstanceServer(server)
-		if err != nil {
-			continue
-		}
-
-		req := api.CertificatesPost{
-			Password: token,
-		}
-
-		err = d.CreateCertificate(req)
-		if err != nil {
-			return fmt.Errorf(i18n.G("Failed to create certificate: %w"), err)
-		}
-
-		// Handle project.
-		remote := conf.Remotes[server]
-		project, err := c.findProject(d.(lxd.InstanceServer), c.flagProject)
-		if err != nil {
-			return fmt.Errorf(i18n.G("Failed to find project: %w"), err)
-		}
-
-		remote.Project = project
-		conf.Remotes[server] = remote
-
-		return conf.SaveConfig(c.global.confPath)
+		return nil
 	}
 
-	return fmt.Errorf(i18n.G("Failed to add remote"))
+	fmt.Println(i18n.G("All server addresses are unavailable"))
+	fmt.Printf(i18n.G("Please provide an alternate server address (empty to abort):") + " ")
+
+	line, err := shared.ReadStdin()
+	if err != nil {
+		return err
+	}
+
+	if len(line) == 0 {
+		return fmt.Errorf(i18n.G("Failed to add remote"))
+	}
+
+	err = c.addRemoteFromToken(string(line), server, token, rawToken.Fingerprint)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *cmdRemoteAdd) addRemoteFromToken(addr string, server string, token string, fingerprint string) error {
+	conf := c.global.conf
+
+	var certificate *x509.Certificate
+	var err error
+
+	conf.Remotes[server] = config.Remote{Addr: addr, Protocol: c.flagProtocol, AuthType: c.flagAuthType, Domain: c.flagDomain}
+
+	_, err = conf.GetInstanceServer(server)
+	if err != nil {
+		certificate, err = shared.GetRemoteCertificate(addr, c.global.conf.UserAgent)
+		if err != nil {
+			return api.StatusErrorf(http.StatusServiceUnavailable, i18n.G("Unavailable remote server")+": %v", err)
+		}
+
+		certDigest := shared.CertFingerprint(certificate)
+		if fingerprint != certDigest {
+			return fmt.Errorf(i18n.G("Certificate fingerprint mismatch between certificate token and server %q"), addr)
+		}
+
+		dnam := conf.ConfigPath("servercerts")
+		err := os.MkdirAll(dnam, 0750)
+		if err != nil {
+			return fmt.Errorf(i18n.G("Could not create server cert dir"))
+		}
+
+		certf := conf.ServerCertPath(server)
+
+		certOut, err := os.Create(certf)
+		if err != nil {
+			return fmt.Errorf(i18n.G("Failed to create %q: %w"), certf, err)
+		}
+
+		err = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw})
+		if err != nil {
+			return fmt.Errorf(i18n.G("Failed to write server cert file %q: %w"), certf, err)
+		}
+
+		err = certOut.Close()
+		if err != nil {
+			return fmt.Errorf(i18n.G("Failed to close server cert file %q: %w"), certf, err)
+		}
+	}
+
+	d, err := conf.GetInstanceServer(server)
+	if err != nil {
+		return api.StatusErrorf(http.StatusServiceUnavailable, i18n.G("Unavailable remote server")+": %v", err)
+	}
+
+	req := api.CertificatesPost{
+		Password: token,
+	}
+
+	err = d.CreateCertificate(req)
+	if err != nil {
+		return fmt.Errorf(i18n.G("Failed to create certificate: %w"), err)
+	}
+
+	// Handle project.
+	remote := conf.Remotes[server]
+	project, err := c.findProject(d, c.flagProject)
+	if err != nil {
+		return fmt.Errorf(i18n.G("Failed to find project: %w"), err)
+	}
+
+	remote.Project = project
+	conf.Remotes[server] = remote
+
+	return conf.SaveConfig(c.global.confPath)
 }
 
 func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
@@ -356,6 +395,7 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+
 	conf.Remotes[server] = config.Remote{Addr: addr, Protocol: c.flagProtocol, AuthType: c.flagAuthType, Domain: c.flagDomain}
 
 	// Attempt to connect
@@ -380,6 +420,7 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+
 		remote.Project = project
 
 		conf.Remotes[server] = remote
@@ -429,8 +470,15 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw})
-		certOut.Close()
+		err = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw})
+		if err != nil {
+			return fmt.Errorf(i18n.G("Could not write server cert file %q: %w"), certf, err)
+		}
+
+		err = certOut.Close()
+		if err != nil {
+			return fmt.Errorf(i18n.G("Could not close server cert file %q: %w"), certf, err)
+		}
 
 		// Setup a new connection, this time with the remote certificate
 		if c.flagPublic {
@@ -507,7 +555,7 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 		if c.flagAuthType == "tls" {
 			// Prompt for trust password
 			if c.flagPassword == "" {
-				fmt.Printf(i18n.G("Admin password for %s:")+" ", server)
+				fmt.Printf(i18n.G("Admin password (or token) for %s:")+" ", server)
 				pwd, err := term.ReadPassword(0)
 				if err != nil {
 					/* We got an error, maybe this isn't a terminal, let's try to
@@ -525,6 +573,7 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 			req := api.CertificatesPost{
 				Password: c.flagPassword,
 			}
+
 			req.Type = api.CertificateTypeClient
 
 			err = d.(lxd.InstanceServer).CreateCertificate(req)
@@ -556,13 +605,14 @@ func (c *cmdRemoteAdd) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
 	remote.Project = project
 	conf.Remotes[server] = remote
 
 	return conf.SaveConfig(c.global.confPath)
 }
 
-// Get default
+// Get default.
 type cmdRemoteGetDefault struct {
 	global *cmdGlobal
 	remote *cmdRemote
@@ -595,7 +645,7 @@ func (c *cmdRemoteGetDefault) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// List
+// List.
 type cmdRemoteList struct {
 	global *cmdGlobal
 	remote *cmdRemote
@@ -666,8 +716,10 @@ func (c *cmdRemoteList) Run(cmd *cobra.Command, args []string) error {
 		if name == conf.DefaultRemote {
 			strName = fmt.Sprintf("%s (%s)", name, i18n.G("current"))
 		}
+
 		data = append(data, []string{strName, rc.Addr, rc.Protocol, rc.AuthType, strPublic, strStatic, strGlobal})
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -683,7 +735,7 @@ func (c *cmdRemoteList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, conf.Remotes)
 }
 
-// Rename
+// Rename.
 type cmdRemoteRename struct {
 	global *cmdGlobal
 	remote *cmdRemote
@@ -721,7 +773,8 @@ func (c *cmdRemoteRename) Run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf(i18n.G("Remote %s is static and cannot be modified"), args[0])
 	}
 
-	if _, ok := conf.Remotes[args[1]]; ok {
+	_, ok = conf.Remotes[args[1]]
+	if ok {
 		return fmt.Errorf(i18n.G("Remote %s already exists"), args[1])
 	}
 
@@ -734,6 +787,7 @@ func (c *cmdRemoteRename) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			rc.Global = false
 		} else {
 			err := os.Rename(oldPath, newPath)
@@ -753,7 +807,7 @@ func (c *cmdRemoteRename) Run(cmd *cobra.Command, args []string) error {
 	return conf.SaveConfig(c.global.confPath)
 }
 
-// Remove
+// Remove.
 type cmdRemoteRemove struct {
 	global *cmdGlobal
 	remote *cmdRemote
@@ -801,13 +855,13 @@ func (c *cmdRemoteRemove) Run(cmd *cobra.Command, args []string) error {
 
 	delete(conf.Remotes, args[0])
 
-	os.Remove(conf.ServerCertPath(args[0]))
-	os.Remove(conf.CookiesPath(args[0]))
+	_ = os.Remove(conf.ServerCertPath(args[0]))
+	_ = os.Remove(conf.CookiesPath(args[0]))
 
 	return conf.SaveConfig(c.global.confPath)
 }
 
-// Set default
+// Set default.
 type cmdRemoteSwitch struct {
 	global *cmdGlobal
 	remote *cmdRemote
@@ -846,7 +900,7 @@ func (c *cmdRemoteSwitch) Run(cmd *cobra.Command, args []string) error {
 	return conf.SaveConfig(c.global.confPath)
 }
 
-// Set URL
+// Set URL.
 type cmdRemoteSetURL struct {
 	global *cmdGlobal
 	remote *cmdRemote
@@ -889,6 +943,7 @@ func (c *cmdRemoteSetURL) Run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+
 		remote.Global = false
 		conf.Remotes[args[0]] = remote
 	}

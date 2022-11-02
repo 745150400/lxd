@@ -1,5 +1,5 @@
 test_image_expiry() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local LXD2_DIR LXD2_ADDR
   LXD2_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
   chmod +x "${LXD2_DIR}"
@@ -50,8 +50,8 @@ test_image_expiry() {
 
 test_image_list_all_aliases() {
     ensure_import_testimage
-    # shellcheck disable=2039,2034,2155
-    local sum=$(lxc image info testimage | grep ^Fingerprint | cut -d' ' -f2)
+    # shellcheck disable=2039,2034,2155,3043
+    local sum="$(lxc image info testimage | grep ^Fingerprint | cut -d' ' -f2)"
     lxc image alias create zzz "$sum"
     lxc image list | grep -vq zzz
     # both aliases are listed if the "aliases" column is included in output
@@ -63,16 +63,16 @@ test_image_list_all_aliases() {
 test_image_import_dir() {
     ensure_import_testimage
     lxc image export testimage
-    # shellcheck disable=2039,2034,2155
-    local image=$(ls -1 -- *.tar.xz)
+    # shellcheck disable=2039,2034,2155,3043
+    local image="$(ls -1 -- *.tar.xz)"
     mkdir -p unpacked
     tar -C unpacked -xf "$image"
-    # shellcheck disable=2039,2034,2155
-    local fingerprint=$(lxc image import unpacked | awk '{print $NF;}')
+    # shellcheck disable=2039,2034,2155,3043
+    local fingerprint="$(lxc image import unpacked | awk '{print $NF;}')"
     rm -rf "$image" unpacked
 
     lxc image export "$fingerprint"
-    # shellcheck disable=2039,2034,2155
+    # shellcheck disable=2039,2034,2155,3043
     local exported="${fingerprint}.tar.xz"
 
     tar tvf "$exported" | grep -Fq metadata.yaml
@@ -89,4 +89,66 @@ test_image_import_existing_alias() {
     # the image can be imported with an existing alias
     lxc image import testimage.file --alias newimage
     lxc image delete newimage image2
+}
+
+test_image_refresh() {
+  # shellcheck disable=2039,3043
+  local LXD2_DIR LXD2_ADDR
+  LXD2_DIR=$(mktemp -d -p "${TEST_DIR}" XXX)
+  chmod +x "${LXD2_DIR}"
+  spawn_lxd "${LXD2_DIR}" true
+  LXD2_ADDR=$(cat "${LXD2_DIR}/lxd.addr")
+
+  ensure_import_testimage
+
+  lxc_remote remote add l2 "${LXD2_ADDR}" --accept-certificate --password foo
+
+  poolDriver=$(lxc storage show "$(lxc profile device get default root pool)" | grep 'driver:' | awk '{print $2}')
+
+  # Publish image
+  lxc image copy testimage l2: --alias testimage --public
+  fp="$(lxc image info l2:testimage | awk '/Fingerprint: / {print $2}')"
+  lxc image rm testimage
+
+  # Create container from published image
+  lxc init l2:testimage c1
+
+  # Create an alias for the received image
+  lxc image alias create testimage "${fp}"
+
+  # Change image and publish it
+  lxc init l2:testimage l2:c1
+  echo test | lxc file push - l2:c1/tmp/testfile
+  lxc publish l2:c1 l2: --alias testimage --public
+  new_fp="$(lxc image info l2:testimage | awk '/Fingerprint: / {print $2}')"
+
+  # Ensure the images differ
+  [ "${fp}" != "${new_fp}" ]
+
+  # Check original image exists before refresh.
+  lxc image info "${fp}"
+
+  if [ "${poolDriver}" != "dir" ]; then
+    # Check old storage volume record exists and new one doesn't.
+    lxd sql global 'select name from storage_volumes' | grep "${fp}"
+    ! lxd sql global 'select name from storage_volumes' | grep "${new_fp}" || false
+  fi
+
+  # Refresh image
+  lxc image refresh testimage
+
+  # Ensure the old image is gone.
+  ! lxc image info "${fp}" || false
+
+  if [ "${poolDriver}" != "dir" ]; then
+    # Check old storage volume record has been replaced with new one.
+    ! lxd sql global 'select name from storage_volumes' | grep "${fp}" || false
+    lxd sql global 'select name from storage_volumes' | grep "${new_fp}"
+  fi
+
+  # Cleanup
+  lxc rm l2:c1
+  lxc rm c1
+  lxc remote rm l2
+  kill_lxd "${LXD2_DIR}"
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
@@ -122,6 +121,7 @@ func (c *cmdExec) Run(cmd *cobra.Command, args []string) error {
 		if len(pieces) > 1 {
 			value = pieces[1]
 		}
+
 		env[pieces[0]] = value
 	}
 
@@ -151,7 +151,7 @@ func (c *cmdExec) Run(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		defer termios.Restore(stdinFd, oldttystate)
+		defer func() { _ = termios.Restore(stdinFd, oldttystate) }()
 	}
 
 	// Setup interactive console handler
@@ -169,7 +169,7 @@ func (c *cmdExec) Run(cmd *cobra.Command, args []string) error {
 	var stdin io.ReadCloser
 	stdin = os.Stdin
 	if c.flagDisableStdin {
-		stdin = ioutil.NopCloser(bytes.NewReader(nil))
+		stdin = io.NopCloser(bytes.NewReader(nil))
 	}
 
 	stdout := getStdout()
@@ -203,14 +203,20 @@ func (c *cmdExec) Run(cmd *cobra.Command, args []string) error {
 
 	// Wait for the operation to complete
 	err = op.Wait()
+	opAPI := op.Get()
+	if opAPI.Metadata != nil {
+		exitStatusRaw, ok := opAPI.Metadata["return"].(float64)
+		if ok {
+			c.global.ret = int(exitStatusRaw)
+		}
+	}
+
 	if err != nil {
 		return err
 	}
-	opAPI := op.Get()
 
 	// Wait for any remaining I/O to be flushed
 	<-execArgs.DataDone
 
-	c.global.ret = int(opAPI.Metadata["return"].(float64))
 	return nil
 }

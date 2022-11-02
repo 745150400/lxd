@@ -6,8 +6,6 @@ import (
 	"strings"
 	"sync"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/state"
@@ -41,7 +39,7 @@ func unixHotplugRegisterHandler(instance instance.Instance, deviceName string, h
 	defer unixHotplugMutex.Unlock()
 
 	// Null delimited string of project name, instance name and device name.
-	key := fmt.Sprintf("%s\000%s\000%s", instance.Project(), instance.Name(), deviceName)
+	key := fmt.Sprintf("%s\000%s\000%s", instance.Project().Name, instance.Name(), deviceName)
 	unixHotplugHandlers[key] = handler
 }
 
@@ -51,7 +49,7 @@ func unixHotplugUnregisterHandler(instance instance.Instance, deviceName string)
 	defer unixHotplugMutex.Unlock()
 
 	// Null delimited string of project name, instance name and device name.
-	key := fmt.Sprintf("%s\000%s\000%s", instance.Project(), instance.Name(), deviceName)
+	key := fmt.Sprintf("%s\000%s\000%s", instance.Project().Name, instance.Name(), deviceName)
 	delete(unixHotplugHandlers, key)
 }
 
@@ -73,7 +71,7 @@ func UnixHotplugRunHandlers(state *state.State, event *UnixHotplugEvent) {
 
 		runConf, err := hook(*event)
 		if err != nil {
-			logger.Error("Unix hotplug event hook failed", log.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
+			logger.Error("Unix hotplug event hook failed", logger.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
 			continue
 		}
 
@@ -82,13 +80,13 @@ func UnixHotplugRunHandlers(state *state.State, event *UnixHotplugEvent) {
 		if runConf != nil {
 			instance, err := instance.LoadByProjectAndName(state, projectName, instanceName)
 			if err != nil {
-				logger.Error("Unix hotplug event loading instance failed", log.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
+				logger.Error("Unix hotplug event loading instance failed", logger.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
 				continue
 			}
 
 			err = instance.DeviceEventHandler(runConf)
 			if err != nil {
-				logger.Error("Unix hotplug event instance handler failed", log.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
+				logger.Error("Unix hotplug event instance handler failed", logger.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
 				continue
 			}
 		}

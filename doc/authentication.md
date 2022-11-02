@@ -1,3 +1,9 @@
+---
+discourse: 13114,15142
+relatedlinks: https://www.youtube.com/watch?v=6O0q3rSWr8A
+---
+
+(authentication)=
 # Remote API authentication
 
 Remote communications with the LXD daemon happen using JSON over HTTPS.
@@ -8,7 +14,6 @@ The following authentication methods are supported:
 - {ref}`authentication-tls-certs`
 - {ref}`authentication-candid`
 - {ref}`authentication-rbac`
-
 
 (authentication-tls-certs)=
 ## TLS client certificates
@@ -28,7 +33,7 @@ On the next connection, a new certificate is generated.
 The supported protocol must be TLS 1.2 or better.
 All communications must use perfect forward secrecy, and ciphers must be limited to strong elliptic curve ones (such as ECDHE-RSA or ECDHE-ECDSA).
 
-Any generated key should be at least 4096 bit RSA, preferably EC384.
+Any generated key should be at least 4096 bit RSA, preferably 384 bit ECDSA.
 When using signatures, only SHA-2 signatures should be trusted.
 
 Since we control both client and server, there is no reason to support
@@ -50,6 +55,7 @@ The workflow to authenticate with the server is similar to that of SSH, where an
 1. When the user adds a server with `lxc remote add`, the server is contacted over HTTPS, its certificate is downloaded and the fingerprint is shown to the user.
 1. The user is asked to confirm that this is indeed the server's fingerprint, which they can manually check by connecting to the server or by asking someone with access to the server to run the info command and compare the fingerprints.
 1. The server attempts to authenticate the client:
+
    - If the client certificate is in the server's trust store, the connection is granted.
    - If the client certificate is not in the server's trust store, the server prompts the user for a token or the trust password.
      If the provided token or trust password matches, the client certificate is added to the server's trust store and the connection is granted.
@@ -81,15 +87,28 @@ This prevents brute-force attacks trying to guess the password.
 (authentication-token)=
 #### Adding client certificates using tokens
 
-You can also add new clients by using tokens. This is a safer way than using the trust password, because tokens expire once they've been used.
+You can also add new clients by using tokens. This is a safer way than using the trust password, because tokens expire after a configurable time (`cluster.join_token_expiry`, see {doc}`server`) or once they've been used.
 
 To use this method, generate a token for each client by calling `lxc config trust add`, which will prompt for the client name.
 The clients can then add their certificates to the server's trust store by providing the generated token when prompted for the trust password.
+
+```{note}
+If your LXD server is behind NAT, you must specify its external public address when adding it as a remote for a client:
+
+    lxc remote add <name> <IP_address>
+
+When you are prompted for the admin password, specify the generated token.
+
+When generating the token on the server, LXD includes a list of IP addresses that the client can use to access the server.
+However, if the server is behind NAT, these addresses might be local addresses that the client cannot connect to.
+In this case, you must specify the external address manually.
+```
+
 Alternatively, the clients can provide the token directly when adding the remote: `lxc remote add <name> <token>`.
 
 ### Using a PKI system
 
-In a {abbr}`PKI (Public key infrastructure)` setup, a system administrator manages a central PKI that issues client certificates for all the lxc clients and server certificates for all the LXD daemons.
+In a {abbr}`PKI (Public key infrastructure)` setup, a system administrator manages a central PKI that issues client certificates for all the LXD clients and server certificates for all the LXD daemons.
 
 To enable PKI mode, complete the following steps:
 
@@ -101,7 +120,7 @@ To enable PKI mode, complete the following steps:
 1. Restart the server.
 
 In that mode, any connection to a LXD daemon will be done using the
-preseeded CA certificate.
+pre-seeded CA certificate.
 
 If the server certificate isn't signed by the CA, the connection will simply go through the normal authentication mechanism.
 If the server certificate is valid and signed by the CA, then the connection continues without prompting the user for the certificate.
@@ -153,6 +172,98 @@ In an unrestricted project, only the `auditor` and the `user` roles are suitable
 In a {ref}`restricted project <projects-restrictions>`, the `operator` role is safe to use as well if configured appropriately.
 ```
 
+(authentication-server-certificate)=
+## TLS server certificate
+
+LXD supports issuing server certificates using {abbr}`ACME (Automatic Certificate Management Environment)` services, for example, [Let's Encrypt](https://letsencrypt.org/).
+
+To enable this feature, set the following {ref}`server`:
+
+- `acme.domain`: The domain for which the certificate should be issued.
+- `acme.email`: The email address used for the account of the ACME service.
+- `acme.agree_tos`: Must be set to `true` to agree to the ACME service's terms of service.
+- `acme.ca_url`: The directory URL of the ACME service. By default, LXD uses "Let's Encrypt".
+
+For this feature to work, LXD must be reachable from port 80.
+This can be achieved by using a reverse proxy such as [HAProxy](http://www.haproxy.org/).
+
+Here's a minimal HAProxy configuration that uses `lxd.example.net` as the domain.
+After the certificate has been issued, LXD will be reachable from `https://lxd.example.net/`.
+
+```
+# Global configuration
+global
+  log /dev/log local0
+  chroot /var/lib/haproxy
+  stats socket /run/haproxy/admin.sock mode 660 level admin
+  stats timeout 30s
+  user haproxy
+  group haproxy
+  daemon
+  ssl-default-bind-options ssl-min-ver TLSv1.2
+  tune.ssl.default-dh-param 2048
+  maxconn 100000
+
+# Default settings
+defaults
+  mode tcp
+  timeout connect 5s
+  timeout client 30s
+  timeout client-fin 30s
+  timeout server 120s
+  timeout tunnel 6h
+  timeout http-request 5s
+  maxconn 80000
+
+# Default backend - Return HTTP 301 (TLS upgrade)
+backend http-301
+  mode http
+  redirect scheme https code 301
+
+# Default backend - Return HTTP 403
+backend http-403
+  mode http
+  http-request deny deny_status 403
+
+# HTTP dispatcher
+frontend http-dispatcher
+  bind :80
+  mode http
+
+  # Backend selection
+  tcp-request inspect-delay 5s
+
+  # Dispatch
+  default_backend http-403
+  use_backend http-301 if { hdr(host) -i lxd.example.net }
+
+# SNI dispatcher
+frontend sni-dispatcher
+  bind :443
+  mode tcp
+
+  # Backend selection
+  tcp-request inspect-delay 5s
+
+  # require TLS
+  tcp-request content reject unless { req.ssl_hello_type 1 }
+
+  # Dispatch
+  default_backend http-403
+  use_backend lxd-nodes if { req.ssl_sni -i lxd.example.net }
+
+# LXD nodes
+backend lxd-nodes
+  mode tcp
+
+  option tcp-check
+
+  # Multiple servers should be listed when running a cluster
+  server lxd-node01 1.2.3.4:8443 check
+  server lxd-node02 1.2.3.5:8443 check
+  server lxd-node03 1.2.3.6:8443 check
+```
+
 ## Failure scenarios
 
 In the following scenarios, authentication is expected to fail.
@@ -161,8 +272,8 @@ In the following scenarios, authentication is expected to fail.
 
 The server certificate might change in the following cases:
 
- * The server was fully reinstalled and therefore got a new certificate.
- * The connection is being intercepted ({abbr}`MITM (Man in the middle)`).
+- The server was fully reinstalled and therefore got a new certificate.
+- The connection is being intercepted ({abbr}`MITM (Machine in the middle)`).
 
 In such cases, the client will refuse to connect to the server because the certificate fingerprint does not match the fingerprint in the configuration for this remote.
 

@@ -48,11 +48,11 @@ func (c *cmdWarning) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// List
+// List.
 type cmdWarningList struct {
 	global  *cmdGlobal
 	warning *cmdWarning
@@ -150,8 +150,10 @@ func (c *cmdWarningList) Run(cmd *cobra.Command, args []string) error {
 		for _, column := range columns {
 			row = append(row, column.Data(warning))
 		}
+
 		data = append(data, row)
 	}
+
 	sort.Sort(utils.StringList(data))
 
 	rawData := make([]*api.Warning, len(warnings))
@@ -235,7 +237,8 @@ func (c *cmdWarningList) parseColumns(clustered bool) ([]warningColumn, error) {
 		}
 
 		for _, columnRune := range columnEntry {
-			if column, ok := columnsShorthandMap[columnRune]; ok {
+			column, ok := columnsShorthandMap[columnRune]
+			if ok {
 				columns = append(columns, column)
 			} else {
 				return nil, fmt.Errorf(i18n.G("Unknown column shorthand char '%c' in '%s'"), columnRune, columnEntry)
@@ -246,7 +249,7 @@ func (c *cmdWarningList) parseColumns(clustered bool) ([]warningColumn, error) {
 	return columns, nil
 }
 
-// Acknowledge
+// Acknowledge.
 type cmdWarningAcknowledge struct {
 	global  *cmdGlobal
 	warning *cmdWarning
@@ -288,7 +291,7 @@ func (c *cmdWarningAcknowledge) Run(cmd *cobra.Command, args []string) error {
 	return remoteServer.UpdateWarning(UUID, warning, "")
 }
 
-// Show
+// Show.
 type cmdWarningShow struct {
 	global  *cmdGlobal
 	warning *cmdWarning
@@ -339,7 +342,7 @@ func (c *cmdWarningShow) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Delete
+// Delete.
 type cmdWarningDelete struct {
 	global  *cmdGlobal
 	warning *cmdWarning

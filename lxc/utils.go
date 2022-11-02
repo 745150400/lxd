@@ -2,18 +2,20 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 
 	"github.com/lxc/lxd/client"
+	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/i18n"
 	"github.com/lxc/lxd/shared/termios"
 )
 
-// Batch operations
+// Batch operations.
 type batchResult struct {
 	err  error
 	name string
@@ -36,7 +38,7 @@ func runBatch(names []string, action func(name string) error) []batchResult {
 	return results
 }
 
-// Add a device to an instance
+// Add a device to an instance.
 func instanceDeviceAdd(client lxd.InstanceServer, name string, devName string, dev map[string]string) error {
 	// Get the instance entry
 	inst, etag, err := client.GetInstance(name)
@@ -60,7 +62,7 @@ func instanceDeviceAdd(client lxd.InstanceServer, name string, devName string, d
 	return op.Wait()
 }
 
-// Add a device to a profile
+// Add a device to a profile.
 func profileDeviceAdd(client lxd.InstanceServer, name string, devName string, dev map[string]string) error {
 	// Get the profile entry
 	profile, profileEtag, err := client.GetProfile(name)
@@ -85,7 +87,29 @@ func profileDeviceAdd(client lxd.InstanceServer, name string, devName string, de
 	return nil
 }
 
-// Create the specified image alises, updating those that already exist.
+// parseDeviceOverrides parses device overrides of the form "<deviceName>,<key>=<value>" into a device map.
+// The resulting device map is unlikely to contain valid devices as these are simply values to be overridden.
+func parseDeviceOverrides(deviceOverrideArgs []string) (map[string]map[string]string, error) {
+	deviceMap := map[string]map[string]string{}
+	for _, entry := range deviceOverrideArgs {
+		if !strings.Contains(entry, "=") || !strings.Contains(entry, ",") {
+			return nil, fmt.Errorf(i18n.G("Bad syntax, expecting <device>,<key>=<value>: %s"), entry)
+		}
+
+		deviceFields := strings.SplitN(entry, ",", 2)
+		keyFields := strings.SplitN(deviceFields[1], "=", 2)
+
+		if deviceMap[deviceFields[0]] == nil {
+			deviceMap[deviceFields[0]] = map[string]string{}
+		}
+
+		deviceMap[deviceFields[0]][keyFields[0]] = keyFields[1]
+	}
+
+	return deviceMap, nil
+}
+
+// Create the specified image aliases, updating those that already exist.
 func ensureImageAliases(client lxd.InstanceServer, aliases []api.ImageAlias, fingerprint string) error {
 	if len(aliases) == 0 {
 		return nil
@@ -95,6 +119,7 @@ func ensureImageAliases(client lxd.InstanceServer, aliases []api.ImageAlias, fin
 	for i, alias := range aliases {
 		names[i] = alias.Name
 	}
+
 	sort.Strings(names)
 
 	resp, err := client.GetImageAliases()
@@ -140,7 +165,7 @@ func GetExistingAliases(aliases []string, allAliases []api.ImageAliasesEntry) []
 func getConfig(args ...string) (map[string]string, error) {
 	if len(args) == 2 && !strings.Contains(args[0], "=") {
 		if args[1] == "-" && !termios.IsTerminal(getStdinFd()) {
-			buf, err := ioutil.ReadAll(os.Stdin)
+			buf, err := io.ReadAll(os.Stdin)
 			if err != nil {
 				return nil, fmt.Errorf(i18n.G("Can't read from stdin: %w"), err)
 			}
@@ -156,11 +181,11 @@ func getConfig(args ...string) (map[string]string, error) {
 	for _, arg := range args {
 		fields := strings.SplitN(arg, "=", 2)
 		if len(fields) != 2 {
-			return nil, fmt.Errorf(i18n.G("Invalid key=value configuration: %w"), arg)
+			return nil, fmt.Errorf(i18n.G("Invalid key=value configuration: %s"), arg)
 		}
 
 		if fields[1] == "-" && !termios.IsTerminal(getStdinFd()) {
-			buf, err := ioutil.ReadAll(os.Stdin)
+			buf, err := io.ReadAll(os.Stdin)
 			if err != nil {
 				return nil, fmt.Errorf(i18n.G("Can't read from stdin: %w"), err)
 			}
@@ -180,4 +205,74 @@ func usage(name string, args ...string) string {
 	}
 
 	return name + " " + args[0]
+}
+
+// instancesExist iterates over a list of instances (or snapshots) and checks that they exist.
+func instancesExist(resources []remoteResource) error {
+	for _, resource := range resources {
+		// Handle snapshots.
+		if shared.IsSnapshot(resource.name) {
+			parent, snap, _ := api.GetParentAndSnapshotName(resource.name)
+
+			_, _, err := resource.server.GetInstanceSnapshot(parent, snap)
+			if err != nil {
+				return fmt.Errorf(i18n.G("Failed checking instance snapshot exists \"%s:%s\": %w"), resource.remote, resource.name, err)
+			}
+
+			continue
+		}
+
+		_, _, err := resource.server.GetInstance(resource.name)
+		if err != nil {
+			return fmt.Errorf(i18n.G("Failed checking instance exists \"%s:%s\": %w"), resource.remote, resource.name, err)
+		}
+	}
+
+	return nil
+}
+
+// structHasField checks if specified struct includes field with given name.
+func structHasField(typ reflect.Type, field string) bool {
+	var parent reflect.Type
+
+	for i := 0; i < typ.NumField(); i++ {
+		fieldType := typ.Field(i)
+		yaml := fieldType.Tag.Get("yaml")
+
+		if yaml == ",inline" {
+			parent = fieldType.Type
+		}
+
+		if yaml == field {
+			return true
+		}
+	}
+
+	if parent != nil {
+		return structHasField(parent, field)
+	}
+
+	return false
+}
+
+// getServerSupportedFilters returns two lists: one with filters supported by server and second one with not supported.
+func getServerSupportedFilters(filters []string, i interface{}) ([]string, []string) {
+	supportedFilters := []string{}
+	unsupportedFilters := []string{}
+
+	for _, filter := range filters {
+		membs := strings.SplitN(filter, "=", 2)
+		// Only key/value pairs are supported by server side API
+		// Only keys which are part of struct are supported by server side API
+		// Multiple values (separated by ',') are not supported by server side API
+		// Keys with '.' in name are not supported
+		if len(membs) < 2 || !structHasField(reflect.TypeOf(i), membs[0]) || strings.Contains(membs[1], ",") || strings.Contains(membs[0], ".") {
+			unsupportedFilters = append(unsupportedFilters, filter)
+			continue
+		}
+
+		supportedFilters = append(supportedFilters, filter)
+	}
+
+	return supportedFilters, unsupportedFilters
 }

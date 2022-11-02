@@ -2,7 +2,6 @@ package drivers
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,12 +26,8 @@ type cephfs struct {
 func (d *cephfs) load() error {
 	// Register the patches.
 	d.patches = map[string]func() error{
-		"storage_create_vm":                        nil,
-		"storage_zfs_mount":                        nil,
-		"storage_create_vm_again":                  nil,
-		"storage_zfs_volmode":                      nil,
-		"storage_rename_custom_volume_add_project": nil,
-		"storage_lvm_skipactivation":               nil,
+		"storage_lvm_skipactivation":       nil,
+		"storage_missing_snapshot_records": nil,
 	}
 
 	// Done if previously loaded.
@@ -54,6 +49,7 @@ func (d *cephfs) load() error {
 		if err != nil {
 			return err
 		}
+
 		out = strings.TrimSpace(out)
 
 		fields := strings.Split(out, " ")
@@ -104,11 +100,11 @@ func (d *cephfs) Create() error {
 
 	// Set default properties if missing.
 	if d.config["cephfs.cluster_name"] == "" {
-		d.config["cephfs.cluster_name"] = "ceph"
+		d.config["cephfs.cluster_name"] = CephDefaultCluster
 	}
 
 	if d.config["cephfs.user.name"] == "" {
-		d.config["cephfs.user.name"] = "admin"
+		d.config["cephfs.user.name"] = CephDefaultUser
 	}
 
 	d.config["cephfs.path"] = d.config["source"]
@@ -127,11 +123,12 @@ func (d *cephfs) Create() error {
 	}
 
 	// Create a temporary mountpoint.
-	mountPath, err := ioutil.TempDir("", "lxd_cephfs_")
+	mountPath, err := os.MkdirTemp("", "lxd_cephfs_")
 	if err != nil {
 		return fmt.Errorf("Failed to create temporary directory under: %w", err)
 	}
-	defer os.RemoveAll(mountPath)
+
+	defer func() { _ = os.RemoveAll(mountPath) }()
 
 	err = os.Chmod(mountPath, 0700)
 	if err != nil {
@@ -152,17 +149,13 @@ func (d *cephfs) Create() error {
 	}
 
 	// Mount the pool.
-	uri := strings.Join(monAddresses, ",")
-	if !strings.Contains(uri, ":6789") {
-		uri = fmt.Sprintf("%s:6789", uri)
-	}
-	uri = fmt.Sprintf("%s:/", uri)
-
-	err = TryMount(uri, mountPoint, "ceph", 0, fmt.Sprintf("name=%v,secret=%v,mds_namespace=%v", d.config["cephfs.user.name"], userSecret, fsName))
+	srcPath := strings.Join(monAddresses, ",") + ":/"
+	err = TryMount(srcPath, mountPoint, "ceph", 0, fmt.Sprintf("name=%v,secret=%v,mds_namespace=%v", d.config["cephfs.user.name"], userSecret, fsName))
 	if err != nil {
 		return err
 	}
-	defer forceUnmount(mountPoint)
+
+	defer func() { _, _ = forceUnmount(mountPoint) }()
 
 	// Create the path if missing.
 	err = os.MkdirAll(filepath.Join(mountPoint, fsPath), 0755)
@@ -190,11 +183,12 @@ func (d *cephfs) Delete(op *operations.Operation) error {
 	}
 
 	// Create a temporary mountpoint.
-	mountPath, err := ioutil.TempDir("", "lxd_cephfs_")
+	mountPath, err := os.MkdirTemp("", "lxd_cephfs_")
 	if err != nil {
 		return fmt.Errorf("Failed to create temporary directory under: %w", err)
 	}
-	defer os.RemoveAll(mountPath)
+
+	defer func() { _ = os.RemoveAll(mountPath) }()
 
 	err = os.Chmod(mountPath, 0700)
 	if err != nil {
@@ -214,17 +208,13 @@ func (d *cephfs) Delete(op *operations.Operation) error {
 	}
 
 	// Mount the pool.
-	uri := strings.Join(monAddresses, ",")
-	if !strings.Contains(uri, ":6789") {
-		uri = fmt.Sprintf("%s:6789", uri)
-	}
-	uri = fmt.Sprintf("%s:/", uri)
-
-	err = TryMount(uri, mountPoint, "ceph", 0, fmt.Sprintf("name=%v,secret=%v,mds_namespace=%v", d.config["cephfs.user.name"], userSecret, fsName))
+	srcPath := strings.Join(monAddresses, ",") + ":/"
+	err = TryMount(srcPath, mountPoint, "ceph", 0, fmt.Sprintf("name=%v,secret=%v,mds_namespace=%v", d.config["cephfs.user.name"], userSecret, fsName))
 	if err != nil {
 		return err
 	}
-	defer forceUnmount(mountPoint)
+
+	defer func() { _, _ = forceUnmount(mountPoint) }()
 
 	// On delete, wipe everything in the directory.
 	err = wipeDirectory(GetPoolMountPath(d.name))
@@ -256,12 +246,13 @@ func (d *cephfs) Delete(op *operations.Operation) error {
 func (d *cephfs) Validate(config map[string]string) error {
 	rules := map[string]func(value string) error{
 		"cephfs.cluster_name":    validate.IsAny,
+		"cephfs.fscache":         validate.Optional(validate.IsBool),
 		"cephfs.path":            validate.IsAny,
 		"cephfs.user.name":       validate.IsAny,
 		"volatile.pool.pristine": validate.IsAny,
 	}
 
-	return d.validatePool(config, rules)
+	return d.validatePool(config, rules, nil)
 }
 
 // Update applies any driver changes required from a configuration change.
@@ -290,14 +281,15 @@ func (d *cephfs) Mount() (bool, error) {
 		return false, err
 	}
 
-	// Mount the pool.
-	uri := strings.Join(monAddresses, ",")
-	if !strings.Contains(uri, ":6789") {
-		uri = fmt.Sprintf("%s:6789", uri)
+	// Mount options.
+	options := fmt.Sprintf("name=%s,secret=%s,mds_namespace=%s", d.config["cephfs.user.name"], userSecret, fsName)
+	if shared.IsTrue(d.config["cephfs.fscache"]) {
+		options += ",fsc"
 	}
-	uri = fmt.Sprintf("%s:/%s", uri, fsPath)
 
-	err = TryMount(uri, GetPoolMountPath(d.name), "ceph", 0, fmt.Sprintf("name=%v,secret=%v,mds_namespace=%v", d.config["cephfs.user.name"], userSecret, fsName))
+	// Mount the pool.
+	srcPath := strings.Join(monAddresses, ",") + ":/" + fsPath
+	err = TryMount(srcPath, GetPoolMountPath(d.name), "ceph", 0, options)
 	if err != nil {
 		return false, err
 	}

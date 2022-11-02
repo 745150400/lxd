@@ -32,7 +32,8 @@ func (r *CSVReport) Load() error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	reader := csv.NewReader(file)
 	for line := 1; err != io.EOF; line++ {
@@ -58,7 +59,8 @@ func (r *CSVReport) Write() error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	writer := csv.NewWriter(file)
 	err = writer.WriteAll(r.records)
@@ -67,13 +69,16 @@ func (r *CSVReport) Write() error {
 	}
 
 	logf("Written report file %s", r.Filename)
-	return nil
+	return file.Close()
 }
 
 // AddRecord adds a record to the report.
 func (r *CSVReport) AddRecord(label string, elapsed time.Duration) error {
 	if len(r.records) == 0 {
-		r.addRecord(csvFields)
+		err := r.addRecord(csvFields)
+		if err != nil {
+			return err
+		}
 	}
 
 	record := []string{
@@ -83,6 +88,7 @@ func (r *CSVReport) AddRecord(label string, elapsed time.Duration) error {
 		"",     // responseCode is not used
 		"true", // success"
 	}
+
 	return r.addRecord(record)
 }
 
@@ -90,6 +96,7 @@ func (r *CSVReport) addRecord(record []string) error {
 	if len(record) != len(csvFields) {
 		return fmt.Errorf("Invalid number of fields : %q", record)
 	}
+
 	r.records = append(r.records, record)
 	return nil
 }

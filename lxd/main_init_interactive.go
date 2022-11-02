@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -28,11 +27,11 @@ import (
 	"github.com/lxc/lxd/shared/version"
 )
 
-func (c *cmdInit) RunInteractive(cmd *cobra.Command, args []string, d lxd.InstanceServer, server *api.Server) (*cmdInitData, error) {
+func (c *cmdInit) RunInteractive(cmd *cobra.Command, args []string, d lxd.InstanceServer, server *api.Server) (*api.InitPreseed, error) {
 	// Initialize config
-	config := cmdInitData{}
-	config.Node.Config = map[string]interface{}{}
-	config.Node.Networks = []internalClusterPostNetwork{}
+	config := api.InitPreseed{}
+	config.Node.Config = map[string]any{}
+	config.Node.Networks = []api.InitNetworksProjectPost{}
 	config.Node.StoragePools = []api.StoragePoolsPost{}
 	config.Node.Profiles = []api.ProfilesPost{
 		{
@@ -84,13 +83,13 @@ func (c *cmdInit) RunInteractive(cmd *cobra.Command, args []string, d lxd.Instan
 	}
 
 	if preSeedPrint {
-		var object cmdInitData
+		var object api.InitPreseed
 
 		// If the user has chosen to join an existing cluster, print
 		// only YAML for the cluster section, which is the only
 		// relevant one. Otherwise print the regular config.
 		if config.Cluster != nil && config.Cluster.ClusterAddress != "" {
-			object = cmdInitData{}
+			object = api.InitPreseed{}
 			object.Cluster = config.Cluster
 		} else {
 			object = config
@@ -107,24 +106,18 @@ func (c *cmdInit) RunInteractive(cmd *cobra.Command, args []string, d lxd.Instan
 	return &config, nil
 }
 
-func (c *cmdInit) askClustering(config *cmdInitData, d lxd.InstanceServer, server *api.Server) error {
+func (c *cmdInit) askClustering(config *api.InitPreseed, d lxd.InstanceServer, server *api.Server) error {
 	clustering, err := cli.AskBool("Would you like to use LXD clustering? (yes/no) [default=no]: ", "no")
 	if err != nil {
 		return err
 	}
 
 	if clustering {
-		config.Cluster = &initDataCluster{}
+		config.Cluster = &api.InitClusterPreseed{}
 		config.Cluster.Enabled = true
 
-		// Cluster server name
-		serverName, err := os.Hostname()
-		if err != nil {
-			serverName = "lxd"
-		}
-
 		askForServerName := func() error {
-			config.Cluster.ServerName, err = cli.AskString(fmt.Sprintf("What name should be used to identify this node in the cluster? [default=%s]: ", serverName), serverName, nil)
+			config.Cluster.ServerName, err = cli.AskString(fmt.Sprintf("What member name should be used to identify this server in the cluster? [default=%s]: ", c.defaultHostname()), c.defaultHostname(), nil)
 			if err != nil {
 				return err
 			}
@@ -154,11 +147,11 @@ func (c *cmdInit) askClustering(config *cmdInitData, d lxd.InstanceServer, serve
 				return fmt.Errorf("Can't bind address %q: %w", address, err)
 			}
 
-			listener.Close()
+			_ = listener.Close()
 			return nil
 		}
 
-		serverAddress, err := cli.AskString(fmt.Sprintf("What IP address or DNS name should be used to reach this node? [default=%s]: ", address), address, validateServerAddress)
+		serverAddress, err := cli.AskString(fmt.Sprintf("What IP address or DNS name should be used to reach this server? [default=%s]: ", address), address, validateServerAddress)
 		if err != nil {
 			return err
 		}
@@ -183,7 +176,7 @@ func (c *cmdInit) askClustering(config *cmdInitData, d lxd.InstanceServer, serve
 			var joinToken *api.ClusterMemberJoinToken
 
 			validJoinToken := func(input string) error {
-				j, err := clusterMemberJoinTokenDecode(input)
+				j, err := shared.JoinTokenDecode(input)
 				if err != nil {
 					return fmt.Errorf("Invalid join token: %w", err)
 				}
@@ -257,7 +250,7 @@ func (c *cmdInit) askClustering(config *cmdInitData, d lxd.InstanceServer, serve
 
 				for {
 					// Cluster URL
-					clusterAddress, err := cli.AskString("IP address or FQDN of an existing cluster member: ", "", nil)
+					clusterAddress, err := cli.AskString("IP address or FQDN of an existing cluster member (may include port): ", "", nil)
 					if err != nil {
 						return err
 					}
@@ -273,7 +266,7 @@ func (c *cmdInit) askClustering(config *cmdInitData, d lxd.InstanceServer, serve
 
 					certDigest := shared.CertFingerprint(cert)
 					fmt.Printf("Cluster fingerprint: %s\n", certDigest)
-					fmt.Printf("You can validate this fingerprint by running \"lxc info\" locally on an existing node.\n")
+					fmt.Printf("You can validate this fingerprint by running \"lxc info\" locally on an existing cluster member.\n")
 
 					validator := func(input string) error {
 						if input == certDigest {
@@ -320,7 +313,7 @@ func (c *cmdInit) askClustering(config *cmdInitData, d lxd.InstanceServer, serve
 				return err
 			}
 
-			err = cluster.SetupTrust(serverCert, serverName, config.Cluster.ClusterAddress, config.Cluster.ClusterCertificate, config.Cluster.ClusterPassword)
+			err = cluster.SetupTrust(serverCert, config.Cluster.ServerName, config.Cluster.ClusterAddress, config.Cluster.ClusterCertificate, config.Cluster.ClusterPassword)
 			if err != nil {
 				return fmt.Errorf("Failed to setup trust relationship with cluster: %w", err)
 			}
@@ -383,7 +376,7 @@ func (c *cmdInit) askClustering(config *cmdInitData, d lxd.InstanceServer, serve
 	return nil
 }
 
-func (c *cmdInit) askMAAS(config *cmdInitData, d lxd.InstanceServer) error {
+func (c *cmdInit) askMAAS(config *api.InitPreseed, d lxd.InstanceServer) error {
 	maas, err := cli.AskBool("Would you like to connect to a MAAS server? (yes/no) [default=no]: ", "no")
 	if err != nil {
 		return err
@@ -393,17 +386,12 @@ func (c *cmdInit) askMAAS(config *cmdInitData, d lxd.InstanceServer) error {
 		return nil
 	}
 
-	serverName, err := os.Hostname()
-	if err != nil {
-		serverName = "lxd"
-	}
-
-	maasHostname, err := cli.AskString(fmt.Sprintf("What's the name of this host in MAAS? [default=%s]: ", serverName), serverName, nil)
+	maasHostname, err := cli.AskString(fmt.Sprintf("What's the name of this host in MAAS? [default=%s]: ", c.defaultHostname()), c.defaultHostname(), nil)
 	if err != nil {
 		return err
 	}
 
-	if maasHostname != serverName {
+	if maasHostname != c.defaultHostname() {
 		config.Node.Config["maas.machine"] = maasHostname
 	}
 
@@ -420,7 +408,7 @@ func (c *cmdInit) askMAAS(config *cmdInitData, d lxd.InstanceServer) error {
 	return nil
 }
 
-func (c *cmdInit) askNetworking(config *cmdInitData, d lxd.InstanceServer) error {
+func (c *cmdInit) askNetworking(config *api.InitPreseed, d lxd.InstanceServer) error {
 	var err error
 	localBridgeCreate := false
 
@@ -435,7 +423,7 @@ func (c *cmdInit) askNetworking(config *cmdInitData, d lxd.InstanceServer) error
 		// At this time, only the Ubuntu kernel supports the Fan, detect it
 		fanKernel := false
 		if shared.PathExists("/proc/sys/kernel/version") {
-			content, _ := ioutil.ReadFile("/proc/sys/kernel/version")
+			content, _ := os.ReadFile("/proc/sys/kernel/version")
 			if content != nil && strings.Contains(string(content), "Ubuntu") {
 				fanKernel = true
 			}
@@ -507,7 +495,7 @@ func (c *cmdInit) askNetworking(config *cmdInitData, d lxd.InstanceServer) error
 
 			if fan {
 				// Define the network
-				networkPost := internalClusterPostNetwork{}
+				networkPost := api.InitNetworksProjectPost{}
 				networkPost.Name = "lxdfan0"
 				networkPost.Project = project.Default
 				networkPost.Config = map[string]string{
@@ -564,7 +552,7 @@ func (c *cmdInit) askNetworking(config *cmdInitData, d lxd.InstanceServer) error
 
 	for {
 		// Define the network
-		net := internalClusterPostNetwork{}
+		net := api.InitNetworksProjectPost{}
 		net.Config = map[string]string{}
 		net.Project = project.Default
 
@@ -644,7 +632,7 @@ func (c *cmdInit) askNetworking(config *cmdInitData, d lxd.InstanceServer) error
 	return nil
 }
 
-func (c *cmdInit) askStorage(config *cmdInitData, d lxd.InstanceServer, server *api.Server) error {
+func (c *cmdInit) askStorage(config *api.InitPreseed, d lxd.InstanceServer, server *api.Server) error {
 	if config.Cluster != nil {
 		localStoragePool, err := cli.AskBool("Do you want to configure a new local storage pool? (yes/no) [default=yes]: ", "yes")
 		if err != nil {
@@ -685,7 +673,7 @@ func (c *cmdInit) askStorage(config *cmdInitData, d lxd.InstanceServer, server *
 	return c.askStoragePool(config, d, server, util.PoolTypeAny)
 }
 
-func (c *cmdInit) askStoragePool(config *cmdInitData, d lxd.InstanceServer, server *api.Server, poolType util.PoolType) error {
+func (c *cmdInit) askStoragePool(config *api.InitPreseed, d lxd.InstanceServer, server *api.Server, poolType util.PoolType) error {
 	// Figure out the preferred storage driver
 	availableBackends := util.AvailableStorageDrivers(server.Environment.StorageSupportedDrivers, poolType)
 
@@ -860,20 +848,21 @@ func (c *cmdInit) askStoragePool(config *cmdInitData, d lxd.InstanceServer, serv
 						return fmt.Errorf("Couldn't statfs %s: %w", shared.VarPath(), err)
 					}
 
-					/* choose 5 GB < x < 30GB, where x is 20% of the disk size */
+					/* choose 5 GiB < x < 30GiB, where x is 20% of the disk size */
 					defaultSize := uint64(st.Frsize) * st.Blocks / (1024 * 1024 * 1024) / 5
 					if defaultSize > 30 {
 						defaultSize = 30
 					}
+
 					if defaultSize < 5 {
 						defaultSize = 5
 					}
 
 					pool.Config["size"], err = cli.AskString(
-						fmt.Sprintf("Size in GB of the new loop device (1GB minimum) [default=%dGB]: ", defaultSize),
-						fmt.Sprintf("%dGB", defaultSize),
+						fmt.Sprintf("Size in GiB of the new loop device (1GiB minimum) [default=%dGiB]: ", defaultSize),
+						fmt.Sprintf("%dGiB", defaultSize),
 						func(input string) error {
-							input = strings.Split(input, "GB")[0]
+							input = strings.Split(input, "GiB")[0]
 
 							result, err := strconv.ParseInt(input, 10, 64)
 							if err != nil {
@@ -881,7 +870,7 @@ func (c *cmdInit) askStoragePool(config *cmdInitData, d lxd.InstanceServer, serv
 							}
 
 							if result < 1 {
-								return fmt.Errorf("Minimum size is 1GB")
+								return fmt.Errorf("Minimum size is 1GiB")
 							}
 
 							return nil
@@ -891,12 +880,11 @@ func (c *cmdInit) askStoragePool(config *cmdInitData, d lxd.InstanceServer, serv
 						return err
 					}
 
-					if !strings.HasSuffix(pool.Config["size"], "GB") {
-						pool.Config["size"] = fmt.Sprintf("%sGB", pool.Config["size"])
+					if !strings.HasSuffix(pool.Config["size"], "GiB") {
+						pool.Config["size"] = fmt.Sprintf("%sGiB", pool.Config["size"])
 					}
 				}
 			}
-
 		} else {
 			if pool.Driver == "ceph" {
 				// ask for the name of the cluster
@@ -954,7 +942,7 @@ your Linux distribution and run "lxd init" again afterwards.
 	return nil
 }
 
-func (c *cmdInit) askDaemon(config *cmdInitData, d lxd.InstanceServer, server *api.Server) error {
+func (c *cmdInit) askDaemon(config *api.InitPreseed, d lxd.InstanceServer, server *api.Server) error {
 	// Detect lack of uid/gid
 	idmapset, err := idmap.DefaultIdmapSet("", "")
 	if (err != nil || len(idmapset.Idmap) == 0 || idmapset.Usable() != nil) && shared.RunningInUserNS() {
@@ -1024,7 +1012,7 @@ they otherwise would.
 					return fmt.Errorf("Can't bind address %q: %w", address, err)
 				}
 
-				listener.Close()
+				_ = listener.Close()
 				return nil
 			})
 			if err != nil {

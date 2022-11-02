@@ -5,7 +5,6 @@ import (
 	"net"
 	"strings"
 
-	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 )
 
@@ -41,7 +40,7 @@ const NeighbourIPStateProbe = "PROBE"
 // NeighbourIPStateFailed max number of probes exceeded without success, neighbor validation has ultimately failed.
 const NeighbourIPStateFailed = "FAILED"
 
-// Neigh represents arguments for neighbour manipulation
+// Neigh represents arguments for neighbour manipulation.
 type Neigh struct {
 	DevName string
 	Addr    net.IP
@@ -58,7 +57,7 @@ func (n *Neigh) Show() ([]Neigh, error) {
 
 	neighbours := []Neigh{}
 
-	for _, line := range util.SplitNTrimSpace(out, "\n", -1, true) {
+	for _, line := range shared.SplitNTrimSpace(out, "\n", -1, true) {
 		// Split fields and early validation.
 		fields := strings.Fields(line)
 		if len(fields) != 4 {
@@ -74,7 +73,7 @@ func (n *Neigh) Show() ([]Neigh, error) {
 
 		// Check neighbour matches desired MAC address if specified.
 		if n.MAC != nil {
-			if bytes.Compare(n.MAC, mac) != 0 {
+			if !bytes.Equal(n.MAC, mac) {
 				continue
 			}
 		}

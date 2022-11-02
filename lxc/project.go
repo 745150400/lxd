@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -76,11 +76,11 @@ func (c *cmdProject) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Create
+// Create.
 type cmdProjectCreate struct {
 	global     *cmdGlobal
 	project    *cmdProject
@@ -145,7 +145,7 @@ func (c *cmdProjectCreate) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Delete
+// Delete.
 type cmdProjectDelete struct {
 	global  *cmdGlobal
 	project *cmdProject
@@ -209,7 +209,7 @@ func (c *cmdProjectDelete) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Edit
+// Edit.
 type cmdProjectEdit struct {
 	global  *cmdGlobal
 	project *cmdProject
@@ -268,7 +268,7 @@ func (c *cmdProjectEdit) Run(cmd *cobra.Command, args []string) error {
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -321,15 +321,17 @@ func (c *cmdProjectEdit) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			continue
 		}
+
 		break
 	}
 
 	return nil
 }
 
-// Get
+// Get.
 type cmdProjectGet struct {
 	global  *cmdGlobal
 	project *cmdProject
@@ -376,7 +378,7 @@ func (c *cmdProjectGet) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// List
+// List.
 type cmdProjectList struct {
 	global  *cmdGlobal
 	project *cmdProject
@@ -412,6 +414,7 @@ func (c *cmdProjectList) Run(cmd *cobra.Command, args []string) error {
 	if len(args) > 0 {
 		remote = args[0]
 	}
+
 	remoteName := strings.TrimSuffix(remote, ":")
 
 	resources, err := c.global.ParseServers(remote)
@@ -449,6 +452,11 @@ func (c *cmdProjectList) Run(cmd *cobra.Command, args []string) error {
 			storageVolumes = i18n.G("YES")
 		}
 
+		storageBuckets := i18n.G("NO")
+		if shared.IsTrue(project.Config["features.storage.buckets"]) {
+			storageBuckets = i18n.G("YES")
+		}
+
 		networks := i18n.G("NO")
 		if shared.IsTrue(project.Config["features.networks"]) {
 			networks = i18n.G("YES")
@@ -460,8 +468,9 @@ func (c *cmdProjectList) Run(cmd *cobra.Command, args []string) error {
 		}
 
 		strUsedBy := fmt.Sprintf("%d", len(project.UsedBy))
-		data = append(data, []string{name, images, profiles, storageVolumes, networks, project.Description, strUsedBy})
+		data = append(data, []string{name, images, profiles, storageVolumes, storageBuckets, networks, project.Description, strUsedBy})
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -469,6 +478,7 @@ func (c *cmdProjectList) Run(cmd *cobra.Command, args []string) error {
 		i18n.G("IMAGES"),
 		i18n.G("PROFILES"),
 		i18n.G("STORAGE VOLUMES"),
+		i18n.G("STORAGE BUCKETS"),
 		i18n.G("NETWORKS"),
 		i18n.G("DESCRIPTION"),
 		i18n.G("USED BY"),
@@ -477,7 +487,7 @@ func (c *cmdProjectList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, projects)
 }
 
-// Rename
+// Rename.
 type cmdProjectRename struct {
 	global  *cmdGlobal
 	project *cmdProject
@@ -533,7 +543,7 @@ func (c *cmdProjectRename) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Set
+// Set.
 type cmdProjectSet struct {
 	global  *cmdGlobal
 	project *cmdProject
@@ -592,7 +602,7 @@ func (c *cmdProjectSet) Run(cmd *cobra.Command, args []string) error {
 	return resource.server.UpdateProject(resource.name, project.Writable(), etag)
 }
 
-// Unset
+// Unset.
 type cmdProjectUnset struct {
 	global     *cmdGlobal
 	project    *cmdProject
@@ -622,7 +632,7 @@ func (c *cmdProjectUnset) Run(cmd *cobra.Command, args []string) error {
 	return c.projectSet.Run(cmd, args)
 }
 
-// Show
+// Show.
 type cmdProjectShow struct {
 	global  *cmdGlobal
 	project *cmdProject
@@ -675,7 +685,7 @@ func (c *cmdProjectShow) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Switch project
+// Switch project.
 type cmdProjectSwitch struct {
 	global  *cmdGlobal
 	project *cmdProject
@@ -732,7 +742,7 @@ func (c *cmdProjectSwitch) Run(cmd *cobra.Command, args []string) error {
 	return conf.SaveConfig(c.global.confPath)
 }
 
-// Info
+// Info.
 type cmdProjectInfo struct {
 	global  *cmdGlobal
 	project *cmdProject
@@ -800,6 +810,7 @@ func (c *cmdProjectInfo) Run(cmd *cobra.Command, args []string) error {
 
 		data = append(data, []string{strings.ToUpper(k), limit, usage})
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{

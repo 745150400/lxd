@@ -255,10 +255,10 @@ func (c *cmdList) evaluateShorthandFilter(key string, value string, inst *api.In
 	return false
 }
 
-func (c *cmdList) listInstances(conf *config.Config, d lxd.InstanceServer, cinfos []api.Instance, filters []string, columns []column) error {
+func (c *cmdList) listInstances(conf *config.Config, d lxd.InstanceServer, instances []api.Instance, filters []string, columns []column) error {
 	threads := 10
-	if len(cinfos) < threads {
-		threads = len(cinfos)
+	if len(instances) < threads {
+		threads = len(instances)
 	}
 
 	// Shortcut when needing state and snapshot info.
@@ -298,11 +298,12 @@ func (c *cmdList) listInstances(conf *config.Config, d lxd.InstanceServer, cinfo
 					cInfo = append(cInfo, *state)
 					cInfoLock.Unlock()
 				}
+
 				cInfoWg.Done()
 			}()
 		}
 
-		for _, info := range cinfos {
+		for _, info := range instances {
 			cInfoQueue <- info.Name
 		}
 
@@ -340,6 +341,7 @@ func (c *cmdList) listInstances(conf *config.Config, d lxd.InstanceServer, cinfo
 				cStates[cName] = state
 				cStatesLock.Unlock()
 			}
+
 			cStatesWg.Done()
 		}()
 
@@ -360,40 +362,41 @@ func (c *cmdList) listInstances(conf *config.Config, d lxd.InstanceServer, cinfo
 				cSnapshots[cName] = snaps
 				cSnapshotsLock.Unlock()
 			}
+
 			cSnapshotsWg.Done()
 		}()
 	}
 
-	for _, cInfo := range cinfos {
+	for _, inst := range instances {
 		for _, column := range columns {
-			if column.NeedsState && cInfo.IsActive() {
+			if column.NeedsState && inst.IsActive() {
 				cStatesLock.Lock()
-				_, ok := cStates[cInfo.Name]
+				_, ok := cStates[inst.Name]
 				cStatesLock.Unlock()
 				if ok {
 					continue
 				}
 
 				cStatesLock.Lock()
-				cStates[cInfo.Name] = nil
+				cStates[inst.Name] = nil
 				cStatesLock.Unlock()
 
-				cStatesQueue <- cInfo.Name
+				cStatesQueue <- inst.Name
 			}
 
 			if column.NeedsSnapshots {
 				cSnapshotsLock.Lock()
-				_, ok := cSnapshots[cInfo.Name]
+				_, ok := cSnapshots[inst.Name]
 				cSnapshotsLock.Unlock()
 				if ok {
 					continue
 				}
 
 				cSnapshotsLock.Lock()
-				cSnapshots[cInfo.Name] = nil
+				cSnapshots[inst.Name] = nil
 				cSnapshotsLock.Unlock()
 
-				cSnapshotsQueue <- cInfo.Name
+				cSnapshotsQueue <- inst.Name
 			}
 		}
 	}
@@ -404,30 +407,36 @@ func (c *cmdList) listInstances(conf *config.Config, d lxd.InstanceServer, cinfo
 	cSnapshotsWg.Wait()
 
 	// Convert to Instance
-	data := make([]api.InstanceFull, len(cinfos))
-	for i := range cinfos {
-		data[i].Instance = cinfos[i]
-		data[i].State = cStates[cinfos[i].Name]
-		data[i].Snapshots = cSnapshots[cinfos[i].Name]
+	data := make([]api.InstanceFull, len(instances))
+	for i := range instances {
+		data[i].Instance = instances[i]
+		data[i].State = cStates[instances[i].Name]
+		data[i].Snapshots = cSnapshots[instances[i].Name]
 	}
 
 	return c.showInstances(data, filters, columns)
 }
 
-func (c *cmdList) showInstances(cts []api.InstanceFull, filters []string, columns []column) error {
+func (c *cmdList) showInstances(instances []api.InstanceFull, filters []string, columns []column) error {
 	// Generate the table data
 	data := [][]string{}
-	for _, ct := range cts {
-		if !c.shouldShow(filters, &ct.Instance, ct.State, false) {
+	instancesFiltered := []api.InstanceFull{}
+
+	for _, inst := range instances {
+		if !c.shouldShow(filters, &inst.Instance, inst.State, false) {
 			continue
 		}
 
+		instancesFiltered = append(instancesFiltered, inst)
+
 		col := []string{}
 		for _, column := range columns {
-			col = append(col, column.Data(ct))
+			col = append(col, column.Data(inst))
 		}
+
 		data = append(data, col)
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	headers := []string{}
@@ -435,7 +444,7 @@ func (c *cmdList) showInstances(cts []api.InstanceFull, filters []string, column
 		headers = append(headers, column.Name)
 	}
 
-	return utils.RenderTable(c.flagFormat, headers, data, cts)
+	return utils.RenderTable(c.flagFormat, headers, data, instancesFiltered)
 }
 
 func (c *cmdList) Run(cmd *cobra.Command, args []string) error {
@@ -447,7 +456,7 @@ func (c *cmdList) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if c.global.flagProject != "" && c.flagAllProjects == true {
+	if c.global.flagProject != "" && c.flagAllProjects {
 		return fmt.Errorf(i18n.G("Can't specify --project with --all-projects"))
 	}
 
@@ -492,61 +501,51 @@ func (c *cmdList) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Check if we have any name based filters.
-	nameFilter := false
-	for _, filter := range filters {
-		// If not key=value syntax, it's a name filter.
-		if !strings.Contains(filter, "=") {
-			nameFilter = true
-			break
-		}
-
-		// If not straightforward key=value, assume name filter.
-		fields := strings.SplitN(filter, "=", 2)
-		if len(fields) != 2 {
-			nameFilter = true
-			break
-		}
-	}
-
-	if !nameFilter && needsData && d.HasExtension("container_full") {
+	if needsData && d.HasExtension("container_full") {
 		// Using the GetInstancesFull shortcut
-		var cts []api.InstanceFull
+		var instances []api.InstanceFull
+
+		serverFilters, clientFilters := getServerSupportedFilters(filters, api.InstanceFull{})
+
 		if c.flagAllProjects {
-			cts, err = d.GetInstancesFullAllProjects(api.InstanceTypeAny)
+			instances, err = d.GetInstancesFullAllProjectsWithFilter(api.InstanceTypeAny, serverFilters)
 		} else {
-			cts, err = d.GetInstancesFull(api.InstanceTypeAny)
+			instances, err = d.GetInstancesFullWithFilter(api.InstanceTypeAny, serverFilters)
 		}
+
 		if err != nil {
 			return err
 		}
 
-		return c.showInstances(cts, filters, columns)
+		return c.showInstances(instances, clientFilters, columns)
 	}
 
 	// Get the list of instances
-	var cts []api.Instance
-	var ctslist []api.Instance
+	var instances []api.Instance
+	serverFilters, clientFilters := getServerSupportedFilters(filters, api.Instance{})
+
 	if c.flagAllProjects {
-		ctslist, err = d.GetInstancesAllProjects(api.InstanceTypeAny)
+		instances, err = d.GetInstancesAllProjectsWithFilter(api.InstanceTypeAny, serverFilters)
 	} else {
-		ctslist, err = d.GetInstances(api.InstanceTypeAny)
+		instances, err = d.GetInstancesWithFilter(api.InstanceTypeAny, serverFilters)
 	}
+
 	if err != nil {
 		return err
 	}
 
 	// Apply filters
-	for _, cinfo := range ctslist {
-		if !c.shouldShow(filters, &cinfo, nil, true) {
+	instancesFiltered := []api.Instance{}
+	for _, inst := range instances {
+		if !c.shouldShow(clientFilters, &inst, nil, true) {
 			continue
 		}
 
-		cts = append(cts, cinfo)
+		instancesFiltered = append(instancesFiltered, inst)
 	}
 
 	// Fetch any remaining data and render the table
-	return c.listInstances(conf, d, cts, filters, columns)
+	return c.listInstances(conf, d, instancesFiltered, clientFilters, columns)
 }
 
 func (c *cmdList) parseColumns(clustered bool) ([]column, bool, error) {
@@ -620,7 +619,8 @@ func (c *cmdList) parseColumns(clustered bool) ([]column, bool, error) {
 		// period as a series of shorthand runes.
 		if !strings.Contains(columnEntry, ".") {
 			for _, columnRune := range columnEntry {
-				if column, ok := columnsShorthandMap[columnRune]; ok {
+				column, ok := columnsShorthandMap[columnRune]
+				if ok {
 					columns = append(columns, column)
 
 					if column.NeedsState || column.NeedsSnapshots {
@@ -644,7 +644,8 @@ func (c *cmdList) parseColumns(clustered bool) ([]column, bool, error) {
 
 			k := cc[0]
 			if colType == configColumnType {
-				if _, err := shared.ConfigKeyChecker(k, instancetype.Any); err != nil {
+				_, err := shared.ConfigKeyChecker(k, instancetype.Any)
+				if err != nil {
 					return nil, false, fmt.Errorf(i18n.G("Invalid config key '%s' in '%s'"), k, columnEntry)
 				}
 			}
@@ -654,6 +655,7 @@ func (c *cmdList) parseColumns(clustered bool) ([]column, bool, error) {
 				if len(cc[1]) == 0 && len(cc) != 3 {
 					return nil, false, fmt.Errorf(i18n.G("Invalid name in '%s', empty string is only allowed when defining maxWidth"), columnEntry)
 				}
+
 				column.Name = cc[1]
 			}
 
@@ -663,9 +665,11 @@ func (c *cmdList) parseColumns(clustered bool) ([]column, bool, error) {
 				if err != nil {
 					return nil, false, fmt.Errorf(i18n.G("Invalid max width (must be an integer) '%s' in '%s'"), cc[2], columnEntry)
 				}
+
 				if temp < -1 {
 					return nil, false, fmt.Errorf(i18n.G("Invalid max width (must -1, 0 or a positive integer) '%s' in '%s'"), cc[2], columnEntry)
 				}
+
 				if temp == 0 {
 					maxWidth = len(column.Name)
 				} else {
@@ -684,6 +688,7 @@ func (c *cmdList) parseColumns(clustered bool) ([]column, bool, error) {
 					if maxWidth > 0 && len(v) > maxWidth {
 						return v[:maxWidth]
 					}
+
 					return v
 				}
 			}
@@ -693,6 +698,7 @@ func (c *cmdList) parseColumns(clustered bool) ([]column, bool, error) {
 					if len(d) == 1 || len(d) > 2 {
 						return ""
 					}
+
 					v, ok := cInfo.Devices[d[0]][d[1]]
 					if !ok {
 						v = cInfo.ExpandedDevices[d[0]][d[1]]
@@ -703,6 +709,7 @@ func (c *cmdList) parseColumns(clustered bool) ([]column, bool, error) {
 					if maxWidth > 0 && len(v) > maxWidth {
 						return v[:maxWidth]
 					}
+
 					return v
 				}
 			}
@@ -768,6 +775,7 @@ func (c *cmdList) IP4ColumnData(cInfo api.InstanceFull) string {
 				}
 			}
 		}
+
 		sort.Sort(sort.Reverse(sort.StringSlice(ipv4s)))
 		return strings.Join(ipv4s, "\n")
 	}
@@ -793,6 +801,7 @@ func (c *cmdList) IP6ColumnData(cInfo api.InstanceFull) string {
 				}
 			}
 		}
+
 		sort.Sort(sort.Reverse(sort.StringSlice(ipv6s)))
 		return strings.Join(ipv6s, "\n")
 	}
@@ -963,6 +972,7 @@ func (c *cmdList) matchByNet(cInfo *api.Instance, cState *api.InstanceState, que
 			if family == "ipv6" && addr.Family != "inet6" {
 				continue
 			}
+
 			if family == "ipv4" && addr.Family != "inet" {
 				continue
 			}
@@ -986,6 +996,7 @@ func (c *cmdList) matchByNet(cInfo *api.Instance, cState *api.InstanceState, que
 func (c *cmdList) matchByIPV6(cInfo *api.Instance, cState *api.InstanceState, query string) bool {
 	return c.matchByNet(cInfo, cState, query, "ipv6")
 }
+
 func (c *cmdList) matchByIPV4(cInfo *api.Instance, cState *api.InstanceState, query string) bool {
 	return c.matchByNet(cInfo, cState, query, "ipv4")
 }

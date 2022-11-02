@@ -1,15 +1,16 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"time"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
+	"github.com/lxc/lxd/lxd/db/query"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
 )
 
@@ -41,11 +42,11 @@ type StoragePoolVolumeBackup struct {
 func (c *Cluster) getInstanceBackupID(name string) (int, error) {
 	q := "SELECT id FROM instances_backups WHERE name=?"
 	id := -1
-	arg1 := []interface{}{name}
-	arg2 := []interface{}{&id}
+	arg1 := []any{name}
+	arg2 := []any{&id}
 	err := dbQueryRowScan(c, q, arg1, arg2)
 	if err == sql.ErrNoRows {
-		return -1, ErrNoSuchObject
+		return -1, api.StatusErrorf(http.StatusNotFound, "Instance backup not found")
 	}
 
 	return id, err
@@ -67,13 +68,13 @@ SELECT instances_backups.id, instances_backups.instance_id,
     JOIN projects ON projects.id=instances.project_id
     WHERE projects.name=? AND instances_backups.name=?
 `
-	arg1 := []interface{}{projectName, name}
-	arg2 := []interface{}{&args.ID, &args.InstanceID, &args.CreationDate,
+	arg1 := []any{projectName, name}
+	arg2 := []any{&args.ID, &args.InstanceID, &args.CreationDate,
 		&args.ExpiryDate, &instanceOnlyInt, &optimizedStorageInt}
 	err := dbQueryRowScan(c, q, arg1, arg2)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return args, ErrNoSuchObject
+			return args, api.StatusErrorf(http.StatusNotFound, "Instance backup not found")
 		}
 
 		return args, err
@@ -106,13 +107,13 @@ SELECT instances_backups.name, instances_backups.instance_id,
     JOIN projects ON projects.id=instances.project_id
     WHERE instances_backups.id=?
 `
-	arg1 := []interface{}{backupID}
-	arg2 := []interface{}{&args.Name, &args.InstanceID, &args.CreationDate,
+	arg1 := []any{backupID}
+	arg2 := []any{&args.Name, &args.InstanceID, &args.CreationDate,
 		&args.ExpiryDate, &instanceOnlyInt, &optimizedStorageInt}
 	err := dbQueryRowScan(c, q, arg1, arg2)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return args, ErrNoSuchObject
+			return args, api.StatusErrorf(http.StatusNotFound, "Instance backup not found")
 		}
 
 		return args, err
@@ -138,8 +139,8 @@ func (c *Cluster) GetInstanceBackups(projectName string, name string) ([]string,
 JOIN instances ON instances_backups.instance_id=instances.id
 JOIN projects ON projects.id=instances.project_id
 WHERE projects.name=? AND instances.name=?`
-	inargs := []interface{}{projectName, name}
-	outfmt := []interface{}{name}
+	inargs := []any{projectName, name}
+	outfmt := []any{name}
 	dbResults, err := queryScan(c, q, inargs, outfmt)
 	if err != nil {
 		return nil, err
@@ -159,7 +160,7 @@ func (c *Cluster) CreateInstanceBackup(args InstanceBackup) error {
 		return ErrAlreadyDefined
 	}
 
-	err = c.Transaction(func(tx *ClusterTx) error {
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		instanceOnlyInt := 0
 		if args.InstanceOnly {
 			instanceOnlyInt = 1
@@ -170,12 +171,13 @@ func (c *Cluster) CreateInstanceBackup(args InstanceBackup) error {
 			optimizedStorageInt = 1
 		}
 
-		str := fmt.Sprintf("INSERT INTO instances_backups (instance_id, name, creation_date, expiry_date, container_only, optimized_storage) VALUES (?, ?, ?, ?, ?, ?)")
+		str := "INSERT INTO instances_backups (instance_id, name, creation_date, expiry_date, container_only, optimized_storage) VALUES (?, ?, ?, ?, ?, ?)"
 		stmt, err := tx.tx.Prepare(str)
 		if err != nil {
 			return err
 		}
-		defer stmt.Close()
+
+		defer func() { _ = stmt.Close() }()
 		result, err := stmt.Exec(args.InstanceID, args.Name,
 			args.CreationDate.Unix(), args.ExpiryDate.Unix(), instanceOnlyInt,
 			optimizedStorageInt)
@@ -212,21 +214,23 @@ func (c *Cluster) DeleteInstanceBackup(name string) error {
 // RenameInstanceBackup renames an instance backup from the given current name
 // to the new one.
 func (c *Cluster) RenameInstanceBackup(oldName, newName string) error {
-	err := c.Transaction(func(tx *ClusterTx) error {
-		str := fmt.Sprintf("UPDATE instances_backups SET name = ? WHERE name = ?")
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		str := "UPDATE instances_backups SET name = ? WHERE name = ?"
 		stmt, err := tx.tx.Prepare(str)
 		if err != nil {
 			return err
 		}
-		defer stmt.Close()
+
+		defer func() { _ = stmt.Close() }()
 
 		logger.Debug(
 			"Calling SQL Query",
-			log.Ctx{
+			logger.Ctx{
 				"query":   "UPDATE instances_backups SET name = ? WHERE name = ?",
 				"oldName": oldName,
 				"newName": newName})
-		if _, err := stmt.Exec(newName, oldName); err != nil {
+		_, err = stmt.Exec(newName, oldName)
+		if err != nil {
 			return err
 		}
 
@@ -243,7 +247,7 @@ func (c *Cluster) GetExpiredInstanceBackups() ([]InstanceBackup, error) {
 	var instanceID int
 
 	q := `SELECT instances_backups.name, instances_backups.expiry_date, instances_backups.instance_id FROM instances_backups`
-	outfmt := []interface{}{name, expiryDate, instanceID}
+	outfmt := []any{name, expiryDate, instanceID}
 	dbResults, err := queryScan(c, q, nil, outfmt)
 	if err != nil {
 		return nil, err
@@ -298,8 +302,8 @@ func (c *Cluster) GetStoragePoolVolumeBackups(projectName string, volumeName str
 
 	var backups []StoragePoolVolumeBackup
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 			var b StoragePoolVolumeBackup
 			var expiryTime sql.NullTime
 
@@ -331,8 +335,8 @@ JOIN storage_volumes ON storage_volumes_backups.storage_volume_id=storage_volume
 JOIN projects ON projects.id=storage_volumes.project_id
 WHERE projects.name=? AND storage_volumes.name=?
 ORDER BY storage_volumes_backups.id`
-	inargs := []interface{}{projectName, volumeName}
-	outfmt := []interface{}{volumeName}
+	inargs := []any{projectName, volumeName}
+	outfmt := []any{volumeName}
 	dbResults, err := queryScan(c, q, inargs, outfmt)
 	if err != nil {
 		return nil, err
@@ -352,7 +356,7 @@ func (c *Cluster) CreateStoragePoolVolumeBackup(args StoragePoolVolumeBackup) er
 		return ErrAlreadyDefined
 	}
 
-	err = c.Transaction(func(tx *ClusterTx) error {
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		volumeOnlyInt := 0
 		if args.VolumeOnly {
 			volumeOnlyInt = 1
@@ -363,12 +367,13 @@ func (c *Cluster) CreateStoragePoolVolumeBackup(args StoragePoolVolumeBackup) er
 			optimizedStorageInt = 1
 		}
 
-		str := fmt.Sprintf("INSERT INTO storage_volumes_backups (storage_volume_id, name, creation_date, expiry_date, volume_only, optimized_storage) VALUES (?, ?, ?, ?, ?, ?)")
+		str := "INSERT INTO storage_volumes_backups (storage_volume_id, name, creation_date, expiry_date, volume_only, optimized_storage) VALUES (?, ?, ?, ?, ?, ?)"
 		stmt, err := tx.tx.Prepare(str)
 		if err != nil {
 			return err
 		}
-		defer stmt.Close()
+
+		defer func() { _ = stmt.Close() }()
 		result, err := stmt.Exec(args.VolumeID, args.Name,
 			args.CreationDate.Unix(), args.ExpiryDate.Unix(), volumeOnlyInt,
 			optimizedStorageInt)
@@ -391,11 +396,11 @@ func (c *Cluster) CreateStoragePoolVolumeBackup(args StoragePoolVolumeBackup) er
 func (c *Cluster) getStoragePoolVolumeBackupID(name string) (int, error) {
 	q := "SELECT id FROM storage_volumes_backups WHERE name=?"
 	id := -1
-	arg1 := []interface{}{name}
-	arg2 := []interface{}{&id}
+	arg1 := []any{name}
+	arg2 := []any{&id}
 	err := dbQueryRowScan(c, q, arg1, arg2)
 	if err == sql.ErrNoRows {
-		return -1, ErrNoSuchObject
+		return -1, api.StatusErrorf(http.StatusNotFound, "Storage volume backup not found")
 	}
 
 	return id, err
@@ -433,12 +438,12 @@ JOIN storage_volumes ON storage_volumes.id=backups.storage_volume_id
 JOIN projects ON projects.id=storage_volumes.project_id
 WHERE projects.name=? AND backups.name=?
 `
-	arg1 := []interface{}{projectName, backupName}
-	outfmt := []interface{}{&args.ID, &args.VolumeID, &args.Name, &args.CreationDate, &args.ExpiryDate, &args.VolumeOnly, &args.OptimizedStorage}
+	arg1 := []any{projectName, backupName}
+	outfmt := []any{&args.ID, &args.VolumeID, &args.Name, &args.CreationDate, &args.ExpiryDate, &args.VolumeOnly, &args.OptimizedStorage}
 	err := dbQueryRowScan(c, q, arg1, outfmt)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return args, ErrNoSuchObject
+			return args, api.StatusErrorf(http.StatusNotFound, "Storage volume backup not found")
 		}
 
 		return args, err
@@ -464,12 +469,12 @@ JOIN storage_volumes ON storage_volumes.id=backups.storage_volume_id
 JOIN projects ON projects.id=storage_volumes.project_id
 WHERE backups.id=?
 `
-	arg1 := []interface{}{backupID}
-	outfmt := []interface{}{&args.ID, &args.VolumeID, &args.Name, &args.CreationDate, &args.ExpiryDate, &args.VolumeOnly, &args.OptimizedStorage}
+	arg1 := []any{backupID}
+	outfmt := []any{&args.ID, &args.VolumeID, &args.Name, &args.CreationDate, &args.ExpiryDate, &args.VolumeOnly, &args.OptimizedStorage}
 	err := dbQueryRowScan(c, q, arg1, outfmt)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return args, ErrNoSuchObject
+			return args, api.StatusErrorf(http.StatusNotFound, "Storage volume backup not found")
 		}
 
 		return args, err
@@ -481,21 +486,23 @@ WHERE backups.id=?
 // RenameVolumeBackup renames a volume backup from the given current name
 // to the new one.
 func (c *Cluster) RenameVolumeBackup(oldName, newName string) error {
-	err := c.Transaction(func(tx *ClusterTx) error {
-		str := fmt.Sprintf("UPDATE storage_volumes_backups SET name = ? WHERE name = ?")
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		str := "UPDATE storage_volumes_backups SET name = ? WHERE name = ?"
 		stmt, err := tx.tx.Prepare(str)
 		if err != nil {
 			return err
 		}
-		defer stmt.Close()
+
+		defer func() { _ = stmt.Close() }()
 
 		logger.Debug(
 			"Calling SQL Query",
-			log.Ctx{
+			logger.Ctx{
 				"query":   "UPDATE storage_volumes_backups SET name = ? WHERE name = ?",
 				"oldName": oldName,
 				"newName": newName})
-		if _, err := stmt.Exec(newName, oldName); err != nil {
+		_, err = stmt.Exec(newName, oldName)
+		if err != nil {
 			return err
 		}
 

@@ -22,7 +22,7 @@ type nicIPVLAN struct {
 	deviceCommon
 }
 
-// CanHotPlug returns whether the device can be managed whilst the instance is running,
+// CanHotPlug returns whether the device can be managed whilst the instance is running,.
 func (d *nicIPVLAN) CanHotPlug() bool {
 	return false
 }
@@ -75,8 +75,9 @@ func (d *nicIPVLAN) validateConfig(instConf instance.ConfigReader) error {
 			return nil
 		}
 
-		return validate.IsNetworkAddressV4List(value)
+		return validate.IsListOf(validate.IsNetworkAddressV4)(value)
 	}
+
 	rules["ipv6.address"] = func(value string) error {
 		if value == "" {
 			return nil
@@ -104,8 +105,9 @@ func (d *nicIPVLAN) validateConfig(instConf instance.ConfigReader) error {
 			return nil
 		}
 
-		return validate.IsNetworkAddressV6List(value)
+		return validate.IsListOf(validate.IsNetworkAddressV6)(value)
 	}
+
 	rules["mode"] = func(value string) error {
 		if value == "" {
 			return nil
@@ -176,6 +178,7 @@ func (d *nicIPVLAN) validateEnvironment() error {
 		if err != nil {
 			return fmt.Errorf("Error reading net sysctl %s: %w", ipv4FwdPath, err)
 		}
+
 		if sysctlVal != "1\n" {
 			// Replace . in parent name with / for sysctl formatting.
 			return fmt.Errorf("IPVLAN in L3S mode requires sysctl net.ipv4.conf.%s.forwarding=1", strings.Replace(effectiveParentName, ".", "/", -1))
@@ -189,6 +192,7 @@ func (d *nicIPVLAN) validateEnvironment() error {
 		if err != nil {
 			return fmt.Errorf("Error reading net sysctl %s: %w", ipv6FwdPath, err)
 		}
+
 		if sysctlVal != "1\n" {
 			// Replace . in parent name with / for sysctl formatting.
 			return fmt.Errorf("IPVLAN in L3S mode requires sysctl net.ipv6.conf.%s.forwarding=1", strings.Replace(effectiveParentName, ".", "/", -1))
@@ -199,6 +203,7 @@ func (d *nicIPVLAN) validateEnvironment() error {
 		if err != nil {
 			return fmt.Errorf("Error reading net sysctl %s: %w", ipv6ProxyNdpPath, err)
 		}
+
 		if sysctlVal != "1\n" {
 			// Replace . in parent name with / for sysctl formatting.
 			return fmt.Errorf("IPVLAN in L3S mode requires sysctl net.ipv6.conf.%s.proxy_ndp=1", strings.Replace(effectiveParentName, ".", "/", -1))
@@ -224,7 +229,10 @@ func (d *nicIPVLAN) Start() (*deviceConfig.RunConfig, error) {
 	// Record a random host name to use to detach the ipvlan interface back onto the host at stop time so we
 	// can remove it and not have to rely on the kernel to do it when the namespace is destroyed, as this is
 	// not always reliable.
-	saveData["host_name"] = network.RandomDevName("lxd")
+	saveData["host_name"], err = d.generateHostName("lxd", d.config["hwaddr"])
+	if err != nil {
+		return nil, err
+	}
 
 	// Decide which parent we should use based on VLAN setting.
 	parentName := network.GetHostDevice(d.config["parent"], d.config["vlan"])
@@ -369,6 +377,7 @@ func (d *nicIPVLAN) postStart() error {
 					Table:   d.config["ipv4.host_table"],
 					Family:  ip.FamilyV4,
 				}
+
 				err := r.Add()
 				if err != nil {
 					return err
@@ -389,6 +398,7 @@ func (d *nicIPVLAN) postStart() error {
 					Table:   d.config["ipv6.host_table"],
 					Family:  ip.FamilyV6,
 				}
+
 				err := r.Add()
 				if err != nil {
 					return err
@@ -419,10 +429,12 @@ func (d *nicIPVLAN) Stop() (*deviceConfig.RunConfig, error) {
 
 // postStop is run after the device is removed from the instance.
 func (d *nicIPVLAN) postStop() error {
-	defer d.volatileSet(map[string]string{
-		"last_state.created": "",
-		"host_name":          "",
-	})
+	defer func() {
+		_ = d.volatileSet(map[string]string{
+			"last_state.created": "",
+			"host_name":          "",
+		})
+	}()
 
 	v := d.volatileGet()
 
@@ -449,6 +461,7 @@ func (d *nicIPVLAN) postStop() error {
 					Table:   d.config["ipv4.host_table"],
 					Family:  ip.FamilyV4,
 				}
+
 				err := r.Delete()
 				if err != nil {
 					errs = append(errs, err)
@@ -468,6 +481,7 @@ func (d *nicIPVLAN) postStop() error {
 					Table:   d.config["ipv6.host_table"],
 					Family:  ip.FamilyV6,
 				}
+
 				err := r.Delete()
 				if err != nil {
 					errs = append(errs, err)

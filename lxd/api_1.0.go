@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
+	clusterConfig "github.com/lxc/lxd/lxd/cluster/config"
 	"github.com/lxc/lxd/lxd/config"
 	"github.com/lxc/lxd/lxd/db"
 	instanceDrivers "github.com/lxc/lxd/lxd/instance/drivers"
@@ -78,6 +80,8 @@ var api10 = []APIEndpoint{
 	networkACLLogCmd,
 	networkForwardCmd,
 	networkForwardsCmd,
+	networkLoadBalancerCmd,
+	networkLoadBalancersCmd,
 	networkPeerCmd,
 	networkPeersCmd,
 	networkZoneCmd,
@@ -96,6 +100,10 @@ var api10 = []APIEndpoint{
 	storagePoolCmd,
 	storagePoolResourcesCmd,
 	storagePoolsCmd,
+	storagePoolBucketsCmd,
+	storagePoolBucketCmd,
+	storagePoolBucketKeysCmd,
+	storagePoolBucketKeyCmd,
 	storagePoolVolumesCmd,
 	storagePoolVolumeSnapshotsTypeCmd,
 	storagePoolVolumeSnapshotTypeCmd,
@@ -191,24 +199,16 @@ var api10 = []APIEndpoint{
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func api10Get(d *Daemon, r *http.Request) response.Response {
+	s := d.State()
+
+	// Get the authentication methods.
 	authMethods := []string{"tls"}
-	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
-		config, err := cluster.ConfigLoad(tx)
-		if err != nil {
-			return err
-		}
-
-		candidURL, _, _, _ := config.CandidServer()
-		rbacURL, _, _, _, _, _, _ := config.RBACServer()
-		if candidURL != "" || rbacURL != "" {
-			authMethods = append(authMethods, "candid")
-		}
-
-		return nil
-	})
-	if err != nil {
-		return response.SmartError(err)
+	candidURL, _, _, _ := s.GlobalConfig.CandidServer()
+	rbacURL, _, _, _, _, _, _ := s.GlobalConfig.RBACServer()
+	if candidURL != "" || rbacURL != "" {
+		authMethods = append(authMethods, "candid")
 	}
+
 	srv := api.ServerUntrusted{
 		APIExtensions: version.APIExtensions,
 		APIStatus:     "stable",
@@ -231,21 +231,14 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 
 	srv.Auth = "trusted"
 
-	uname, err := shared.Uname()
+	localHTTPSAddress := s.LocalConfig.HTTPSAddress()
+
+	addresses, err := util.ListenAddresses(localHTTPSAddress)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	address, err := node.HTTPSAddress(d.db)
-	if err != nil {
-		return response.InternalError(err)
-	}
-	addresses, err := util.ListenAddresses(address)
-	if err != nil {
-		return response.InternalError(err)
-	}
-
-	clustered, err := cluster.Enabled(d.db)
+	clustered, err := cluster.Enabled(d.db.Node)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -253,18 +246,13 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 	// When clustered, use the node name, otherwise use the hostname.
 	var serverName string
 	if clustered {
-		err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			serverName, err = tx.GetLocalNodeName()
-			return err
-		})
-		if err != nil {
-			return response.SmartError(err)
-		}
+		serverName = s.ServerName
 	} else {
 		hostname, err := os.Hostname()
 		if err != nil {
 			return response.SmartError(err)
 		}
+
 		serverName = hostname
 	}
 
@@ -284,6 +272,7 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 		if err != nil {
 			return response.InternalError(err)
 		}
+
 		architectures = append(architectures, architectureName)
 	}
 
@@ -292,21 +281,16 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 		projectName = project.Default
 	}
 
-	osInfo, err := osarch.GetLSBRelease()
-	if err != nil {
-		return response.InternalError(err)
-	}
-
 	env := api.ServerEnvironment{
 		Addresses:              addresses,
 		Architectures:          architectures,
 		Certificate:            certificate,
 		CertificateFingerprint: certificateFingerprint,
-		Kernel:                 uname.Sysname,
-		KernelArchitecture:     uname.Machine,
-		KernelVersion:          uname.Release,
-		OSName:                 osInfo["NAME"],
-		OSVersion:              osInfo["VERSION_ID"],
+		Kernel:                 d.os.Uname.Sysname,
+		KernelArchitecture:     d.os.Uname.Machine,
+		KernelVersion:          d.os.Uname.Release,
+		OSName:                 d.os.ReleaseInfo["NAME"],
+		OSVersion:              d.os.ReleaseInfo["VERSION_ID"],
 		Project:                projectName,
 		Server:                 "lxd",
 		ServerPid:              os.Getpid(),
@@ -314,7 +298,7 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 		ServerClustered:        clustered,
 		ServerEventMode:        string(cluster.ServerEventMode()),
 		ServerName:             serverName,
-		Firewall:               fmt.Sprintf("%s", d.firewall),
+		Firewall:               d.firewall.String(),
 	}
 
 	env.KernelFeatures = map[string]string{
@@ -327,19 +311,24 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 		"idmapped_mounts":           fmt.Sprintf("%v", d.os.IdmappedMounts),
 	}
 
-	instanceTypes, _ := instanceDrivers.SupportedInstanceTypes()
-	for _, driverInfo := range instanceTypes {
+	drivers := instanceDrivers.DriverStatuses()
+	for _, driver := range drivers {
+		// Only report the supported drivers.
+		if !driver.Supported {
+			continue
+		}
+
 		if env.Driver != "" {
-			env.Driver = env.Driver + " | " + driverInfo.Name
+			env.Driver = env.Driver + " | " + driver.Info.Name
 		} else {
-			env.Driver = driverInfo.Name
+			env.Driver = driver.Info.Name
 		}
 
 		// Get the version of the instance drivers in use.
 		if env.DriverVersion != "" {
-			env.DriverVersion = env.DriverVersion + " | " + driverInfo.Version
+			env.DriverVersion = env.DriverVersion + " | " + driver.Info.Version
 		} else {
-			env.DriverVersion = driverInfo.Version
+			env.DriverVersion = driver.Info.Version
 		}
 	}
 
@@ -436,19 +425,29 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 		for key, value := range req.Config {
 			changed[key] = value.(string)
 		}
-		var config *cluster.Config
-		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+
+		// Get the current (updated) config.
+		var config *clusterConfig.Config
+		err := d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			var err error
-			config, err = cluster.ConfigLoad(tx)
+			config, err = clusterConfig.Load(ctx, tx)
 			return err
 		})
 		if err != nil {
 			return response.SmartError(err)
 		}
+
+		// Update the daemon config.
+		d.globalConfigMu.Lock()
+		d.globalConfig = config
+		d.globalConfigMu.Unlock()
+
+		// Run any update triggers.
 		err = doApi10UpdateTriggers(d, nil, changed, nil, config)
 		if err != nil {
 			return response.SmartError(err)
 		}
+
 		return response.EmptySyncResponse
 	}
 
@@ -456,6 +455,7 @@ func api10Put(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	err = util.EtagCheck(r, render)
 	if err != nil {
 		return response.PreconditionFailed(err)
@@ -509,6 +509,7 @@ func api10Patch(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.InternalError(err)
 	}
+
 	err = util.EtagCheck(r, render)
 	if err != nil {
 		return response.PreconditionFailed(err)
@@ -531,7 +532,7 @@ func doApi10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 	s := d.State()
 
 	// First deal with config specific to the local daemon
-	nodeValues := map[string]interface{}{}
+	nodeValues := map[string]any{}
 
 	for key := range node.ConfigSchema {
 		value, ok := req.Config[key]
@@ -541,23 +542,23 @@ func doApi10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 		}
 	}
 
-	clustered, err := cluster.Enabled(d.db)
+	clustered, err := cluster.Enabled(d.db.Node)
 	if err != nil {
 		return response.InternalError(fmt.Errorf("Failed to check for cluster state: %w", err))
 	}
 
 	nodeChanged := map[string]string{}
 	var newNodeConfig *node.Config
-	err = d.db.Transaction(func(tx *db.NodeTx) error {
+	err = d.db.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		var err error
-		newNodeConfig, err = node.ConfigLoad(tx)
+		newNodeConfig, err = node.ConfigLoad(ctx, tx)
 		if err != nil {
 			return fmt.Errorf("Failed to load node config: %w", err)
 		}
 
 		// We currently don't allow changing the cluster.https_address once it's set.
 		if clustered {
-			curConfig, err := tx.Config()
+			curConfig, err := tx.Config(ctx)
 			if err != nil {
 				return fmt.Errorf("Cannot fetch node config from database: %w", err)
 			}
@@ -594,6 +595,7 @@ func doApi10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 		} else {
 			nodeChanged, err = newNodeConfig.Replace(nodeValues)
 		}
+
 		return err
 	})
 	if err != nil {
@@ -626,10 +628,10 @@ func doApi10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 
 	// Then deal with cluster wide configuration
 	var clusterChanged map[string]string
-	var newClusterConfig *cluster.Config
-	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+	var newClusterConfig *clusterConfig.Config
+	err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
-		newClusterConfig, err = cluster.ConfigLoad(tx)
+		newClusterConfig, err = clusterConfig.Load(ctx, tx)
 		if err != nil {
 			return fmt.Errorf("Failed to load cluster config: %w", err)
 		}
@@ -639,6 +641,7 @@ func doApi10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 		} else {
 			clusterChanged, err = newClusterConfig.Replace(req.Config)
 		}
+
 		return err
 	})
 	if err != nil {
@@ -655,17 +658,20 @@ func doApi10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	err = notifier(func(client lxd.InstanceServer) error {
 		server, etag, err := client.GetServer()
 		if err != nil {
 			return err
 		}
+
 		serverPut := server.Writable()
-		serverPut.Config = make(map[string]interface{})
+		serverPut.Config = make(map[string]any)
 		// Only propagated cluster-wide changes
 		for key, value := range clusterChanged {
 			serverPut.Config[key] = value
 		}
+
 		return client.UpdateServer(serverPut, etag)
 	})
 	if err != nil {
@@ -673,6 +679,13 @@ func doApi10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 		return response.SmartError(err)
 	}
 
+	// Update the daemon config.
+	d.globalConfigMu.Lock()
+	d.globalConfig = newClusterConfig
+	d.localConfig = newNodeConfig
+	d.globalConfigMu.Unlock()
+
+	// Run any update triggers.
 	err = doApi10UpdateTriggers(d, nodeChanged, clusterChanged, newNodeConfig, newClusterConfig)
 	if err != nil {
 		return response.SmartError(err)
@@ -683,9 +696,9 @@ func doApi10Update(d *Daemon, r *http.Request, req api.ServerPut, patch bool) re
 	return response.EmptySyncResponse
 }
 
-func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]string, nodeConfig *node.Config, clusterConfig *cluster.Config) error {
-	// Don't apply changes to settings until daemon is full started.
-	<-d.readyChan
+func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]string, nodeConfig *node.Config, clusterConfig *clusterConfig.Config) error {
+	// Don't apply changes to settings until daemon is fully started.
+	<-d.waitReady.Done()
 
 	s := d.State()
 
@@ -694,6 +707,9 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 	rbacChanged := false
 	bgpChanged := false
 	dnsChanged := false
+	lokiChanged := false
+	acmeDomainChanged := false
+	acmeCAURLChanged := false
 
 	for key := range clusterChanged {
 		switch key {
@@ -718,7 +734,11 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		case "candid.api.url":
 			candidChanged = true
 		case "cluster.images_minimal_replica":
-			autoSyncImages(d.shutdownCtx, d)
+			err := autoSyncImages(d.shutdownCtx, d)
+			if err != nil {
+				logger.Warn("Could not auto-sync images", logger.Ctx{"err": err})
+			}
+
 		case "cluster.offline_threshold":
 			d.gateway.HeartbeatOfflineThreshold = clusterConfig.OfflineThreshold()
 			d.taskClusterHeartbeat.Reset()
@@ -728,6 +748,7 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			if !d.os.MockMode {
 				d.taskPruneImages.Reset()
 			}
+
 		case "rbac.agent.url":
 			fallthrough
 		case "rbac.agent.username":
@@ -744,6 +765,24 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 			rbacChanged = true
 		case "core.bgp_asn":
 			bgpChanged = true
+		case "loki.api.url":
+			fallthrough
+		case "loki.auth.username":
+			fallthrough
+		case "loki.auth.password":
+			fallthrough
+		case "loki.api.ca_cert":
+			fallthrough
+		case "loki.labels":
+			fallthrough
+		case "loki.loglevel":
+			fallthrough
+		case "loki.types":
+			lokiChanged = true
+		case "acme.ca_url":
+			acmeCAURLChanged = true
+		case "acme.domain":
+			acmeDomainChanged = true
 		}
 	}
 
@@ -771,6 +810,7 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		if err != nil {
 			return err
 		}
+
 		d.endpoints.NetworkUpdateTrustedProxy(clusterConfig.HTTPSTrustedProxy())
 	}
 
@@ -780,6 +820,7 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		if err != nil {
 			return err
 		}
+
 		d.endpoints.NetworkUpdateTrustedProxy(clusterConfig.HTTPSTrustedProxy())
 	}
 
@@ -794,6 +835,14 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 	value, ok = nodeChanged["core.metrics_address"]
 	if ok {
 		err := d.endpoints.MetricsUpdateAddress(value, d.endpoints.NetworkCert())
+		if err != nil {
+			return err
+		}
+	}
+
+	value, ok = nodeChanged["core.storage_buckets_address"]
+	if ok {
+		err := d.endpoints.StorageBucketsUpdateAddress(value, d.endpoints.NetworkCert())
 		if err != nil {
 			return err
 		}
@@ -867,6 +916,26 @@ func doApi10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 		address := nodeConfig.DNSAddress()
 
 		err := s.DNS.Reconfigure(address)
+		if err != nil {
+			return err
+		}
+	}
+
+	if lokiChanged {
+		lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiLabels, lokiLoglevel, lokiTypes := clusterConfig.LokiServer()
+
+		if lokiURL == "" || lokiLoglevel == "" || len(lokiTypes) == 0 {
+			d.internalListener.RemoveHandler("loki")
+		} else {
+			err := d.setupLoki(lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiLabels, lokiLoglevel, lokiTypes)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if acmeCAURLChanged || acmeDomainChanged {
+		err := autoRenewCertificate(d.shutdownCtx, d, acmeCAURLChanged)
 		if err != nil {
 			return err
 		}

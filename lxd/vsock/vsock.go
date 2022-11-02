@@ -1,7 +1,7 @@
 package vsock
 
 import (
-	"crypto/tls"
+	"context"
 	"net"
 	"net/http"
 	"strings"
@@ -11,6 +11,11 @@ import (
 
 	"github.com/lxc/lxd/shared"
 )
+
+// ContextID returns the local VM sockets context ID.
+func ContextID() (uint32, error) {
+	return vsock.ContextID()
+}
 
 // Dial connects to a remote vsock.
 func Dial(cid, port uint32) (net.Conn, error) {
@@ -23,7 +28,7 @@ func Listen(port uint32) (net.Listener, error) {
 }
 
 // HTTPClient provides an HTTP client for using over vsock.
-func HTTPClient(vsockID int, tlsClientCert string, tlsClientKey string, tlsServerCert string) (*http.Client, error) {
+func HTTPClient(vsockID int, port int, tlsClientCert string, tlsClientKey string, tlsServerCert string) (*http.Client, error) {
 	client := &http.Client{}
 
 	// Get the TLS configuration.
@@ -35,13 +40,13 @@ func HTTPClient(vsockID int, tlsClientCert string, tlsClientKey string, tlsServe
 	client.Transport = &http.Transport{
 		TLSClientConfig: tlsConfig,
 		// Setup a VM socket dialer.
-		Dial: func(network, addr string) (net.Conn, error) {
+		DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
 			var conn net.Conn
 			var err error
 
 			// Retry for up to 1s at 100ms interval to handle various failures.
 			for i := 0; i < 10; i++ {
-				conn, err = Dial(uint32(vsockID), shared.HTTPSDefaultPort)
+				conn, err = Dial(uint32(vsockID), uint32(port))
 				if err == nil {
 					break
 				} else {
@@ -49,7 +54,7 @@ func HTTPClient(vsockID int, tlsClientCert string, tlsClientKey string, tlsServe
 					msg := err.Error()
 					if strings.Contains(msg, "connection timed out") {
 						// Retry once.
-						conn, err = Dial(uint32(vsockID), shared.HTTPSDefaultPort)
+						conn, err = Dial(uint32(vsockID), uint32(port))
 						break
 					} else if strings.Contains(msg, "connection refused") {
 						break
@@ -60,22 +65,17 @@ func HTTPClient(vsockID int, tlsClientCert string, tlsClientKey string, tlsServe
 
 				time.Sleep(100 * time.Millisecond)
 			}
+
 			if err != nil {
 				return nil, err
 			}
 
-			tlsConn := tls.Client(conn, tlsConfig)
-
-			// Validate the connection.
-			err = tlsConn.Handshake()
-			if err != nil {
-				conn.Close()
-				return nil, err
-			}
-
-			return tlsConn, nil
+			return conn, nil
 		},
-		DisableKeepAlives: true,
+		DisableKeepAlives:     true,
+		ExpectContinueTimeout: time.Second * 30,
+		ResponseHeaderTimeout: time.Second * 3600,
+		TLSHandshakeTimeout:   time.Second * 5,
 	}
 
 	// Setup redirect policy.

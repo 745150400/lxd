@@ -10,13 +10,10 @@ import (
 	"os"
 	"time"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 )
 
 var debug bool
@@ -26,17 +23,82 @@ func Init(d bool) {
 	debug = d
 }
 
-// Response represents an API response
+// Response represents an API response.
 type Response interface {
 	Render(w http.ResponseWriter) error
 	String() string
 }
 
-// Sync response
+// Devlxd response.
+type devLxdResponse struct {
+	content     any
+	code        int
+	contentType string
+}
+
+func (r *devLxdResponse) Render(w http.ResponseWriter) error {
+	var err error
+
+	if r.code != http.StatusOK {
+		http.Error(w, fmt.Sprintf("%s", r.content), r.code)
+	} else if r.contentType == "json" {
+		w.Header().Set("Content-Type", "application/json")
+
+		var debugLogger logger.Logger
+		if debug {
+			debugLogger = logger.Logger(logger.Log)
+		}
+
+		err = util.WriteJSON(w, r.content, debugLogger)
+	} else if r.contentType != "websocket" {
+		w.Header().Set("Content-Type", "application/octet-stream")
+
+		_, err = fmt.Fprint(w, r.content.(string))
+	}
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *devLxdResponse) String() string {
+	if r.code == http.StatusOK {
+		return "success"
+	}
+
+	return "failure"
+}
+
+// DevLxdErrorResponse returns an error response. If rawResponse is true, a api.ResponseRaw will be sent instead of a minimal devLxdResponse.
+func DevLxdErrorResponse(err error, rawResponse bool) Response {
+	if rawResponse {
+		return SmartError(err)
+	}
+
+	code, ok := api.StatusErrorMatch(err)
+	if ok {
+		return &devLxdResponse{content: err.Error(), code: code, contentType: "raw"}
+	}
+
+	return &devLxdResponse{content: err.Error(), code: http.StatusInternalServerError, contentType: "raw"}
+}
+
+// DevLxdResponse represents a devLxdResponse. If rawResponse is true, a api.ResponseRaw will be sent instead of a minimal devLxdResponse.
+func DevLxdResponse(code int, content any, contentType string, rawResponse bool) Response {
+	if rawResponse {
+		return SyncResponse(true, content)
+	}
+
+	return &devLxdResponse{content: content, code: code, contentType: contentType}
+}
+
+// Sync response.
 type syncResponse struct {
 	success   bool
-	etag      interface{}
-	metadata  interface{}
+	etag      any
+	metadata  any
 	location  string
 	code      int
 	headers   map[string]string
@@ -44,21 +106,21 @@ type syncResponse struct {
 }
 
 // EmptySyncResponse represents an empty syncResponse.
-var EmptySyncResponse = &syncResponse{success: true, metadata: make(map[string]interface{})}
+var EmptySyncResponse = &syncResponse{success: true, metadata: make(map[string]any)}
 
 // SyncResponse returns a new syncResponse with the success and metadata fields
 // set to the provided values.
-func SyncResponse(success bool, metadata interface{}) Response {
+func SyncResponse(success bool, metadata any) Response {
 	return &syncResponse{success: success, metadata: metadata}
 }
 
 // SyncResponseETag returns a new syncResponse with an etag.
-func SyncResponseETag(success bool, metadata interface{}, etag interface{}) Response {
+func SyncResponseETag(success bool, metadata any, etag any) Response {
 	return &syncResponse{success: success, metadata: metadata, etag: etag}
 }
 
 // SyncResponseLocation returns a new syncResponse with a location.
-func SyncResponseLocation(success bool, metadata interface{}, location string) Response {
+func SyncResponseLocation(success bool, metadata any, location string) Response {
 	return &syncResponse{success: success, metadata: metadata, location: location}
 }
 
@@ -69,7 +131,7 @@ func SyncResponseRedirect(address string) Response {
 }
 
 // SyncResponseHeaders returns a new syncResponse with headers.
-func SyncResponseHeaders(success bool, metadata interface{}, headers map[string]string) Response {
+func SyncResponseHeaders(success bool, metadata any, headers map[string]string) Response {
 	return &syncResponse{success: success, metadata: metadata, headers: headers}
 }
 
@@ -142,7 +204,7 @@ func (r *syncResponse) Render(w http.ResponseWriter) error {
 
 	var debugLogger logger.Logger
 	if debug {
-		debugLogger = logging.AddContext(logger.Log, log.Ctx{"http_code": code})
+		debugLogger = logger.AddContext(logger.Log, logger.Ctx{"http_code": code})
 	}
 
 	return util.WriteJSON(w, resp, debugLogger)
@@ -156,7 +218,7 @@ func (r *syncResponse) String() string {
 	return "failure"
 }
 
-// Error response
+// Error response.
 type errorResponse struct {
 	code int    // Code to return in both the HTTP header and Code field of the response body.
 	msg  string // Message to return in the Error field of the response body.
@@ -261,7 +323,7 @@ func (r *errorResponse) Render(w http.ResponseWriter) error {
 	}
 
 	if debug {
-		debugLogger := logging.AddContext(logger.Log, log.Ctx{"http_code": r.code})
+		debugLogger := logger.AddContext(logger.Log, logger.Ctx{"http_code": r.code})
 		util.DebugJSON("Error Response", captured, debugLogger)
 	}
 
@@ -270,9 +332,9 @@ func (r *errorResponse) Render(w http.ResponseWriter) error {
 
 	w.WriteHeader(r.code) // Set the error code in the HTTP header response.
 
-	fmt.Fprintln(w, buf.String())
+	_, err = fmt.Fprintln(w, buf.String())
 
-	return nil
+	return err
 }
 
 // FileResponseEntry represents a file response entry.
@@ -331,7 +393,8 @@ func (r *fileResponse) Render(w http.ResponseWriter) error {
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+
+			defer func() { _ = f.Close() }()
 
 			fi, err := f.Stat()
 			if err != nil {
@@ -358,7 +421,7 @@ func (r *fileResponse) Render(w http.ResponseWriter) error {
 
 	// Now the complex multipart answer.
 	mw := multipart.NewWriter(w)
-	defer mw.Close()
+	defer func() { _ = mw.Close() }()
 
 	w.Header().Set("Content-Type", mw.FormDataContentType())
 	w.Header().Set("Transfer-Encoding", "chunked")
@@ -372,7 +435,8 @@ func (r *fileResponse) Render(w http.ResponseWriter) error {
 			if err != nil {
 				return err
 			}
-			defer fd.Close()
+
+			defer func() { _ = fd.Close() }()
 
 			rd = fd
 		}
@@ -390,10 +454,9 @@ func (r *fileResponse) Render(w http.ResponseWriter) error {
 		if entry.Cleanup != nil {
 			entry.Cleanup()
 		}
-
 	}
 
-	return nil
+	return mw.Close()
 }
 
 func (r *fileResponse) String() string {

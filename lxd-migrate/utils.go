@@ -7,7 +7,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,8 +16,8 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 	schemaform "gopkg.in/juju/environschema.v1/form"
-	"gopkg.in/macaroon-bakery.v2/httpbakery"
-	"gopkg.in/macaroon-bakery.v2/httpbakery/form"
+	"gopkg.in/macaroon-bakery.v3/httpbakery"
+	"gopkg.in/macaroon-bakery.v3/httpbakery/form"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/migration"
@@ -103,14 +102,15 @@ func transferRootfs(ctx context.Context, dst lxd.InstanceServer, op lxd.Operatio
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+
+		defer func() { _ = f.Close() }()
 
 		conn := &shared.WebsocketIO{Conn: wsFs}
 
 		go func() {
 			<-ctx.Done()
-			conn.Close()
-			f.Close()
+			_ = conn.Close()
+			_ = f.Close()
 		}()
 
 		_, err = io.Copy(conn, f)
@@ -118,14 +118,17 @@ func transferRootfs(ctx context.Context, dst lxd.InstanceServer, op lxd.Operatio
 			return err
 		}
 
-		conn.Close()
+		err = conn.Close()
+		if err != nil {
+			return err
+		}
 	}
 
 	// Check the result
 	msg := migration.MigrationControl{}
 	err = migration.ProtoRecv(wsControl, &msg)
 	if err != nil {
-		wsControl.Close()
+		_ = wsControl.Close()
 		return err
 	}
 
@@ -140,6 +143,7 @@ func connectTarget(url string, certPath string, keyPath string, authType string,
 	args := lxd.ConnectionArgs{
 		AuthType: authType,
 	}
+
 	clientFingerprint := ""
 
 	if authType == "tls" {
@@ -167,12 +171,12 @@ func connectTarget(url string, certPath string, keyPath string, authType string,
 		} else {
 			var err error
 
-			clientCrt, err = ioutil.ReadFile(certPath)
+			clientCrt, err = os.ReadFile(certPath)
 			if err != nil {
 				return nil, "", fmt.Errorf("Failed to read client certificate: %w", err)
 			}
 
-			clientKey, err = ioutil.ReadFile(keyPath)
+			clientKey, err = os.ReadFile(keyPath)
 			if err != nil {
 				return nil, "", fmt.Errorf("Failed to read client key: %w", err)
 			}
@@ -188,11 +192,12 @@ func connectTarget(url string, certPath string, keyPath string, authType string,
 			},
 		}
 
-		f, err := ioutil.TempFile("", "lxd-migrate_")
+		f, err := os.CreateTemp("", "lxd-migrate_")
 		if err != nil {
 			return nil, "", err
 		}
-		f.Close()
+
+		_ = f.Close()
 
 		jar, err := cookiejar.New(
 			&cookiejar.Options{
@@ -273,12 +278,14 @@ func connectTarget(url string, certPath string, keyPath string, authType string,
 				if err != nil {
 					return nil, "", err
 				}
+
 				fmt.Println("")
 
 				// Add client certificate to trust store
 				req := api.CertificatesPost{
 					Password: string(pwd),
 				}
+
 				req.Type = api.CertificateTypeClient
 
 				err = c.CreateCertificate(req)
@@ -287,7 +294,10 @@ func connectTarget(url string, certPath string, keyPath string, authType string,
 				}
 			} else {
 				fmt.Print("Press ENTER after the certificate was added to the remote server: ")
-				bufio.NewReader(os.Stdin).ReadString('\n')
+				_, err = bufio.NewReader(os.Stdin).ReadString('\n')
+				if err != nil {
+					return nil, "", err
+				}
 			}
 		}
 	} else {
@@ -298,7 +308,7 @@ func connectTarget(url string, certPath string, keyPath string, authType string,
 	srv, _, err = c.GetServer()
 	if err != nil {
 		if clientFingerprint != "" {
-			c.DeleteCertificate(clientFingerprint)
+			_ = c.DeleteCertificate(clientFingerprint)
 		}
 
 		return nil, "", err

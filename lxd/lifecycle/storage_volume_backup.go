@@ -1,12 +1,8 @@
 package lifecycle
 
 import (
-	"fmt"
-	"net/url"
-
-	"github.com/lxc/lxd/lxd/project"
-	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/version"
 )
 
 // StorageVolumeBackupAction represents a lifecycle event action for storage volume backups.
@@ -14,28 +10,21 @@ type StorageVolumeBackupAction string
 
 // All supported lifecycle events for storage volume backups.
 const (
-	StorageVolumeBackupCreated   = StorageVolumeBackupAction("created")
-	StorageVolumeBackupDeleted   = StorageVolumeBackupAction("deleted")
-	StorageVolumeBackupRetrieved = StorageVolumeBackupAction("retrieved")
-	StorageVolumeBackupRenamed   = StorageVolumeBackupAction("renamed")
+	StorageVolumeBackupCreated   = StorageVolumeBackupAction(api.EventLifecycleStorageVolumeBackupCreated)
+	StorageVolumeBackupDeleted   = StorageVolumeBackupAction(api.EventLifecycleStorageVolumeBackupDeleted)
+	StorageVolumeBackupRetrieved = StorageVolumeBackupAction(api.EventLifecycleStorageVolumeBackupRetrieved)
+	StorageVolumeBackupRenamed   = StorageVolumeBackupAction(api.EventLifecycleStorageVolumeBackupRenamed)
 )
 
 // Event creates the lifecycle event for an action on a storage volume backup.
-func (a StorageVolumeBackupAction) Event(poolName string, volumeType string, volumeName string, projectName string, requestor *api.EventLifecycleRequestor, ctx map[string]interface{}) api.EventLifecycle {
-	eventType := fmt.Sprintf("storage-volume-backup-%s", a)
-	parentName, backupName, _ := shared.InstanceGetParentAndSnapshotName(volumeName)
-	u := fmt.Sprintf("/1.0/storage-pools/%s/volumes/%s/%s/backups", url.PathEscape(poolName), url.PathEscape(volumeType), url.PathEscape(parentName))
-	if backupName != "" {
-		u = fmt.Sprintf("%s/%s", u, backupName)
-	}
+func (a StorageVolumeBackupAction) Event(poolName string, volumeType string, fullBackupName string, projectName string, requestor *api.EventLifecycleRequestor, ctx map[string]any) api.EventLifecycle {
+	volumeName, backupName, _ := api.GetParentAndSnapshotName(fullBackupName)
 
-	if projectName != project.Default {
-		u = fmt.Sprintf("%s?project=%s", u, url.QueryEscape(projectName))
-	}
+	u := api.NewURL().Path(version.APIVersion, "storage-pools", poolName, "volumes", volumeType, volumeName, "backups", backupName).Project(projectName)
 
 	return api.EventLifecycle{
-		Action:    eventType,
-		Source:    u,
+		Action:    string(a),
+		Source:    u.String(),
 		Context:   ctx,
 		Requestor: requestor,
 	}

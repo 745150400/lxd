@@ -1,12 +1,15 @@
 package cluster
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 
 	driver "github.com/canonical/go-dqlite/driver"
+
 	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/lxd/db/schema"
 	"github.com/lxc/lxd/lxd/util"
@@ -38,6 +41,7 @@ func Open(name string, store driver.NodeStore, options ...driver.Option) (*sql.D
 	if name == "" {
 		name = "db.bin"
 	}
+
 	db, err := sql.Open(driverName, name)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open cluster database: %w", err)
@@ -59,9 +63,9 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 	apiExtensions := version.APIExtensionsCount()
 
 	backupDone := false
-	hook := (func(version int, tx *sql.Tx) error {
+	hook := (func(ctx context.Context, version int, tx *sql.Tx) error {
 		// Check if this is a fresh instance.
-		isUpdate, err := schema.DoesSchemaTableExist(tx)
+		isUpdate, err := schema.DoesSchemaTableExist(ctx, tx)
 		if err != nil {
 			return fmt.Errorf("failed to check if schema table exists: %w", err)
 		}
@@ -72,10 +76,11 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 
 		// Check if we're clustered
 		clustered := true
-		n, err := selectUnclusteredNodesCount(tx)
+		n, err := selectUnclusteredNodesCount(ctx, tx)
 		if err != nil {
 			return fmt.Errorf("failed to fetch unclustered nodes count: %w", err)
 		}
+
 		if n > 1 {
 			// This should never happen, since we only add nodes with valid addresses..
 			return fmt.Errorf("found more than one unclustered nodes")
@@ -96,6 +101,7 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 			if err != nil {
 				return fmt.Errorf("failed to backup global database: %w", err)
 			}
+
 			backupDone = true
 		}
 
@@ -108,7 +114,7 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 		return nil
 	})
 
-	check := func(current int, tx *sql.Tx) error {
+	check := func(ctx context.Context, current int, tx *sql.Tx) error {
 		// If we're bootstrapping a fresh schema, skip any check, since
 		// it's safe to assume we are the only node.
 		if current == 0 {
@@ -116,10 +122,11 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 		}
 
 		// Check if we're clustered
-		n, err := selectUnclusteredNodesCount(tx)
+		n, err := selectUnclusteredNodesCount(ctx, tx)
 		if err != nil {
 			return fmt.Errorf("failed to fetch unclustered nodes count: %w", err)
 		}
+
 		if n > 1 {
 			// This should never happen, since we only add nodes with valid addresses.
 			return fmt.Errorf("found more than one unclustered nodes")
@@ -133,11 +140,12 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 			return fmt.Errorf("failed to update node version info: %w", err)
 		}
 
-		err = checkClusterIsUpgradable(tx, [2]int{len(updates), apiExtensions})
+		err = checkClusterIsUpgradable(ctx, tx, [2]int{len(updates), apiExtensions})
 		if err == errSomeNodesAreBehind {
 			someNodesAreBehind = true
 			return schema.ErrGracefulAbort
 		}
+
 		return err
 	}
 
@@ -155,6 +163,7 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 	if someNodesAreBehind {
 		return false, nil
 	}
+
 	if err != nil {
 		return false, err
 	}
@@ -167,7 +176,8 @@ func EnsureSchema(db *sql.DB, address string, dir string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		err = query.Transaction(db, func(tx *sql.Tx) error {
+
+		err = query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
 			stmt := `
 INSERT INTO nodes(id, name, address, schema, api_extensions, arch, description) VALUES(1, 'none', '0.0.0.0', ?, ?, ?, '')
 `
@@ -177,14 +187,14 @@ INSERT INTO nodes(id, name, address, schema, api_extensions, arch, description) 
 			}
 
 			// Default project
-			stmt = `
-INSERT INTO projects (name, description) VALUES ('default', 'Default LXD project');
-INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.images', 'true');
-INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.profiles', 'true');
-INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.storage.volumes', 'true');
-INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.networks', 'true');
-`
-			_, err = tx.Exec(stmt)
+			var defaultProjectStmt strings.Builder
+			_, _ = defaultProjectStmt.WriteString("INSERT INTO projects (name, description) VALUES ('default', 'Default LXD project');")
+
+			for _, key := range ProjectFeatures {
+				_, _ = defaultProjectStmt.WriteString(fmt.Sprintf("INSERT INTO projects_config (project_id, key, value) VALUES (1, '%s', 'true');", key))
+			}
+
+			_, err = tx.Exec(defaultProjectStmt.String())
 			if err != nil {
 				return err
 			}
@@ -207,6 +217,7 @@ INSERT INTO nodes_cluster_groups (node_id, group_id) VALUES(1, 1);
 			if err != nil {
 				return err
 			}
+
 			return nil
 		})
 		if err != nil {
@@ -230,9 +241,9 @@ func dqliteDriverName() string {
 // registered.
 var dqliteDriverSerial uint64
 
-func checkClusterIsUpgradable(tx *sql.Tx, target [2]int) error {
+func checkClusterIsUpgradable(ctx context.Context, tx *sql.Tx, target [2]int) error {
 	// Get the current versions in the nodes table.
-	versions, err := selectNodesVersions(tx)
+	versions, err := selectNodesVersions(ctx, tx)
 	if err != nil {
 		return fmt.Errorf("failed to fetch current nodes versions: %w", err)
 	}
@@ -242,6 +253,7 @@ func checkClusterIsUpgradable(tx *sql.Tx, target [2]int) error {
 		if err != nil {
 			return err
 		}
+
 		switch n {
 		case 0:
 			// Versions are equal, there's hope for the

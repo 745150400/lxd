@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -65,7 +65,7 @@ func (c *cmdClusterGroup) Command() *cobra.Command {
 	return cmd
 }
 
-// Assign
+// Assign.
 type cmdClusterGroupAssign struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -137,12 +137,10 @@ func (c *cmdClusterGroupAssign) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Create
+// Create.
 type cmdClusterGroupCreate struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
-
-	flagFormat string
 }
 
 func (c *cmdClusterGroupCreate) Command() *cobra.Command {
@@ -193,12 +191,10 @@ func (c *cmdClusterGroupCreate) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Delete
+// Delete.
 type cmdClusterGroupDelete struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
-
-	flagFormat string
 }
 
 func (c *cmdClusterGroupDelete) Command() *cobra.Command {
@@ -246,12 +242,10 @@ func (c *cmdClusterGroupDelete) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Edit
+// Edit.
 type cmdClusterGroupEdit struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
-
-	flagFormat string
 }
 
 func (c *cmdClusterGroupEdit) Command() *cobra.Command {
@@ -287,7 +281,7 @@ func (c *cmdClusterGroupEdit) Run(cmd *cobra.Command, args []string) error {
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -358,7 +352,7 @@ func (c *cmdClusterGroupEdit) helpTemplate() string {
 ### Any line starting with a '# will be ignored.`)
 }
 
-// List
+// List.
 type cmdClusterGroupList struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -421,6 +415,7 @@ func (c *cmdClusterGroupList) Run(cmd *cobra.Command, args []string) error {
 		line := []string{group.Name, group.Description, fmt.Sprintf("%d", len(group.Members))}
 		data = append(data, line)
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -432,7 +427,7 @@ func (c *cmdClusterGroupList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, groups)
 }
 
-// Remove
+// Remove.
 type cmdClusterGroupRemove struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
@@ -502,12 +497,10 @@ func (c *cmdClusterGroupRemove) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Rename
+// Rename.
 type cmdClusterGroupRename struct {
 	global  *cmdGlobal
 	cluster *cmdCluster
-
-	flagFormat string
 }
 
 func (c *cmdClusterGroupRename) Command() *cobra.Command {
@@ -551,7 +544,7 @@ func (c *cmdClusterGroupRename) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Show
+// Show.
 type cmdClusterGroupShow struct {
 	global  *cmdGlobal
 	cluster *cmdCluster

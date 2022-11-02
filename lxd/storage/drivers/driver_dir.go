@@ -20,12 +20,8 @@ type dir struct {
 func (d *dir) load() error {
 	// Register the patches.
 	d.patches = map[string]func() error{
-		"storage_create_vm":                        nil,
-		"storage_zfs_mount":                        nil,
-		"storage_create_vm_again":                  nil,
-		"storage_zfs_volmode":                      nil,
-		"storage_rename_custom_volume_add_project": nil,
-		"storage_lvm_skipactivation":               nil,
+		"storage_lvm_skipactivation":       nil,
+		"storage_missing_snapshot_records": nil,
 	}
 
 	return nil
@@ -39,11 +35,12 @@ func (d *dir) Info() Info {
 		OptimizedImages:   false,
 		PreservesInodes:   false,
 		Remote:            d.isRemote(),
-		VolumeTypes:       []VolumeType{VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		VolumeTypes:       []VolumeType{VolumeTypeBucket, VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
 		BlockBacking:      false,
 		RunningCopyFreeze: true,
 		DirectIO:          true,
 		MountedRoot:       true,
+		Buckets:           true,
 	}
 }
 
@@ -99,7 +96,7 @@ func (d *dir) Delete(op *operations.Operation) error {
 
 // Validate checks that all provide keys are supported and that no conflicting or missing configuration is present.
 func (d *dir) Validate(config map[string]string) error {
-	return d.validatePool(config, nil)
+	return d.validatePool(config, nil, nil)
 }
 
 // Update applies any driver changes required from a configuration change.

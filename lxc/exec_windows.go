@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package main
 
@@ -47,6 +46,7 @@ func (c *cmdExec) controlSocketHandler(control *websocket.Conn) {
 				logger.Debugf("Failed to forward signal '%s'.", windows.SIGINT)
 				return
 			}
+
 		default:
 			break
 		}

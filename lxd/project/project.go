@@ -1,11 +1,14 @@
 package project
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 )
 
 // Default is the string used for a default project.
@@ -62,16 +65,33 @@ func StorageVolumeParts(projectStorageVolumeName string) (string, string) {
 }
 
 // StorageVolumeProject returns the project name to use to for the volume based on the requested project.
+// For image volume types the default project is always returned.
 // For custom volume type, if the project specified has the "features.storage.volumes" flag enabled then the
-// project name is returned, otherwise the default project name is returned. For all other volume types the
-// supplied project name is returned.
+// project name is returned, otherwise the default project name is returned.
+// For all other volume types the supplied project name is returned.
 func StorageVolumeProject(c *db.Cluster, projectName string, volumeType int) (string, error) {
+	// Image volumes are effectively a cache and so are always linked to default project.
+	// Optimisation to avoid loading project record.
+	if volumeType == db.StoragePoolVolumeTypeImage {
+		return Default, nil
+	}
+
 	// Non-custom volumes always use the project specified. Optimisation to avoid loading project record.
 	if volumeType != db.StoragePoolVolumeTypeCustom {
 		return projectName, nil
 	}
 
-	project, err := c.GetProject(projectName)
+	var project *api.Project
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		dbProject, err := cluster.GetProject(ctx, tx.Tx(), projectName)
+		if err != nil {
+			return err
+		}
+
+		project, err = dbProject.ToAPI(ctx, tx.Tx())
+
+		return err
+	})
 	if err != nil {
 		return "", fmt.Errorf("Failed to load project %q: %w", projectName, err)
 	}
@@ -80,10 +100,16 @@ func StorageVolumeProject(c *db.Cluster, projectName string, volumeType int) (st
 }
 
 // StorageVolumeProjectFromRecord returns the project name to use to for the volume based on the supplied project.
+// For image volume types the default project is always returned.
 // For custom volume type, if the project supplied has the "features.storage.volumes" flag enabled then the
-// project name is returned, otherwise the default project name is returned. For all other volume types the
-// supplied project's name is returned.
-func StorageVolumeProjectFromRecord(p *db.Project, volumeType int) string {
+// project name is returned, otherwise the default project name is returned.
+// For all other volume types the supplied project's name is returned.
+func StorageVolumeProjectFromRecord(p *api.Project, volumeType int) string {
+	// Image volumes are effectively a cache and so are always linked to default project.
+	if volumeType == db.StoragePoolVolumeTypeImage {
+		return Default
+	}
+
 	// Non-custom volumes always use the project specified.
 	if volumeType != db.StoragePoolVolumeTypeCustom {
 		return p.Name
@@ -98,29 +124,69 @@ func StorageVolumeProjectFromRecord(p *db.Project, volumeType int) string {
 	return Default
 }
 
-// NetworkProject returns the project name to use for the network based on the requested project.
-// If the project specified has the "features.networks" flag enabled then the project name is returned,
-// otherwise the default project name is returned. The second return value is the project's config if non-default
-// project is being returned, nil if not.
-func NetworkProject(c *db.Cluster, projectName string) (string, map[string]string, error) {
-	p, err := c.GetProject(projectName)
+// StorageBucketProject returns the effective project name to use to for the bucket based on the requested project.
+// If the project specified has the "features.storage.buckets" flag enabled then the project name is returned,
+// otherwise the default project name is returned.
+func StorageBucketProject(ctx context.Context, c *db.Cluster, projectName string) (string, error) {
+	var p *api.Project
+	err := c.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
+		dbProject, err := cluster.GetProject(ctx, tx.Tx(), projectName)
+		if err != nil {
+			return err
+		}
+
+		p, err = dbProject.ToAPI(ctx, tx.Tx())
+
+		return err
+	})
+	if err != nil {
+		return "", fmt.Errorf("Failed to load project %q: %w", projectName, err)
+	}
+
+	return StorageBucketProjectFromRecord(p), nil
+}
+
+// StorageBucketProjectFromRecord returns the project name to use to for the bucket based on the supplied project.
+// If the project supplied has the "features.storage.buckets" flag enabled then the project name is returned,
+// otherwise the default project name is returned.
+func StorageBucketProjectFromRecord(p *api.Project) string {
+	// Buckets only use the project specified if the project has the features.storage.buckets feature
+	// enabled, otherwise the default project is used.
+	if shared.IsTrue(p.Config["features.storage.buckets"]) {
+		return p.Name
+	}
+
+	return Default
+}
+
+// NetworkProject returns the effective project name to use for the network based on the requested project.
+// If the requested project has the "features.networks" flag enabled then the requested project's info is returned,
+// otherwise the default project name is returned. The second return value is always the requested project's info.
+func NetworkProject(c *db.Cluster, projectName string) (string, *api.Project, error) {
+	var p *api.Project
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		dbProject, err := cluster.GetProject(ctx, tx.Tx(), projectName)
+		if err != nil {
+			return err
+		}
+
+		p, err = dbProject.ToAPI(ctx, tx.Tx())
+
+		return err
+	})
 	if err != nil {
 		return "", nil, fmt.Errorf("Failed to load project %q: %w", projectName, err)
 	}
 
-	projectName = NetworkProjectFromRecord(p)
+	effectiveProjectName := NetworkProjectFromRecord(p)
 
-	if projectName != Default {
-		return projectName, p.Config, nil
-	}
-
-	return Default, nil, nil
+	return effectiveProjectName, p, nil
 }
 
 // NetworkProjectFromRecord returns the project name to use for the network based on the supplied project.
 // If the project supplied has the "features.networks" flag enabled then the project name is returned,
 // otherwise the default project name is returned.
-func NetworkProjectFromRecord(p *db.Project) string {
+func NetworkProjectFromRecord(p *api.Project) string {
 	// Networks only use the project specified if the project has the features.networks feature enabled,
 	// otherwise the legacy behaviour of using the default project for networks is used.
 	if shared.IsTrue(p.Config["features.networks"]) {
@@ -130,29 +196,76 @@ func NetworkProjectFromRecord(p *db.Project) string {
 	return Default
 }
 
-// ProfileProject returns the project name to use for the profile based on the requested project.
-// If the project specified has the "features.profiles" flag enabled then the project name is returned,
-// otherwise the default project name is returned. The second return value is the project's config if non-default
-// project is being returned, nil if not.
-func ProfileProject(c *db.Cluster, projectName string) (string, map[string]string, error) {
-	p, err := c.GetProject(projectName)
+// NetworkAllowed returns whether access is allowed to a particular network based on projectConfig.
+func NetworkAllowed(reqProjectConfig map[string]string, networkName string, isManaged bool) bool {
+	// If project is not restricted, then access to network is allowed.
+	if shared.IsFalseOrEmpty(reqProjectConfig["restricted"]) {
+		return true
+	}
+
+	// If project has no access to NIC devices then also block access to all networks.
+	if reqProjectConfig["restricted.devices.nic"] == "block" {
+		return false
+	}
+
+	// Don't allow access to unmanaged networks if only managed network access is allowed.
+	if shared.StringInSlice(reqProjectConfig["restricted.devices.nic"], []string{"managed", ""}) && !isManaged {
+		return false
+	}
+
+	// If restricted.networks.access is not set then allow access to all networks.
+	if reqProjectConfig["restricted.networks.access"] == "" {
+		return true
+	}
+
+	// Check if reqquested network is in list of allowed networks.
+	allowedRestrictedNetworks := shared.SplitNTrimSpace(reqProjectConfig["restricted.networks.access"], ",", -1, false)
+	return shared.StringInSlice(networkName, allowedRestrictedNetworks)
+}
+
+// ProfileProject returns the effective project to use for the profile based on the requested project.
+// If the requested project has the "features.profiles" flag enabled then the requested project's info is returned,
+// otherwise the default project's info is returned.
+func ProfileProject(c *db.Cluster, projectName string) (*api.Project, error) {
+	var p *api.Project
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		dbProject, err := cluster.GetProject(ctx, tx.Tx(), projectName)
+		if err != nil {
+			return fmt.Errorf("Failed loading project %q: %w", projectName, err)
+		}
+
+		p, err = dbProject.ToAPI(ctx, tx.Tx())
+		if err != nil {
+			return fmt.Errorf("Failed loading config for project %q: %w", projectName, err)
+		}
+
+		effectiveProjectName := ProfileProjectFromRecord(p)
+
+		if effectiveProjectName == Default {
+			dbProject, err = cluster.GetProject(ctx, tx.Tx(), effectiveProjectName)
+			if err != nil {
+				return fmt.Errorf("Failed loading project %q: %w", effectiveProjectName, err)
+			}
+		}
+
+		p, err = dbProject.ToAPI(ctx, tx.Tx())
+		if err != nil {
+			return fmt.Errorf("Failed loading config for project %q: %w", dbProject.Name, err)
+		}
+
+		return nil
+	})
 	if err != nil {
-		return "", nil, fmt.Errorf("Failed to load project %q: %w", projectName, err)
+		return nil, err
 	}
 
-	projectName = ProfileProjectFromRecord(p)
-
-	if projectName != Default {
-		return projectName, p.Config, nil
-	}
-
-	return Default, nil, nil
+	return p, nil
 }
 
 // ProfileProjectFromRecord returns the project name to use for the profile based on the supplied project.
 // If the project supplied has the "features.profiles" flag enabled then the project name is returned,
 // otherwise the default project name is returned.
-func ProfileProjectFromRecord(p *db.Project) string {
+func ProfileProjectFromRecord(p *api.Project) string {
 	// Profiles only use the project specified if the project has the features.profiles feature enabled,
 	// otherwise the default project for profiles is used.
 	if shared.IsTrue(p.Config["features.profiles"]) {

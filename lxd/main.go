@@ -14,11 +14,10 @@ import (
 	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/lxd/rsync"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 	"github.com/lxc/lxd/shared/version"
 )
 
-// Initialize the random number generator
+// Initialize the random number generator.
 func init() {
 	rand.Seed(time.Now().UTC().UnixNano())
 }
@@ -64,11 +63,10 @@ func (c *cmdGlobal) Run(cmd *cobra.Command, args []string) error {
 		syslog = "lxd"
 	}
 
-	log, err := logging.GetLogger(syslog, c.flagLogFile, c.flagLogVerbose, c.flagLogDebug, events.NewEventHandler())
+	err = logger.InitLogger(c.flagLogFile, syslog, c.flagLogVerbose, c.flagLogDebug, events.NewEventHandler())
 	if err != nil {
 		return err
 	}
-	logger.Log = log
 
 	return nil
 }
@@ -169,10 +167,6 @@ func main() {
 	// forkuevent sub-command
 	forkueventCmd := cmdForkuevent{global: &globalCmd}
 	app.AddCommand(forkueventCmd.Command())
-
-	// forkusernsexec sub-command
-	forkusernsexecCmd := cmdForkusernsexec{global: &globalCmd}
-	app.AddCommand(forkusernsexecCmd.Command())
 
 	// forkzfs sub-command
 	forkzfsCmd := cmdForkZFS{global: &globalCmd}

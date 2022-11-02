@@ -4,14 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/lxd/metrics"
 	"github.com/lxc/lxd/lxd/response"
@@ -37,40 +35,40 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 
 	diskStats, err := getDiskMetrics(d)
 	if err != nil {
-		logger.Warn("Failed to get disk metrics", log.Ctx{"err": err})
+		logger.Warn("Failed to get disk metrics", logger.Ctx{"err": err})
 	} else {
 		out.Disk = diskStats
 	}
 
 	filesystemStats, err := getFilesystemMetrics(d)
 	if err != nil {
-		logger.Warn("Failed to get filesystem metrics", log.Ctx{"err": err})
+		logger.Warn("Failed to get filesystem metrics", logger.Ctx{"err": err})
 	} else {
 		out.Filesystem = filesystemStats
 	}
 
 	memStats, err := getMemoryMetrics(d)
 	if err != nil {
-		logger.Warn("Failed to get memory metrics", log.Ctx{"err": err})
+		logger.Warn("Failed to get memory metrics", logger.Ctx{"err": err})
 	} else {
 		out.Memory = memStats
 	}
 
 	netStats, err := getNetworkMetrics(d)
 	if err != nil {
-		logger.Warn("Failed to get network metrics", log.Ctx{"err": err})
+		logger.Warn("Failed to get network metrics", logger.Ctx{"err": err})
 	} else {
 		out.Network = netStats
 	}
 
 	out.ProcessesTotal, err = getTotalProcesses(d)
 	if err != nil {
-		logger.Warn("Failed to get total processes", log.Ctx{"err": err})
+		logger.Warn("Failed to get total processes", logger.Ctx{"err": err})
 	}
 
 	cpuStats, err := getCPUMetrics(d)
 	if err != nil {
-		logger.Warn("Failed to get CPU metrics", log.Ctx{"err": err})
+		logger.Warn("Failed to get CPU metrics", logger.Ctx{"err": err})
 	} else {
 		out.CPU = cpuStats
 	}
@@ -79,7 +77,7 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 }
 
 func getCPUMetrics(d *Daemon) (map[string]metrics.CPUMetrics, error) {
-	stats, err := ioutil.ReadFile("/proc/stat")
+	stats, err := os.ReadFile("/proc/stat")
 	if err != nil {
 		return nil, fmt.Errorf("Failed to read /proc/stat: %w", err)
 	}
@@ -161,7 +159,7 @@ func getCPUMetrics(d *Daemon) (map[string]metrics.CPUMetrics, error) {
 }
 
 func getTotalProcesses(d *Daemon) (uint64, error) {
-	entries, err := ioutil.ReadDir("/proc")
+	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0, fmt.Errorf("Failed to read dir %q: %w", "/proc", err)
 	}
@@ -182,7 +180,7 @@ func getTotalProcesses(d *Daemon) (uint64, error) {
 
 		cmdlinePath := filepath.Join("/proc", entry.Name(), "cmdline")
 
-		cmdline, err := ioutil.ReadFile(cmdlinePath)
+		cmdline, err := os.ReadFile(cmdlinePath)
 		if err != nil {
 			continue
 		}
@@ -198,7 +196,7 @@ func getTotalProcesses(d *Daemon) (uint64, error) {
 }
 
 func getDiskMetrics(d *Daemon) (map[string]metrics.DiskMetrics, error) {
-	diskStats, err := ioutil.ReadFile("/proc/diskstats")
+	diskStats, err := os.ReadFile("/proc/diskstats")
 	if err != nil {
 		return nil, fmt.Errorf("Failed to read /proc/diskstats: %w", err)
 	}
@@ -247,7 +245,7 @@ func getDiskMetrics(d *Daemon) (map[string]metrics.DiskMetrics, error) {
 }
 
 func getFilesystemMetrics(d *Daemon) (map[string]metrics.FilesystemMetrics, error) {
-	mounts, err := ioutil.ReadFile("/proc/mounts")
+	mounts, err := os.ReadFile("/proc/mounts")
 	if err != nil {
 		return nil, fmt.Errorf("Failed to read /proc/mounts: %w", err)
 	}
@@ -277,9 +275,8 @@ func getFilesystemMetrics(d *Daemon) (map[string]metrics.FilesystemMetrics, erro
 			stats.FSType = fsType
 		}
 
-		stats.SizeBytes = statfs.Blocks * uint64(statfs.Bsize)
-		stats.SizeBytes = statfs.Blocks * uint64(statfs.Bsize)
-		stats.SizeBytes = statfs.Blocks * uint64(statfs.Bsize)
+		stats.AvailableBytes = statfs.Bavail * uint64(statfs.Bsize)
+		stats.FreeBytes = statfs.Bfree * uint64(statfs.Bsize)
 		stats.SizeBytes = statfs.Blocks * uint64(statfs.Bsize)
 
 		out[fields[0]] = stats
@@ -289,7 +286,7 @@ func getFilesystemMetrics(d *Daemon) (map[string]metrics.FilesystemMetrics, erro
 }
 
 func getMemoryMetrics(d *Daemon) (metrics.MemoryMetrics, error) {
-	content, err := ioutil.ReadFile("/proc/meminfo")
+	content, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return metrics.MemoryMetrics{}, fmt.Errorf("Failed to read /proc/meminfo: %w", err)
 	}

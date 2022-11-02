@@ -3,18 +3,16 @@ package drivers
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/lxd/instance/drivers/qmp"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/metrics"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/units"
 )
 
@@ -29,30 +27,29 @@ func (d *qemu) getQemuMetrics() (*metrics.MetricSet, error) {
 
 	cpuStats, err := d.getQemuCPUMetrics(monitor)
 	if err != nil {
-		d.logger.Warn("Failed to get CPU metrics", log.Ctx{"err": err})
+		d.logger.Warn("Failed to get CPU metrics", logger.Ctx{"err": err})
 	} else {
 		out.CPU = cpuStats
 	}
 
 	memoryStats, err := d.getQemuMemoryMetrics(monitor)
 	if err != nil {
-		d.logger.Warn("Failed to get memory metrics", log.Ctx{"err": err})
+		d.logger.Warn("Failed to get memory metrics", logger.Ctx{"err": err})
 	} else {
 		out.Memory = memoryStats
 	}
 
 	diskStats, err := d.getQemuDiskMetrics(monitor)
 	if err != nil {
-		d.logger.Warn("Failed to get disk metrics", log.Ctx{"err": err})
+		d.logger.Warn("Failed to get disk metrics", logger.Ctx{"err": err})
 	} else {
 		out.Disk = diskStats
 	}
 
 	networkState, err := d.getNetworkState()
 	if err != nil {
-		d.logger.Warn("Failed to get network metrics", log.Ctx{"err": err})
+		d.logger.Warn("Failed to get network metrics", logger.Ctx{"err": err})
 	} else {
-
 		out.Network = make(map[string]metrics.NetworkMetrics)
 
 		for name, state := range networkState {
@@ -69,7 +66,7 @@ func (d *qemu) getQemuMetrics() (*metrics.MetricSet, error) {
 		}
 	}
 
-	metricSet, err := metrics.MetricSetFromAPI(&out, map[string]string{"project": d.project, "name": d.name, "type": instancetype.VM.String()})
+	metricSet, err := metrics.MetricSetFromAPI(&out, map[string]string{"project": d.project.Name, "name": d.name, "type": instancetype.VM.String()})
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +108,8 @@ func (d *qemu) getQemuMemoryMetrics(monitor *qmp.Monitor) (metrics.MemoryMetrics
 	if err != nil {
 		return out, err
 	}
-	defer f.Close()
+
+	defer func() { _ = f.Close() }()
 
 	// Read it line by line.
 	memRSS := int64(-1)
@@ -174,7 +172,7 @@ func (d *qemu) getQemuCPUMetrics(monitor *qmp.Monitor) (map[string]metrics.CPUMe
 	cpuMetrics := map[string]metrics.CPUMetrics{}
 
 	for i, threadID := range threadIDs {
-		pid, err := ioutil.ReadFile(d.pidFilePath())
+		pid, err := os.ReadFile(d.pidFilePath())
 		if err != nil {
 			return nil, err
 		}
@@ -185,7 +183,7 @@ func (d *qemu) getQemuCPUMetrics(monitor *qmp.Monitor) (map[string]metrics.CPUMe
 			continue
 		}
 
-		content, err := ioutil.ReadFile(statFile)
+		content, err := os.ReadFile(statFile)
 		if err != nil {
 			return nil, err
 		}

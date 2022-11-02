@@ -1,3 +1,8 @@
+---
+discourse: 8178
+relatedlinks: "[LXD&#32;-&#32;Installation](https://linuxcontainers.org/lxd/getting-started-cli/)"
+---
+
 # Installing LXD
 
 The easiest way to install LXD is to install one of the available packages, but you can also install LXD from the sources.
@@ -10,28 +15,29 @@ The easiest way to install LXD is to install one of the available packages, but 
 
 (installing_from_source)=
 ## Installing LXD from source
-We recommend having the latest versions of liblxc (>= 4.0.0 required)
-available for LXD development. Additionally, LXD requires Golang 1.16 or
-later to work. On ubuntu, you can get those with:
+
+We recommend having the latest versions of `liblxc` (>= 4.0.0 required)
+available for LXD development. Additionally, LXD requires Golang 1.18 or
+later to work. On Ubuntu, you can get those with:
 
 ```bash
 sudo apt update
-sudo apt install acl attr autoconf dnsmasq-base git golang libacl1-dev libcap-dev liblxc1 liblxc-dev libsqlite3-dev libtool libudev-dev liblz4-dev libuv1-dev make pkg-config rsync squashfs-tools tar tcl xz-utils ebtables
+sudo apt install acl attr autoconf automake dnsmasq-base git golang libacl1-dev libcap-dev liblxc1 liblxc-dev libsqlite3-dev libtool libudev-dev liblz4-dev libuv1-dev make pkg-config rsync squashfs-tools tar tcl xz-utils ebtables
 ```
 
-There are a few storage backends for LXD besides the default "directory" backend.
+There are a few storage drivers for LXD besides the default `dir` driver.
 Installing these tools adds a bit to initramfs and may slow down your
-host boot, but are needed if you'd like to use a particular backend:
+host boot, but are needed if you'd like to use a particular driver:
 
 ```bash
 sudo apt install lvm2 thin-provisioning-tools
 sudo apt install btrfs-progs
 ```
 
-To run the testsuite, you'll also need:
+To run the test suite, you'll also need:
 
 ```bash
-sudo apt install curl gettext jq sqlite3 uuid-runtime socat bind9-dnsutils
+sudo apt install curl gettext jq sqlite3 socat bind9-dnsutils
 ```
 
 ### From Source: Building the latest version
@@ -52,7 +58,7 @@ Then proceed to the instructions below to actually build and install LXD.
 ### From Source: Building a Release
 
 The LXD release tarballs bundle a complete dependency tree as well as a
-local copy of libraft and libdqlite for LXD's database setup.
+local copy of `libraft` and `libdqlite` for LXD's database setup.
 
 ```bash
 tar zxvf lxd-4.18.tar.gz
@@ -96,6 +102,7 @@ export LD_LIBRARY_PATH="$(go env GOPATH)/deps/dqlite/.libs/:$(go env GOPATH)/dep
 Now, the `lxd` and `lxc` binaries will be available to you and can be used to set up LXD. The binaries will automatically find and use the dependencies built in `$(go env GOPATH)/deps` thanks to the `LD_LIBRARY_PATH` environment variable.
 
 ### Machine Setup
+
 You'll need sub{u,g}ids for root, so that LXD can create the unprivileged containers:
 
 ```bash
@@ -109,4 +116,19 @@ group to talk to LXD; you can create your own group if you want):
 sudo -E PATH=${PATH} LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $(go env GOPATH)/bin/lxd --group sudo
 ```
 
-*Note: If `newuidmap/newgidmap` tools are present on your system and `/etc/subuid`, `etc/subgid` exist, they must be configured to allow the root user a contiguous range of at least 10M uid/gid.* 
+```{note}
+If `newuidmap/newgidmap` tools are present on your system and `/etc/subuid`, `etc/subgid` exist, they must be configured to allow the root user a contiguous range of at least 10M UID/GID.
+```
+
+## Upgrading LXD
+
+After upgrading LXD to a newer version, LXD might need to update its database to a new schema.
+This update happens automatically when the daemon starts up after a LXD upgrade.
+A backup of the database before the update is stored in the same location as the active database (for example, at `/var/snap/lxd/common/lxd/database` for the snap installation).
+
+```{important}
+After a schema update, older versions of LXD might regard the database as invalid.
+That means that downgrading LXD might render your LXD installation unusable.
+
+In that case, if you need to downgrade, restore the database backup before starting the downgrade.
+```

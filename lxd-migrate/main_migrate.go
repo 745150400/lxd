@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxc/utils"
+	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	cli "github.com/lxc/lxd/shared/cmd"
@@ -428,6 +428,7 @@ Additional overrides can be applied at this stage:
 		case 5:
 			err = c.askNetwork(server, &config)
 		}
+
 		if err != nil {
 			fmt.Println(err)
 		}
@@ -459,7 +460,7 @@ func (c *cmdMigrate) Run(cmd *cobra.Command, args []string) error {
 		<-sigChan
 
 		if clientFingerprint != "" {
-			server.DeleteCertificate(clientFingerprint)
+			_ = server.DeleteCertificate(clientFingerprint)
 		}
 
 		cancel()
@@ -467,7 +468,7 @@ func (c *cmdMigrate) Run(cmd *cobra.Command, args []string) error {
 	}()
 
 	if clientFingerprint != "" {
-		defer server.DeleteCertificate(clientFingerprint)
+		defer func() { _ = server.DeleteCertificate(clientFingerprint) }()
 	}
 
 	config, err := c.RunInteractive(server)
@@ -501,15 +502,15 @@ func (c *cmdMigrate) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create the temporary directory to be used for the mounts
-	path, err := ioutil.TempDir("", "lxd-migrate_mount_")
+	path, err := os.MkdirTemp("", "lxd-migrate_mount_")
 	if err != nil {
 		return err
 	}
 
 	// Automatically clean-up the temporary path on exit
 	defer func(path string) {
-		unix.Unmount(path, unix.MNT_DETACH)
-		os.Remove(path)
+		_ = unix.Unmount(path, unix.MNT_DETACH)
+		_ = os.Remove(path)
 	}(path)
 
 	var fullPath string
@@ -532,7 +533,7 @@ func (c *cmdMigrate) Run(cmd *cobra.Command, args []string) error {
 		fullPath = path
 		target := filepath.Join(path, "root.img")
 
-		err := ioutil.WriteFile(target, nil, 0644)
+		err := os.WriteFile(target, nil, 0644)
 		if err != nil {
 			return fmt.Errorf("Failed to create %q: %w", target, err)
 		}
@@ -555,20 +556,21 @@ func (c *cmdMigrate) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
 	config.InstanceArgs.Architecture = architectureName
 
+	revert := revert.New()
+	defer revert.Fail()
+
 	// Create the instance
-	success := false
 	op, err := server.CreateInstance(config.InstanceArgs)
 	if err != nil {
 		return err
 	}
 
-	defer func() {
-		if !success {
-			server.DeleteInstance(config.InstanceArgs.Name)
-		}
-	}()
+	revert.Add(func() {
+		_, _ = server.DeleteInstance(config.InstanceArgs.Name)
+	})
 
 	progress := utils.ProgressRenderer{Format: "Transferring instance: %s"}
 	_, err = op.AddHandler(progress.UpdateOp)
@@ -583,7 +585,7 @@ func (c *cmdMigrate) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	progress.Done(fmt.Sprintf("Instance %s successfully created", config.InstanceArgs.Name))
-	success = true
+	revert.Success()
 
 	return nil
 }

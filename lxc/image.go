@@ -1,9 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -106,7 +106,7 @@ hash or alias name (if one is set).`))
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
@@ -123,7 +123,7 @@ func (c *cmdImage) dereferenceAlias(d lxd.ImageServer, imageType string, inName 
 	return result.Target
 }
 
-// Copy
+// Copy.
 type cmdImageCopy struct {
 	global *cmdGlobal
 	image  *cmdImage
@@ -135,6 +135,7 @@ type cmdImageCopy struct {
 	flagVM            bool
 	flagMode          string
 	flagTargetProject string
+	flagProfile       []string
 }
 
 func (c *cmdImageCopy) Command() *cobra.Command {
@@ -155,6 +156,7 @@ It requires the source to be an alias and for it to be public.`))
 	cmd.Flags().BoolVar(&c.flagVM, "vm", false, i18n.G("Copy virtual machine images"))
 	cmd.Flags().StringVar(&c.flagMode, "mode", "pull", i18n.G("Transfer mode. One of pull (default), push or relay")+"``")
 	cmd.Flags().StringVar(&c.flagTargetProject, "target-project", "", i18n.G("Copy to a project different from the source")+"``")
+	cmd.Flags().StringArrayVarP(&c.flagProfile, "profile", "p", nil, i18n.G("Profile to apply to the new image")+"``")
 	cmd.RunE = c.Run
 
 	return cmd
@@ -184,10 +186,10 @@ func (c *cmdImageCopy) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Revert project for `sourceServer` which may have been overriten
+	// Revert project for `sourceServer` which may have been overwritten
 	// by `--project` flag in `GetImageServer` method
 	remote := conf.Remotes[remoteName]
-	if remote.Protocol != "simplestream" && remote.Public == false {
+	if remote.Protocol != "simplestream" && !remote.Public {
 		d, ok := sourceServer.(lxd.InstanceServer)
 		if ok {
 			sourceServer = d.UseProject(remote.Project)
@@ -248,6 +250,7 @@ func (c *cmdImageCopy) Run(cmd *cobra.Command, args []string) error {
 		Public:     c.flagPublic,
 		Type:       imageType,
 		Mode:       c.flagMode,
+		Profiles:   c.flagProfile,
 	}
 
 	// Do the copy
@@ -296,7 +299,7 @@ func (c *cmdImageCopy) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Delete
+// Delete.
 type cmdImageDelete struct {
 	global *cmdGlobal
 	image  *cmdImage
@@ -348,7 +351,7 @@ func (c *cmdImageDelete) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Edit
+// Edit.
 type cmdImageEdit struct {
 	global *cmdGlobal
 	image  *cmdImage
@@ -409,7 +412,7 @@ func (c *cmdImageEdit) Run(cmd *cobra.Command, args []string) error {
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -463,15 +466,17 @@ func (c *cmdImageEdit) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			continue
 		}
+
 		break
 	}
 
 	return nil
 }
 
-// Export
+// Export.
 type cmdImageExport struct {
 	global *cmdGlobal
 	image  *cmdImage
@@ -539,13 +544,15 @@ func (c *cmdImageExport) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer dest.Close()
+
+	defer func() { _ = dest.Close() }()
 
 	destRootfs, err := os.Create(targetRootfs)
 	if err != nil {
 		return err
 	}
-	defer destRootfs.Close()
+
+	defer func() { _ = destRootfs.Close() }()
 
 	// Prepare the download request
 	progress := utils.ProgressRenderer{
@@ -562,8 +569,8 @@ func (c *cmdImageExport) Run(cmd *cobra.Command, args []string) error {
 	// Download the image
 	resp, err := remoteServer.GetImageFile(fingerprint, req)
 	if err != nil {
-		os.Remove(targetMeta)
-		os.Remove(targetRootfs)
+		_ = os.Remove(targetMeta)
+		_ = os.Remove(targetRootfs)
 		progress.Done("")
 		return err
 	}
@@ -585,8 +592,8 @@ func (c *cmdImageExport) Run(cmd *cobra.Command, args []string) error {
 	if resp.RootfsSize == 0 {
 		err := os.Remove(targetRootfs)
 		if err != nil {
-			os.Remove(targetMeta)
-			os.Remove(targetRootfs)
+			_ = os.Remove(targetMeta)
+			_ = os.Remove(targetRootfs)
 			progress.Done("")
 			return err
 		}
@@ -597,8 +604,8 @@ func (c *cmdImageExport) Run(cmd *cobra.Command, args []string) error {
 		if resp.MetaName != "" {
 			err := os.Rename(targetMeta, shared.HostPathFollow(filepath.Join(target, resp.MetaName)))
 			if err != nil {
-				os.Remove(targetMeta)
-				os.Remove(targetRootfs)
+				_ = os.Remove(targetMeta)
+				_ = os.Remove(targetRootfs)
 				progress.Done("")
 				return err
 			}
@@ -607,8 +614,8 @@ func (c *cmdImageExport) Run(cmd *cobra.Command, args []string) error {
 		if resp.RootfsSize > 0 && resp.RootfsName != "" {
 			err := os.Rename(targetRootfs, shared.HostPathFollow(filepath.Join(target, resp.RootfsName)))
 			if err != nil {
-				os.Remove(targetMeta)
-				os.Remove(targetRootfs)
+				_ = os.Remove(targetMeta)
+				_ = os.Remove(targetRootfs)
 				progress.Done("")
 				return err
 			}
@@ -618,7 +625,7 @@ func (c *cmdImageExport) Run(cmd *cobra.Command, args []string) error {
 			extension := strings.SplitN(resp.MetaName, ".", 2)[1]
 			err := os.Rename(targetMeta, fmt.Sprintf("%s.%s", targetMeta, extension))
 			if err != nil {
-				os.Remove(targetMeta)
+				_ = os.Remove(targetMeta)
 				progress.Done("")
 				return err
 			}
@@ -629,7 +636,7 @@ func (c *cmdImageExport) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Import
+// Import.
 type cmdImageImport struct {
 	global *cmdGlobal
 	image  *cmdImage
@@ -662,16 +669,20 @@ func (c *cmdImageImport) packImageDir(path string) (string, error) {
 		return "", fmt.Errorf(i18n.G("Must run as root to import from directory"))
 	}
 
-	outFile, err := ioutil.TempFile("", "lxd_image_")
+	outFile, err := os.CreateTemp("", "lxd_image_")
 	if err != nil {
 		return "", err
 	}
-	defer outFile.Close()
+
+	defer func() { _ = outFile.Close() }()
 
 	outFileName := outFile.Name()
-	shared.RunCommand("tar", "-C", path, "--numeric-owner", "--restrict", "--force-local", "--xattrs", "-cJf", outFileName, "rootfs", "templates", "metadata.yaml")
+	_, err = shared.RunCommand("tar", "-C", path, "--numeric-owner", "--restrict", "--force-local", "--xattrs", "-cJf", outFileName, "rootfs", "templates", "metadata.yaml")
+	if err != nil {
+		return "", err
+	}
 
-	return outFileName, nil
+	return outFileName, outFile.Close()
 }
 
 func (c *cmdImageImport) Run(cmd *cobra.Command, args []string) error {
@@ -777,14 +788,15 @@ func (c *cmdImageImport) Run(cmd *cobra.Command, args []string) error {
 				return err
 			}
 			// remove temp file
-			defer os.Remove(imageFile)
-
+			defer func() { _ = os.Remove(imageFile) }()
 		}
+
 		meta, err = os.Open(imageFile)
 		if err != nil {
 			return err
 		}
-		defer meta.Close()
+
+		defer func() { _ = meta.Close() }()
 
 		// Open rootfs
 		if rootfsFile != "" {
@@ -792,13 +804,18 @@ func (c *cmdImageImport) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
-			defer rootfs.Close()
+
+			defer func() { _ = rootfs.Close() }()
 
 			_, ext, _, err := shared.DetectCompressionFile(rootfs)
 			if err != nil {
 				return err
 			}
-			rootfs.(*os.File).Seek(0, 0)
+
+			_, err = rootfs.(*os.File).Seek(0, 0)
+			if err != nil {
+				return err
+			}
 
 			if ext == ".qcow2" {
 				imageType = "virtual-machine"
@@ -813,6 +830,7 @@ func (c *cmdImageImport) Run(cmd *cobra.Command, args []string) error {
 			ProgressHandler: progress.UpdateProgress,
 			Type:            imageType,
 		}
+
 		image.Filename = createArgs.MetaName
 	}
 
@@ -829,6 +847,7 @@ func (c *cmdImageImport) Run(cmd *cobra.Command, args []string) error {
 		progress.Done("")
 		return err
 	}
+
 	opAPI := op.Get()
 
 	// Get the fingerprint
@@ -851,7 +870,7 @@ func (c *cmdImageImport) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Info
+// Info.
 type cmdImageInfo struct {
 	global *cmdGlobal
 	image  *cmdImage
@@ -984,7 +1003,7 @@ func (c *cmdImageInfo) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// List
+// List.
 type cmdImageList struct {
 	global *cmdGlobal
 	image  *cmdImage
@@ -1053,7 +1072,8 @@ func (c *cmdImageList) parseColumns() ([]imageColumn, error) {
 		}
 
 		for _, columnRune := range columnEntry {
-			if column, ok := columnsShorthandMap[columnRune]; ok {
+			column, ok := columnsShorthandMap[columnRune]
+			if ok {
 				columns = append(columns, column)
 			} else {
 				return nil, fmt.Errorf(i18n.G("Unknown column shorthand char '%c' in '%s'"), columnRune, columnEntry)
@@ -1078,6 +1098,7 @@ func (c *cmdImageList) aliasesColumnData(image api.Image) string {
 	for _, alias := range image.Aliases {
 		aliases = append(aliases, alias.Name)
 	}
+
 	sort.Strings(aliases)
 	return strings.Join(aliases, "\n")
 }
@@ -1094,6 +1115,7 @@ func (c *cmdImageList) publicColumnData(image api.Image) string {
 	if image.Public {
 		return i18n.G("yes")
 	}
+
 	return i18n.G("no")
 }
 
@@ -1128,6 +1150,7 @@ func (c *cmdImageList) shortestAlias(list []api.ImageAlias) string {
 			shortest = l.Name
 			continue
 		}
+
 		if len(l.Name) != 0 && len(l.Name) < len(shortest) {
 			shortest = l.Name
 		}
@@ -1149,6 +1172,8 @@ func (c *cmdImageList) imageShouldShow(filters []string, state *api.Image) bool 
 	if len(filters) == 0 {
 		return true
 	}
+
+	m := structToMap(state)
 
 	for _, filter := range filters {
 		found := false
@@ -1172,6 +1197,7 @@ func (c *cmdImageList) imageShouldShow(filters []string, state *api.Image) bool 
 					if !(strings.Contains(value, "^") || strings.Contains(value, "$")) {
 						regexpValue = "^" + regexpValue + "$"
 					}
+
 					r, err := regexp.Compile(regexpValue)
 					//if not regexp compatible use original value
 					if err != nil {
@@ -1184,6 +1210,11 @@ func (c *cmdImageList) imageShouldShow(filters []string, state *api.Image) bool 
 						break
 					}
 				}
+			}
+
+			val, ok := m[key]
+			if ok && fmt.Sprintf("%v", val) == value {
+				found = true
 			}
 		} else {
 			for _, alias := range state.Aliases {
@@ -1244,14 +1275,21 @@ func (c *cmdImageList) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	serverFilters, clientFilters := getServerSupportedFilters(filters, api.Image{})
+
 	var images []api.Image
-	allImages, err := remoteServer.GetImages()
+	allImages, err := remoteServer.GetImagesWithFilter(serverFilters)
 	if err != nil {
-		return err
+		allImages, err = remoteServer.GetImages()
+		if err != nil {
+			return err
+		}
+
+		clientFilters = filters
 	}
 
 	for _, image := range allImages {
-		if !c.imageShouldShow(filters, &image) {
+		if !c.imageShouldShow(clientFilters, &image) {
 			continue
 		}
 
@@ -1261,7 +1299,7 @@ func (c *cmdImageList) Run(cmd *cobra.Command, args []string) error {
 	// Render the table
 	data := [][]string{}
 	for _, image := range images {
-		if !c.imageShouldShow(filters, &image) {
+		if !c.imageShouldShow(clientFilters, &image) {
 			continue
 		}
 
@@ -1269,8 +1307,10 @@ func (c *cmdImageList) Run(cmd *cobra.Command, args []string) error {
 		for _, column := range columns {
 			row = append(row, column.Data(image))
 		}
+
 		data = append(data, row)
 	}
+
 	sort.Sort(utils.StringList(data))
 
 	rawData := make([]*api.Image, len(images))
@@ -1286,7 +1326,7 @@ func (c *cmdImageList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, headers, data, rawData)
 }
 
-// Refresh
+// Refresh.
 type cmdImageRefresh struct {
 	global *cmdGlobal
 	image  *cmdImage
@@ -1344,6 +1384,7 @@ func (c *cmdImageRefresh) Run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+
 		opAPI := op.Get()
 
 		// Check if refreshed
@@ -1363,7 +1404,7 @@ func (c *cmdImageRefresh) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Show
+// Show.
 type cmdImageShow struct {
 	global *cmdGlobal
 	image  *cmdImage
@@ -1559,4 +1600,20 @@ func (c *cmdImageUnsetProp) Run(cmd *cobra.Command, args []string) error {
 
 	args = append(args, "")
 	return c.imageSetProp.Run(cmd, args)
+}
+
+func structToMap(data any) map[string]any {
+	dataBytes, err := json.Marshal(data)
+	if err != nil {
+		return nil
+	}
+
+	mapData := make(map[string]any)
+
+	err = json.Unmarshal(dataBytes, &mapData)
+	if err != nil {
+		return nil
+	}
+
+	return mapData
 }

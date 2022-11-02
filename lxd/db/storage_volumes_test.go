@@ -1,14 +1,15 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db_test
 
 import (
+	"context"
 	"testing"
 
-	"github.com/lxc/lxd/lxd/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lxc/lxd/lxd/db"
 )
 
 // Addresses of all nodes with matching volume name are returned.
@@ -16,7 +17,7 @@ func TestGetStorageVolumeNodes(t *testing.T) {
 	tx, cleanup := db.NewTestClusterTx(t)
 	defer cleanup()
 
-	nodeID1 := int64(1) // This is the default local node
+	nodeID1 := int64(1) // This is the default local member
 
 	nodeID2, err := tx.CreateNode("node2", "1.2.3.4:666")
 	require.NoError(t, err)
@@ -30,7 +31,7 @@ func TestGetStorageVolumeNodes(t *testing.T) {
 	addVolume(t, tx, poolID, nodeID3, "volume2")
 	addVolume(t, tx, poolID, nodeID2, "volume2")
 
-	nodes, err := tx.GetStorageVolumeNodes(poolID, "default", "volume1", 1)
+	nodes, err := tx.GetStorageVolumeNodes(context.Background(), poolID, "default", "volume1", 1)
 	require.NoError(t, err)
 
 	assert.Equal(t, []db.NodeInfo{

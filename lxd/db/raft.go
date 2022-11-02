@@ -1,13 +1,16 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/canonical/go-dqlite/client"
+
 	"github.com/lxc/lxd/lxd/db/query"
+	"github.com/lxc/lxd/shared/api"
 )
 
 // RaftNode holds information about a single node in the dqlite raft cluster.
@@ -30,44 +33,49 @@ const (
 )
 
 // GetRaftNodes returns information about all LXD nodes that are members of the
-// dqlite Raft cluster (possibly including the local node). If this LXD
+// dqlite Raft cluster (possibly including the local member). If this LXD
 // instance is not running in clustered mode, an empty list is returned.
-func (n *NodeTx) GetRaftNodes() ([]RaftNode, error) {
+func (n *NodeTx) GetRaftNodes(ctx context.Context) ([]RaftNode, error) {
 	nodes := []RaftNode{}
-	dest := func(i int) []interface{} {
-		nodes = append(nodes, RaftNode{})
-		return []interface{}{&nodes[i].ID, &nodes[i].Address, &nodes[i].Role, &nodes[i].Name}
-	}
-	stmt, err := n.tx.Prepare("SELECT id, address, role, name FROM raft_nodes ORDER BY id")
-	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	err = query.SelectObjects(stmt, dest)
+
+	sql := "SELECT id, address, role, name FROM raft_nodes ORDER BY id"
+	err := query.Scan(ctx, n.tx, sql, func(scan func(dest ...any) error) error {
+		node := RaftNode{}
+		err := scan(&node.ID, &node.Address, &node.Role, &node.Name)
+		if err != nil {
+			return err
+		}
+
+		nodes = append(nodes, node)
+
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("Failed to fetch raft nodes: %w", err)
 	}
+
 	return nodes, nil
 }
 
 // GetRaftNodeAddresses returns the addresses of all LXD nodes that are members of
-// the dqlite Raft cluster (possibly including the local node). If this LXD
+// the dqlite Raft cluster (possibly including the local member). If this LXD
 // instance is not running in clustered mode, an empty list is returned.
-func (n *NodeTx) GetRaftNodeAddresses() ([]string, error) {
-	return query.SelectStrings(n.tx, "SELECT address FROM raft_nodes")
+func (n *NodeTx) GetRaftNodeAddresses(ctx context.Context) ([]string, error) {
+	return query.SelectStrings(ctx, n.tx, "SELECT address FROM raft_nodes")
 }
 
 // GetRaftNodeAddress returns the address of the LXD raft node with the given ID,
 // if any matching row exists.
-func (n *NodeTx) GetRaftNodeAddress(id int64) (string, error) {
+func (n *NodeTx) GetRaftNodeAddress(ctx context.Context, id int64) (string, error) {
 	stmt := "SELECT address FROM raft_nodes WHERE id=?"
-	addresses, err := query.SelectStrings(n.tx, stmt, id)
+	addresses, err := query.SelectStrings(ctx, n.tx, stmt, id)
 	if err != nil {
 		return "", err
 	}
+
 	switch len(addresses) {
 	case 0:
-		return "", ErrNoSuchObject
+		return "", api.StatusErrorf(http.StatusNotFound, "Raft member not found")
 	case 1:
 		return addresses[0], nil
 	default:
@@ -84,14 +92,16 @@ func (n *NodeTx) GetRaftNodeAddress(id int64) (string, error) {
 // and it will replace whatever existing row has ID 1.
 func (n *NodeTx) CreateFirstRaftNode(address string, name string) error {
 	columns := []string{"id", "address", "name"}
-	values := []interface{}{int64(1), address, name}
+	values := []any{int64(1), address, name}
 	id, err := query.UpsertObject(n.tx, "raft_nodes", columns, values)
 	if err != nil {
 		return err
 	}
+
 	if id != 1 {
 		return fmt.Errorf("could not set raft node ID to 1")
 	}
+
 	return nil
 }
 
@@ -99,7 +109,7 @@ func (n *NodeTx) CreateFirstRaftNode(address string, name string) error {
 // dqlite Raft cluster. It returns the ID of the newly inserted row.
 func (n *NodeTx) CreateRaftNode(address string, name string) (int64, error) {
 	columns := []string{"address", "name"}
-	values := []interface{}{address, name}
+	values := []any{address, name}
 	return query.UpsertObject(n.tx, "raft_nodes", columns, values)
 }
 
@@ -110,9 +120,11 @@ func (n *NodeTx) RemoveRaftNode(id int64) error {
 	if err != nil {
 		return err
 	}
+
 	if !deleted {
-		return ErrNoSuchObject
+		return api.StatusErrorf(http.StatusNotFound, "Raft member not found")
 	}
+
 	return nil
 }
 
@@ -125,7 +137,7 @@ func (n *NodeTx) ReplaceRaftNodes(nodes []RaftNode) error {
 
 	columns := []string{"id", "address", "role", "name"}
 	for _, node := range nodes {
-		values := []interface{}{node.ID, node.Address, node.Role, node.Name}
+		values := []any{node.ID, node.Address, node.Role, node.Name}
 		_, err := query.UpsertObject(n.tx, "raft_nodes", columns, values)
 		if err != nil {
 			return err

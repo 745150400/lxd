@@ -79,6 +79,7 @@ _have lxc && {
       core.https_allowed_origin candid.api.url candid.api.key candid.expiry \
       candid.domains cluster.https_address \
       core.metrics_address core.metrics_authentication \
+      core.storage_buckets_address \
       core.proxy_https core.proxy_http core.proxy_ignore_hosts \
       core.trust_password core.bgp_address core.bgp_asn core.bgp_routerid \
       core.debug_address cluster.offline_threshold \
@@ -101,7 +102,7 @@ _have lxc && {
       migration.incremental.memory.goal nvidia.runtime \
       nvidia.driver.capabilities nvidia.require.cuda nvidia.require.driver \
       migration.incremental.memory.iterations raw.apparmor raw.idmap raw.qemu \
-      raw.lxc raw.seccomp security.idmap.base security.idmap.isolated \
+      raw.qemu.conf raw.lxc raw.seccomp security.idmap.base security.idmap.isolated \
       security.idmap.size security.devlxd security.devlxd.images \
       security.nesting security.privileged security.protection.delete \
       security.protection.shift security.secureboot \
@@ -112,7 +113,9 @@ _have lxc && {
       security.syscalls.intercept.mknod security.syscalls.intercept.mount \
       security.syscalls.intercept.mount.allowed \
       security.syscalls.intercept.mount.fuse \
+      security.syscalls.intercept.sched_setscheduler \
       security.syscalls.intercept.setxattr \
+      security.syscalls.intercept.sysinfo \
       security.syscalls.intercept.mount.shift \
       snapshots.schedule snapshots.schedule.stopped snapshots.pattern \
       snapshots.expiry \
@@ -149,9 +152,9 @@ _have lxc && {
       restricted.devices.pci restricted.devices.proxy"
 
     storage_pool_keys="source size btrfs.mount_options ceph.cluster_name \
-      ceph.osd.force_reuse ceph.osd.pg_num ceph.osd.pool_name ceph.osd.data_pool_name \
+      ceph.osd.pg_num ceph.osd.pool_name ceph.osd.data_pool_name \
       ceph.rbd.clone_copy ceph.rbd.du ceph.rbd.features ceph.user.name cephfs.cluster_name cephfs.path \
-      cephfs.vg_name lvm.thinpool_name lvm.use_thinpool \
+      cephfs.fscache cephfs.vg_name lvm.thinpool_name lvm.thinpool_metadata_size lvm.use_thinpool \
       lvm.vg_name rsync.bwlimit volatile.initial_source \
       volatile.pool.pristine volume.block.filesystem \
       volume.block.mount_options volume.size volume.zfs.remove_snapshots \
@@ -257,11 +260,11 @@ _have lxc && {
       "network")
         case $pos in
           2)
-            COMPREPLY=( $(compgen -W "list show create get set unset delete edit rename attach attach-profile detach detach-profile info" -- $cur) )
+            COMPREPLY=( $(compgen -W "list show create get set unset delete edit rename attach attach-profile detach detach-profile info acl forward list-leases load-balancer peer zone" -- $cur) )
             ;;
           3)
             case ${no_dashargs[2]} in
-              "show"|"get"|"set"|"unset"|"delete"|"edit"|"rename"|"attach"|"attach-profile"|"detach"|"detach-profile"|"info")
+              "show"|"get"|"set"|"unset"|"delete"|"edit"|"rename"|"attach"|"attach-profile"|"detach"|"detach-profile"|"info"|"acl"|"forward"|"list-leases"|"load-balancer"|"peer"|"zone")
                 _lxd_networks
                 ;;
             esac

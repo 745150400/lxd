@@ -1,14 +1,16 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
+	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/shared/api"
 )
 
@@ -21,8 +23,8 @@ func (c *Cluster) GetNetworkZones(project string) ([]string, error) {
 
 	var zoneNames []string
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 			var zoneName string
 
 			err := scan(&zoneName)
@@ -51,8 +53,8 @@ func (c *Cluster) GetNetworkZoneKeys() (map[string]string, error) {
 	`
 
 	secrets := map[string]string{}
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 			var name string
 			var peer string
 			var secret string
@@ -94,8 +96,8 @@ func (c *Cluster) GetNetworksForZone(projectName string, zoneName string) ([]str
 
 	var networkNames []string
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 			var networkName string
 
 			err := scan(&networkName)
@@ -124,7 +126,7 @@ func (c *Cluster) GetNetworkZone(name string) (int64, string, *api.NetworkZone, 
 	}
 
 	q := `
-		SELECT networks_zones.id, projects.Name, networks_zones.description
+		SELECT networks_zones.id, projects.name, networks_zones.description
 		FROM networks_zones
 		JOIN projects ON projects.id=networks_zones.project_id
 		WHERE networks_zones.name=?
@@ -132,13 +134,13 @@ func (c *Cluster) GetNetworkZone(name string) (int64, string, *api.NetworkZone, 
 	`
 
 	var projectName string
-	err := c.Transaction(func(tx *ClusterTx) error {
-		err := tx.tx.QueryRow(q, name).Scan(&id, &projectName, &zone.Description)
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		err := tx.tx.QueryRowContext(ctx, q, name).Scan(&id, &projectName, &zone.Description)
 		if err != nil {
 			return err
 		}
 
-		err = networkZoneConfig(tx, id, &zone)
+		err = networkZoneConfig(ctx, tx, id, &zone)
 		if err != nil {
 			return fmt.Errorf("Failed loading config: %w", err)
 		}
@@ -147,7 +149,7 @@ func (c *Cluster) GetNetworkZone(name string) (int64, string, *api.NetworkZone, 
 	})
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return -1, "", nil, ErrNoSuchObject
+			return -1, "", nil, api.StatusErrorf(http.StatusNotFound, "Network zone not found")
 		}
 
 		return -1, "", nil, err
@@ -171,13 +173,13 @@ func (c *Cluster) GetNetworkZoneByProject(projectName string, name string) (int6
 		LIMIT 1
 	`
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		err := tx.tx.QueryRow(q, projectName, name).Scan(&id, &zone.Description)
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		err := tx.tx.QueryRowContext(ctx, q, projectName, name).Scan(&id, &zone.Description)
 		if err != nil {
 			return err
 		}
 
-		err = networkZoneConfig(tx, id, &zone)
+		err = networkZoneConfig(ctx, tx, id, &zone)
 		if err != nil {
 			return fmt.Errorf("Failed loading config: %w", err)
 		}
@@ -186,7 +188,7 @@ func (c *Cluster) GetNetworkZoneByProject(projectName string, name string) (int6
 	})
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return -1, nil, ErrNoSuchObject
+			return -1, nil, api.StatusErrorf(http.StatusNotFound, "Network zone not found")
 		}
 
 		return -1, nil, err
@@ -196,7 +198,7 @@ func (c *Cluster) GetNetworkZoneByProject(projectName string, name string) (int6
 }
 
 // networkZoneConfig populates the config map of the Network zone with the given ID.
-func networkZoneConfig(tx *ClusterTx, id int64, zone *api.NetworkZone) error {
+func networkZoneConfig(ctx context.Context, tx *ClusterTx, id int64, zone *api.NetworkZone) error {
 	q := `
 		SELECT key, value
 		FROM networks_zones_config
@@ -204,7 +206,7 @@ func networkZoneConfig(tx *ClusterTx, id int64, zone *api.NetworkZone) error {
 	`
 
 	zone.Config = make(map[string]string)
-	return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 		var key, value string
 
 		err := scan(&key, &value)
@@ -226,9 +228,8 @@ func networkZoneConfig(tx *ClusterTx, id int64, zone *api.NetworkZone) error {
 // CreateNetworkZone creates a new Network zone.
 func (c *Cluster) CreateNetworkZone(projectName string, info *api.NetworkZonesPost) (int64, error) {
 	var id int64
-	var err error
 
-	err = c.Transaction(func(tx *ClusterTx) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Insert a new Network zone record.
 		result, err := tx.tx.Exec(`
 			INSERT INTO networks_zones (project_id, name, description)
@@ -264,7 +265,8 @@ func networkzoneConfigAdd(tx *sql.Tx, id int64, config map[string]string) error 
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+
+	defer func() { _ = stmt.Close() }()
 
 	for k, v := range config {
 		if v == "" {
@@ -282,7 +284,7 @@ func networkzoneConfigAdd(tx *sql.Tx, id int64, config map[string]string) error 
 
 // UpdateNetworkZone updates the Network zone with the given ID.
 func (c *Cluster) UpdateNetworkZone(id int64, config *api.NetworkZonePut) error {
-	return c.Transaction(func(tx *ClusterTx) error {
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		_, err := tx.tx.Exec(`
 			UPDATE networks_zones
 			SET description=?
@@ -308,7 +310,7 @@ func (c *Cluster) UpdateNetworkZone(id int64, config *api.NetworkZonePut) error 
 
 // DeleteNetworkZone deletes the Network zone.
 func (c *Cluster) DeleteNetworkZone(id int64) error {
-	return c.Transaction(func(tx *ClusterTx) error {
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		_, err := tx.tx.Exec("DELETE FROM networks_zones WHERE id=?", id)
 		return err
 	})
@@ -322,8 +324,8 @@ func (c *Cluster) GetNetworkZoneRecordNames(zone int64) ([]string, error) {
 	`
 
 	var recordNames []string
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 			var recordName string
 
 			err := scan(&recordName)
@@ -359,13 +361,13 @@ func (c *Cluster) GetNetworkZoneRecord(zone int64, name string) (int64, *api.Net
 	`
 
 	var entries string
-	err := c.Transaction(func(tx *ClusterTx) error {
-		err := tx.tx.QueryRow(q, zone, name).Scan(&id, &record.Description, &entries)
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		err := tx.tx.QueryRowContext(ctx, q, zone, name).Scan(&id, &record.Description, &entries)
 		if err != nil {
 			return err
 		}
 
-		err = networkZoneRecordConfig(tx, id, &record)
+		err = networkZoneRecordConfig(ctx, tx, id, &record)
 		if err != nil {
 			return fmt.Errorf("Failed loading config: %w", err)
 		}
@@ -374,7 +376,7 @@ func (c *Cluster) GetNetworkZoneRecord(zone int64, name string) (int64, *api.Net
 	})
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return -1, nil, ErrNoSuchObject
+			return -1, nil, api.StatusErrorf(http.StatusNotFound, "Network zone record not found")
 		}
 
 		return -1, nil, err
@@ -390,7 +392,7 @@ func (c *Cluster) GetNetworkZoneRecord(zone int64, name string) (int64, *api.Net
 }
 
 // networkZoneRecordConfig populates the config map of the network zone record with the given ID.
-func networkZoneRecordConfig(tx *ClusterTx, id int64, record *api.NetworkZoneRecord) error {
+func networkZoneRecordConfig(ctx context.Context, tx *ClusterTx, id int64, record *api.NetworkZoneRecord) error {
 	q := `
 		SELECT key, value
 		FROM networks_zones_records_config
@@ -398,7 +400,7 @@ func networkZoneRecordConfig(tx *ClusterTx, id int64, record *api.NetworkZoneRec
 	`
 
 	record.Config = make(map[string]string)
-	return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 		var key, value string
 
 		err := scan(&key, &value)
@@ -428,7 +430,7 @@ func (c *Cluster) CreateNetworkZoneRecord(zone int64, info api.NetworkZoneRecord
 		return -1, err
 	}
 
-	err = c.Transaction(func(tx *ClusterTx) error {
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Insert a new network zone record.
 		result, err := tx.tx.Exec(`
 			INSERT INTO networks_zones_records (network_zone_id, name, description, entries)
@@ -464,7 +466,8 @@ func networkZoneRecordConfigAdd(tx *sql.Tx, id int64, config map[string]string) 
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+
+	defer func() { _ = stmt.Close() }()
 
 	for k, v := range config {
 		if v == "" {
@@ -488,7 +491,7 @@ func (c *Cluster) UpdateNetworkZoneRecord(id int64, config api.NetworkZoneRecord
 		return err
 	}
 
-	return c.Transaction(func(tx *ClusterTx) error {
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		_, err := tx.tx.Exec(`
 			UPDATE networks_zones_records
 			SET description=?, entries=?
@@ -514,7 +517,7 @@ func (c *Cluster) UpdateNetworkZoneRecord(id int64, config api.NetworkZoneRecord
 
 // DeleteNetworkZoneRecord deletes the network zone record.
 func (c *Cluster) DeleteNetworkZoneRecord(id int64) error {
-	return c.Transaction(func(tx *ClusterTx) error {
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		_, err := tx.tx.Exec("DELETE FROM networks_zones_records WHERE id=?", id)
 		return err
 	})

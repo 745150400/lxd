@@ -3,9 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"gopkg.in/inconshreveable/log15.v2"
 	"gopkg.in/yaml.v2"
 
 	"github.com/lxc/lxd/client"
@@ -13,7 +14,6 @@ import (
 	"github.com/lxc/lxd/shared/api"
 	cli "github.com/lxc/lxd/shared/cmd"
 	"github.com/lxc/lxd/shared/i18n"
-	"github.com/lxc/lxd/shared/logging"
 )
 
 type cmdMonitor struct {
@@ -49,7 +49,7 @@ lxc monitor --type=lifecycle
 	cmd.Flags().BoolVar(&c.flagPretty, "pretty", false, i18n.G("Pretty rendering (short for --format=pretty)"))
 	cmd.Flags().BoolVar(&c.flagAllProjects, "all-projects", false, i18n.G("Show events from all projects"))
 	cmd.Flags().StringArrayVar(&c.flagType, "type", nil, i18n.G("Event type to listen for")+"``")
-	cmd.Flags().StringVar(&c.flagLogLevel, "loglevel", "", i18n.G("Minimum level for log messages")+"``")
+	cmd.Flags().StringVar(&c.flagLogLevel, "loglevel", "", i18n.G("Minimum level for log messages (only available when using pretty format)")+"``")
 	cmd.Flags().StringVarP(&c.flagFormat, "format", "f", "yaml", i18n.G("Format (json|pretty|yaml)")+"``")
 
 	return cmd
@@ -76,6 +76,10 @@ func (c *cmdMonitor) Run(cmd *cobra.Command, args []string) error {
 		c.flagFormat = "pretty"
 	}
 
+	if c.flagFormat != "pretty" && c.flagLogLevel != "" {
+		return fmt.Errorf(i18n.G("Log level filtering can only be used with pretty formatting"))
+	}
+
 	// Connect to the event source.
 	if len(args) == 0 {
 		remote, _, err = conf.ParseRemote("")
@@ -100,13 +104,14 @@ func (c *cmdMonitor) Run(cmd *cobra.Command, args []string) error {
 	} else {
 		listener, err = d.GetEvents()
 	}
+
 	if err != nil {
 		return err
 	}
 
-	logLvl := log15.LvlDebug
+	logLevel := logrus.DebugLevel
 	if c.flagLogLevel != "" {
-		logLvl, err = log15.LvlFromString(c.flagLogLevel)
+		logLevel, err = logrus.ParseLevel(c.flagLogLevel)
 		if err != nil {
 			return err
 		}
@@ -116,31 +121,48 @@ func (c *cmdMonitor) Run(cmd *cobra.Command, args []string) error {
 
 	handler := func(event api.Event) {
 		if c.flagFormat == "pretty" {
-			format := logging.TerminalFormat()
+			// Parse the event.
 			record, err := event.ToLogging()
 			if err != nil {
 				chError <- err
 				return
 			}
 
-			lvl, err := log15.LvlFromString(record.Lvl)
+			if record.Lvl == "dbug" {
+				record.Lvl = "debug"
+			}
+
+			// Get the log level.
+			msgLevel, err := logrus.ParseLevel(record.Lvl)
 			if err != nil {
 				chError <- err
 				return
 			}
 
-			log15Record := log15.Record{
-				Time: record.Time,
-				Lvl:  lvl,
-				Msg:  record.Msg,
-				Ctx:  record.Ctx,
-			}
-			// Check log level for logging type
-			// `lifecycle` type have fixed `info` log level
-			if event.Type == "logging" && (log15Record.Lvl > logLvl) {
+			// Check log level.
+			if msgLevel > logLevel {
 				return
 			}
-			fmt.Printf("%s", format.Format(&log15Record))
+
+			// Setup logrus.
+			logger := &logrus.Logger{
+				Out: os.Stdout,
+			}
+
+			entry := &logrus.Entry{Logger: logger}
+			entry.Data = c.unpackCtx(record.Ctx)
+			entry.Message = record.Msg
+			entry.Time = record.Time
+			entry.Level = msgLevel
+			format := logrus.TextFormatter{FullTimestamp: true, PadLevelText: true}
+
+			line, err := format.Format(entry)
+			if err != nil {
+				chError <- err
+				return
+			}
+
+			fmt.Print(string(line))
 			return
 		}
 
@@ -152,7 +174,7 @@ func (c *cmdMonitor) Run(cmd *cobra.Command, args []string) error {
 		}
 
 		// Read back to a clean interface
-		var rawEvent interface{}
+		var rawEvent any
 		err = json.Unmarshal(jsonRender, &rawEvent)
 		if err != nil {
 			chError <- err
@@ -188,4 +210,20 @@ func (c *cmdMonitor) Run(cmd *cobra.Command, args []string) error {
 	}()
 
 	return <-chError
+}
+
+func (c *cmdMonitor) unpackCtx(ctx []any) logrus.Fields {
+	out := logrus.Fields{}
+
+	var key string
+	for _, entry := range ctx {
+		if key == "" {
+			key = fmt.Sprintf("%v", entry)
+		} else {
+			out[key] = fmt.Sprintf("%v", entry)
+			key = ""
+		}
+	}
+
+	return out
 }

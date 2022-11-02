@@ -2,14 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/gorilla/mux"
 
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	projecthelpers "github.com/lxc/lxd/lxd/project"
@@ -60,44 +63,54 @@ func instancePatch(d *Daemon, r *http.Request) response.Response {
 	projectName := projectParam(r)
 
 	// Get the container
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to a container on a different node
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
 
 	c, err := instance.LoadByProjectAndName(d.State(), projectName, name)
 	if err != nil {
-		return response.NotFound(err)
+		return response.SmartError(err)
 	}
 
 	// Validate the ETag
-	etag := []interface{}{c.Architecture(), c.LocalConfig(), c.LocalDevices(), c.IsEphemeral(), c.Profiles()}
+	etag := []any{c.Architecture(), c.LocalConfig(), c.LocalDevices(), c.IsEphemeral(), c.Profiles()}
 	err = util.EtagCheck(r, etag)
 	if err != nil {
 		return response.PreconditionFailed(err)
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	rdr1 := ioutil.NopCloser(bytes.NewBuffer(body))
-	rdr2 := ioutil.NopCloser(bytes.NewBuffer(body))
+	rdr1 := io.NopCloser(bytes.NewBuffer(body))
+	rdr2 := io.NopCloser(bytes.NewBuffer(body))
 
 	reqRaw := shared.Jmap{}
-	if err := json.NewDecoder(rdr1).Decode(&reqRaw); err != nil {
+	err = json.NewDecoder(rdr1).Decode(&reqRaw)
+	if err != nil {
 		return response.BadRequest(err)
 	}
 
 	req := api.InstancePut{}
-	if err := json.NewDecoder(rdr2).Decode(&req); err != nil {
+	err = json.NewDecoder(rdr2).Decode(&req)
+	if err != nil {
 		return response.BadRequest(err)
 	}
 
@@ -123,9 +136,14 @@ func instancePatch(d *Daemon, r *http.Request) response.Response {
 		req.Ephemeral = c.IsEphemeral()
 	}
 
+	profileNames := make([]string, 0, len(c.Profiles()))
+	for _, profile := range c.Profiles() {
+		profileNames = append(profileNames, profile.Name)
+	}
+
 	// Check if profiles was passed
 	if req.Profiles == nil {
-		req.Profiles = c.Profiles()
+		req.Profiles = profileNames
 	}
 
 	// Check if config was passed
@@ -153,7 +171,22 @@ func instancePatch(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Check project limits.
-	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+	apiProfiles := make([]api.Profile, 0, len(req.Profiles))
+	err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		profiles, err := cluster.GetProfilesIfEnabled(ctx, tx.Tx(), projectName, req.Profiles)
+		if err != nil {
+			return err
+		}
+
+		for _, profile := range profiles {
+			apiProfile, err := profile.ToAPI(ctx, tx.Tx())
+			if err != nil {
+				return err
+			}
+
+			apiProfiles = append(apiProfiles, *apiProfile)
+		}
+
 		return projecthelpers.AllowInstanceUpdate(tx, projectName, name, req, c.LocalConfig())
 	})
 	if err != nil {
@@ -167,7 +200,7 @@ func instancePatch(d *Daemon, r *http.Request) response.Response {
 		Description:  req.Description,
 		Devices:      deviceConfig.NewDevices(req.Devices),
 		Ephemeral:    req.Ephemeral,
-		Profiles:     req.Profiles,
+		Profiles:     apiProfiles,
 		Project:      projectName,
 	}
 

@@ -15,7 +15,7 @@ import (
 	"github.com/lxc/lxd/shared/i18n"
 )
 
-// Start
+// Start.
 type cmdStart struct {
 	global *cmdGlobal
 	action *cmdAction
@@ -34,7 +34,7 @@ func (c *cmdStart) Command() *cobra.Command {
 	return cmd
 }
 
-// Pause
+// Pause.
 type cmdPause struct {
 	global *cmdGlobal
 	action *cmdAction
@@ -54,7 +54,7 @@ func (c *cmdPause) Command() *cobra.Command {
 	return cmd
 }
 
-// Restart
+// Restart.
 type cmdRestart struct {
 	global *cmdGlobal
 	action *cmdAction
@@ -75,7 +75,7 @@ The opposite of "lxc pause" is "lxc start".`))
 	return cmd
 }
 
-// Stop
+// Stop.
 type cmdStop struct {
 	global *cmdGlobal
 	action *cmdAction
@@ -260,6 +260,7 @@ func (c *cmdAction) doAction(action string, conf *config.Config, nameArg string)
 	progress := utils.ProgressRenderer{
 		Quiet: c.global.flagQuiet,
 	}
+
 	_, err = op.AddHandler(progress.UpdateOp)
 	if err != nil {
 		progress.Done("")
@@ -329,6 +330,7 @@ func (c *cmdAction) Run(cmd *cobra.Command, args []string) error {
 					if ct.StatusCode == api.Running {
 						continue
 					}
+
 				case "stop":
 					if ct.StatusCode == api.Stopped {
 						continue
@@ -341,7 +343,7 @@ func (c *cmdAction) Run(cmd *cobra.Command, args []string) error {
 		names = args
 
 		if len(args) == 0 {
-			cmd.Usage()
+			_ = cmd.Usage()
 			return nil
 		}
 	}

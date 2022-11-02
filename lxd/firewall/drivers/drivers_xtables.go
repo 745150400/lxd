@@ -13,7 +13,6 @@ import (
 
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/revert"
-	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
 )
@@ -31,7 +30,7 @@ const iptablesCommentPrefix = "generated for"
 // As its own locking mechanism isn't always available.
 var ebtablesMu sync.Mutex
 
-// Xtables is an implmentation of LXD firewall using {ip, ip6, eb}tables
+// Xtables is an implmentation of LXD firewall using {ip, ip6, eb}tables.
 type Xtables struct{}
 
 // String returns the driver name.
@@ -101,11 +100,13 @@ func (d Xtables) iptablesInUse(iptablesCmd string) bool {
 		if err != nil {
 			return false
 		}
+
 		err = cmd.Start()
 		if err != nil {
 			return false
 		}
-		defer cmd.Wait()
+
+		defer func() { _ = cmd.Wait() }()
 
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
@@ -113,7 +114,7 @@ func (d Xtables) iptablesInUse(iptablesCmd string) bool {
 
 			// Check for lines that indicate a rule being used.
 			if strings.HasPrefix(line, "-A") || strings.HasPrefix(line, "-R") || strings.HasPrefix(line, "-I") {
-				cmd.Process.Kill()
+				_ = cmd.Process.Kill()
 				return true
 			}
 		}
@@ -140,11 +141,13 @@ func (d Xtables) ebtablesInUse() bool {
 	if err != nil {
 		return false
 	}
+
 	err = cmd.Start()
 	if err != nil {
 		return false
 	}
-	defer cmd.Wait()
+
+	defer func() { _ = cmd.Wait() }()
 
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
@@ -365,7 +368,6 @@ func (d Xtables) networkSetupOutboundNAT(networkName string, subnet *net.IPNet, 
 		if err != nil {
 			return err
 		}
-
 	} else {
 		err := d.iptablesPrepend(family, comment, "nat", "POSTROUTING", args...)
 		if err != nil {
@@ -543,13 +545,13 @@ func (d Xtables) NetworkApplyACLRules(networkName string, rules []ACLRule) error
 
 	applyACLRules := func(cmd string, iptRules [][]string) error {
 		// Attempt to flush chain in table.
-		_, err := shared.RunCommand(cmd, "-t", "filter", "-F", chain)
+		_, err := shared.RunCommand(cmd, "-w", "-t", "filter", "-F", chain)
 		if err != nil {
 			return fmt.Errorf("Failed flushing %q chain %q in table %q: %w", cmd, chain, "filter", err)
 		}
 
 		// Allow connection tracking.
-		_, err = shared.RunCommand(cmd, "-t", "filter", "-A", chain, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+		_, err = shared.RunCommand(cmd, "-w", "-t", "filter", "-A", chain, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT")
 		if err != nil {
 			return fmt.Errorf("Failed adding connection tracking rules to %q chain %q in table %q: %w", cmd, chain, "filter", err)
 		}
@@ -590,7 +592,7 @@ func (d Xtables) aclRuleCriteriaToArgs(networkName string, ipVersion uint, rule 
 
 	// Add subject filters.
 	if rule.Source != "" {
-		matchArgs, err := d.aclRuleSubjectToACLMatch("source", ipVersion, util.SplitNTrimSpace(rule.Source, ",", -1, false)...)
+		matchArgs, err := d.aclRuleSubjectToACLMatch("source", ipVersion, shared.SplitNTrimSpace(rule.Source, ",", -1, false)...)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -603,7 +605,7 @@ func (d Xtables) aclRuleCriteriaToArgs(networkName string, ipVersion uint, rule 
 	}
 
 	if rule.Destination != "" {
-		matchArgs, err := d.aclRuleSubjectToACLMatch("destination", ipVersion, util.SplitNTrimSpace(rule.Destination, ",", -1, false)...)
+		matchArgs, err := d.aclRuleSubjectToACLMatch("destination", ipVersion, shared.SplitNTrimSpace(rule.Destination, ",", -1, false)...)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -620,11 +622,11 @@ func (d Xtables) aclRuleCriteriaToArgs(networkName string, ipVersion uint, rule 
 		args = append(args, "-p", rule.Protocol)
 
 		if rule.SourcePort != "" {
-			args = append(args, d.aclRulePortToACLMatch("sports", util.SplitNTrimSpace(rule.SourcePort, ",", -1, false)...)...)
+			args = append(args, d.aclRulePortToACLMatch("sports", shared.SplitNTrimSpace(rule.SourcePort, ",", -1, false)...)...)
 		}
 
 		if rule.DestinationPort != "" {
-			args = append(args, d.aclRulePortToACLMatch("dports", util.SplitNTrimSpace(rule.DestinationPort, ",", -1, false)...)...)
+			args = append(args, d.aclRulePortToACLMatch("dports", shared.SplitNTrimSpace(rule.DestinationPort, ",", -1, false)...)...)
 		}
 	} else if shared.StringInSlice(rule.Protocol, []string{"icmp4", "icmp6"}) {
 		var icmpIPVersion uint
@@ -740,7 +742,7 @@ func (d Xtables) aclRulePortToACLMatch(direction string, portCriteria ...string)
 		if len(criterionParts) > 1 {
 			fieldParts = append(fieldParts, fmt.Sprintf("%s:%s", criterionParts[0], criterionParts[1]))
 		} else {
-			fieldParts = append(fieldParts, fmt.Sprintf("%s", criterionParts[0]))
+			fieldParts = append(fieldParts, criterionParts[0])
 		}
 	}
 
@@ -930,7 +932,7 @@ func (d Xtables) InstanceSetupProxyNAT(projectName string, instanceName string, 
 
 	revert := revert.New()
 	defer revert.Fail()
-	revert.Add(func() { d.InstanceClearProxyNAT(projectName, instanceName, deviceName) })
+	revert.Add(func() { _ = d.InstanceClearProxyNAT(projectName, instanceName, deviceName) })
 
 	comment := d.instanceDeviceIPTablesComment(projectName, instanceName, deviceName)
 
@@ -949,7 +951,6 @@ func (d Xtables) InstanceSetupProxyNAT(projectName string, instanceName string, 
 
 	dnatRanges := getOptimisedDNATRanges(forward)
 	for listenPortRange, targetPortRange := range dnatRanges {
-
 		listenPortRangeStr := portRangeStr(listenPortRange, ":")
 		targetDest := targetAddressStr
 
@@ -1110,7 +1111,6 @@ func (d Xtables) generateFilterIptablesRules(parentName string, hostName string,
 	// correct source address and MAC at the IP & ethernet layers, but a fraudulent IP or MAC
 	// inside the ICMPv6 NDP packet.
 	if IPv6Nets != nil {
-
 		var chains []string
 
 		if parentManaged {
@@ -1142,6 +1142,7 @@ func (d Xtables) generateFilterIptablesRules(parentName string, hostName string,
 					[]string{"6", chain, "-i", parentName, "-p", "ipv6-icmp", "-m", "physdev", "--physdev-in", hostName, "-m", "icmp6", "--icmpv6-type", "136", "-m", "string", "--hex-string", fmt.Sprintf("|%s|", hexPrefix), "--algo", "bm", "--from", "48", "--to", strconv.Itoa(48 + len(hexPrefix)/2), "-j", "ACCEPT"},
 				)
 			}
+
 			if len(IPv6Nets) > 0 {
 				rules = append(rules,
 					// Prevent Neighbor Advertisement MAC spoofing (prevents the instance poisoning the NDP cache of its neighbours with a MAC address that isn't its own).
@@ -1181,13 +1182,13 @@ func (d Xtables) matchEbtablesRule(activeRule []string, matchRule []string, dele
 		matchIPMaskStr := strings.SplitN(match, "/", 2)
 		if len(matchIPMaskStr) == 2 && matchIPMaskStr[0] == strings.Split(active, "/")[0] {
 			// If the active subnet is a CIDR string we have a match if the masks are identical.
-			activeIP, activeIPNet, err := net.ParseCIDR(active)
+			_, activeIPNet, err := net.ParseCIDR(active)
 			if err == nil {
 				return subnetMask(activeIPNet) == matchIPMaskStr[1]
 			}
 
 			// If the active subnet is a single IP then we have a match if the generated mask is a full mask.
-			activeIP = net.ParseIP(active)
+			activeIP := net.ParseIP(active)
 			if activeIP != nil {
 				if activeIP.To4() != nil {
 					return matchIPMaskStr[1] == "255.255.255.255"
@@ -1223,9 +1224,7 @@ func (d Xtables) iptablesAdd(ipVersion uint, comment string, table string, metho
 		return fmt.Errorf("Asked to setup IPv%d firewalling but %s can't be found", ipVersion, cmd)
 	}
 
-	baseArgs := []string{"-w", "-t", table}
-
-	args := append(baseArgs, []string{method, chain}...)
+	args := []string{"-w", "-t", table, method, chain}
 	args = append(args, rule...)
 	args = append(args, "-m", "comment", "--comment", fmt.Sprintf("%s %s", iptablesCommentPrefix, comment))
 
@@ -1283,7 +1282,8 @@ func (d Xtables) iptablesClear(ipVersion uint, comments []string, fromTables ...
 		for scanner.Scan() {
 			tables = append(tables, scanner.Text())
 		}
-		file.Close()
+
+		_ = file.Close()
 	}
 
 	for _, fromTable := range fromTables {
@@ -1294,8 +1294,9 @@ func (d Xtables) iptablesClear(ipVersion uint, comments []string, fromTables ...
 		}
 
 		baseArgs := []string{"-w", "-t", fromTable}
+
 		// List the rules.
-		args := append(baseArgs, "-S")
+		args := append(baseArgs, "--list-rules")
 		output, err := shared.TryRunCommand(cmd, args...)
 		if err != nil {
 			return fmt.Errorf("Failed to list IPv%d rules (table %s)", ipVersion, fromTable)
@@ -1391,7 +1392,7 @@ func (d Xtables) iptablesChainExists(ipVersion uint, table string, chain string)
 		return false, false, nil
 	}
 
-	for _, rule := range util.SplitNTrimSpace(strings.TrimSpace(rules), "\n", -1, true) {
+	for _, rule := range shared.SplitNTrimSpace(strings.TrimSpace(rules), "\n", -1, true) {
 		if strings.HasPrefix(rule, "-A") {
 			return true, true, nil
 		}

@@ -1,11 +1,15 @@
 package cluster_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
@@ -15,8 +19,6 @@ import (
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // The returned notifier connects to all nodes.
@@ -29,6 +31,17 @@ func TestNewNotifier(t *testing.T) {
 	f := notifyFixtures{t: t, state: state}
 	defer f.Nodes(cert, 3)()
 
+	// Populate state.LocalConfig after nodes created above.
+	var err error
+	var nodeConfig *node.Config
+	err = state.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		nodeConfig, err = node.ConfigLoad(ctx, tx)
+		return err
+	})
+	require.NoError(t, err)
+
+	state.LocalConfig = nodeConfig
+
 	notifier, err := cluster.NewNotifier(state, cert, cert, cluster.NotifyAll)
 	require.NoError(t, err)
 
@@ -39,6 +52,7 @@ func TestNewNotifier(t *testing.T) {
 		peers <- server.Config["cluster.https_address"].(string)
 		return nil
 	}
+
 	assert.NoError(t, notifier(hook))
 
 	addresses := make([]string, 2)
@@ -66,6 +80,18 @@ func TestNewNotify_NotifyAllError(t *testing.T) {
 	defer f.Nodes(cert, 3)()
 
 	f.Down(1)
+
+	// Populate state.LocalConfig after nodes created above.
+	var err error
+	var nodeConfig *node.Config
+	err = state.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		nodeConfig, err = node.ConfigLoad(ctx, tx)
+		return err
+	})
+	require.NoError(t, err)
+
+	state.LocalConfig = nodeConfig
+
 	notifier, err := cluster.NewNotifier(state, cert, cert, cluster.NotifyAll)
 	assert.Nil(t, notifier)
 	require.Error(t, err)
@@ -84,6 +110,18 @@ func TestNewNotify_NotifyAlive(t *testing.T) {
 	defer f.Nodes(cert, 3)()
 
 	f.Down(1)
+
+	// Populate state.LocalConfig after nodes created above.
+	var err error
+	var nodeConfig *node.Config
+	err = state.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		nodeConfig, err = node.ConfigLoad(ctx, tx)
+		return err
+	})
+	require.NoError(t, err)
+
+	state.LocalConfig = nodeConfig
+
 	notifier, err := cluster.NewNotifier(state, cert, cert, cluster.NotifyAlive)
 	assert.NoError(t, err)
 
@@ -92,6 +130,7 @@ func TestNewNotify_NotifyAlive(t *testing.T) {
 		i++
 		return nil
 	}
+
 	assert.NoError(t, notifier(hook))
 	assert.Equal(t, 1, i)
 }
@@ -115,7 +154,7 @@ func (h *notifyFixtures) Nodes(cert *shared.CertInfo, n int) func() {
 	}
 
 	// Insert new entries in the nodes table of the cluster database.
-	err := h.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+	err := h.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		for i := 0; i < n; i++ {
 			name := strconv.Itoa(i)
 			address := servers[i].Listener.Addr().String()
@@ -125,18 +164,20 @@ func (h *notifyFixtures) Nodes(cert *shared.CertInfo, n int) func() {
 			} else {
 				_, err = tx.CreateNode(name, address)
 			}
+
 			require.NoError(h.t, err)
 		}
+
 		return nil
 	})
 	require.NoError(h.t, err)
 
 	// Set the address in the config table of the node database.
-	err = h.state.Node.Transaction(func(tx *db.NodeTx) error {
-		config, err := node.ConfigLoad(tx)
+	err = h.state.DB.Node.Transaction(context.Background(), func(ctx context.Context, tx *db.NodeTx) error {
+		config, err := node.ConfigLoad(ctx, tx)
 		require.NoError(h.t, err)
 		address := servers[0].Listener.Addr().String()
-		values := map[string]interface{}{"cluster.https_address": address}
+		values := map[string]any{"cluster.https_address": address}
 		_, err = config.Patch(values)
 		require.NoError(h.t, err)
 		return nil
@@ -157,10 +198,10 @@ func (h *notifyFixtures) Nodes(cert *shared.CertInfo, n int) func() {
 // Return the network address of the i-th node.
 func (h *notifyFixtures) Address(i int) string {
 	var address string
-	err := h.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		nodes, err := tx.GetNodes()
+	err := h.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		members, err := tx.GetNodes(ctx)
 		require.NoError(h.t, err)
-		address = nodes[i].Address
+		address = members[i].Address
 		return nil
 	})
 	require.NoError(h.t, err)
@@ -169,16 +210,15 @@ func (h *notifyFixtures) Address(i int) string {
 
 // Mark the i'th node as down.
 func (h *notifyFixtures) Down(i int) {
-	err := h.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		nodes, err := tx.GetNodes()
+	err := h.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		members, err := tx.GetNodes(ctx)
 		require.NoError(h.t, err)
-		err = tx.SetNodeHeartbeat(nodes[i].Address, time.Now().Add(-time.Minute))
+		err = tx.SetNodeHeartbeat(members[i].Address, time.Now().Add(-time.Minute))
 		require.NoError(h.t, err)
 		return nil
 	})
 	require.NoError(h.t, err)
 	h.servers[i].Close()
-
 }
 
 // Returns a minimal stub for the LXD RESTful API server, just realistic
@@ -192,9 +232,9 @@ func newRestServer(cert *shared.CertInfo) *httptest.Server {
 
 	mux.HandleFunc("/1.0/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		config := map[string]interface{}{"cluster.https_address": server.Listener.Addr().String()}
+		config := map[string]any{"cluster.https_address": server.Listener.Addr().String()}
 		metadata := api.ServerPut{Config: config}
-		util.WriteJSON(w, api.ResponseRaw{Metadata: metadata}, nil)
+		_ = util.WriteJSON(w, api.ResponseRaw{Metadata: metadata}, nil)
 	})
 
 	return server

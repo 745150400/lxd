@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,7 +133,8 @@ func parseConfig(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	var config []string
 
@@ -166,7 +166,7 @@ func parseConfig(path string) ([]string, error) {
 
 			if shared.PathExists(value) {
 				if shared.IsDir(value) {
-					files, err := ioutil.ReadDir(value)
+					files, err := os.ReadDir(value)
 					if err != nil {
 						return nil, err
 					}
@@ -187,6 +187,7 @@ func parseConfig(path string) ([]string, error) {
 
 					config = append(config, c...)
 				}
+
 				continue
 			}
 		// Expand any fstab
@@ -200,7 +201,8 @@ func parseConfig(path string) ([]string, error) {
 			if err != nil {
 				return nil, err
 			}
-			defer file.Close()
+
+			defer func() { _ = file.Close() }()
 
 			sc := bufio.NewScanner(file)
 			for sc.Scan() {

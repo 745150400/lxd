@@ -34,6 +34,9 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   {{ .varPath }}/networks/{{ .networkName }}/dnsmasq.leases rw,
   {{ .varPath }}/networks/{{ .networkName }}/dnsmasq.raw r,
 
+  # Logging path
+  {{ .logPath }}/dnsmasq.{{ .networkName }}.log rw,
+
   # Additional system files
   @{PROC}/sys/net/ipv6/conf/*/mtu r,
   @{PROC}/@{pid}/fd/ r,
@@ -54,6 +57,7 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
 
   {{ .rootPath }}/run/{resolvconf,NetworkManager,systemd/resolve,connman,netconfig}/resolv.conf r,
   {{ .rootPath }}/run/systemd/resolve/stub-resolv.conf r,
+  {{ .rootPath }}/mnt/wsl/resolv.conf r,
 
 {{- if .snap }}
 
@@ -62,6 +66,9 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
 
   # Snap-specific libraries
   /snap/lxd/*/lib/**.so*                  mr,
+{{ else }}
+  # The binary itself (for nesting)
+  /{,usr/}sbin/dnsmasq                    mr,
 {{- end }}
 }
 `))
@@ -75,9 +82,10 @@ func dnsmasqProfile(sysOS *sys.OS, n network) (string, error) {
 
 	// Render the profile.
 	var sb *strings.Builder = &strings.Builder{}
-	err := dnsmasqProfileTpl.Execute(sb, map[string]interface{}{
+	err := dnsmasqProfileTpl.Execute(sb, map[string]any{
 		"name":        DnsmasqProfileName(n),
 		"networkName": n.Name(),
+		"logPath":     shared.LogPath(""),
 		"varPath":     shared.VarPath(""),
 		"rootPath":    rootPath,
 		"snap":        shared.InSnap(),

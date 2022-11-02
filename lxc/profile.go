@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -87,11 +87,11 @@ func (c *cmdProfile) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Add
+// Add.
 type cmdProfileAdd struct {
 	global  *cmdGlobal
 	profile *cmdProfile
@@ -153,7 +153,7 @@ func (c *cmdProfileAdd) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Assign
+// Assign.
 type cmdProfileAssign struct {
 	global  *cmdGlobal
 	profile *cmdProfile
@@ -233,10 +233,12 @@ func (c *cmdProfileAssign) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Copy
+// Copy.
 type cmdProfileCopy struct {
 	global  *cmdGlobal
 	profile *cmdProfile
+
+	flagTargetProject string
 }
 
 func (c *cmdProfileCopy) Command() *cobra.Command {
@@ -246,6 +248,7 @@ func (c *cmdProfileCopy) Command() *cobra.Command {
 	cmd.Short = i18n.G("Copy profiles")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
 		`Copy profiles`))
+	cmd.Flags().StringVar(&c.flagTargetProject, "target-project", "", i18n.G("Copy to a project different from the source")+"``")
 
 	cmd.RunE = c.Run
 
@@ -287,10 +290,14 @@ func (c *cmdProfileCopy) Run(cmd *cobra.Command, args []string) error {
 		Name:       dest.name,
 	}
 
+	if c.flagTargetProject != "" {
+		dest.server = dest.server.UseProject(c.flagTargetProject)
+	}
+
 	return dest.server.CreateProfile(newProfile)
 }
 
-// Create
+// Create.
 type cmdProfileCreate struct {
 	global  *cmdGlobal
 	profile *cmdProfile
@@ -343,7 +350,7 @@ func (c *cmdProfileCreate) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Delete
+// Delete.
 type cmdProfileDelete struct {
 	global  *cmdGlobal
 	profile *cmdProfile
@@ -394,7 +401,7 @@ func (c *cmdProfileDelete) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Edit
+// Edit.
 type cmdProfileEdit struct {
 	global  *cmdGlobal
 	profile *cmdProfile
@@ -457,7 +464,7 @@ func (c *cmdProfileEdit) Run(cmd *cobra.Command, args []string) error {
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -510,15 +517,17 @@ func (c *cmdProfileEdit) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			continue
 		}
+
 		break
 	}
 
 	return nil
 }
 
-// Get
+// Get.
 type cmdProfileGet struct {
 	global  *cmdGlobal
 	profile *cmdProfile
@@ -565,7 +574,7 @@ func (c *cmdProfileGet) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// List
+// List.
 type cmdProfileList struct {
 	global     *cmdGlobal
 	profile    *cmdProfile
@@ -617,6 +626,7 @@ func (c *cmdProfileList) Run(cmd *cobra.Command, args []string) error {
 		strUsedBy := fmt.Sprintf("%d", len(profile.UsedBy))
 		data = append(data, []string{profile.Name, profile.Description, strUsedBy})
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -627,7 +637,7 @@ func (c *cmdProfileList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, profiles)
 }
 
-// Remove
+// Remove.
 type cmdProfileRemove struct {
 	global  *cmdGlobal
 	profile *cmdProfile
@@ -702,7 +712,7 @@ func (c *cmdProfileRemove) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Rename
+// Rename.
 type cmdProfileRename struct {
 	global  *cmdGlobal
 	profile *cmdProfile
@@ -753,7 +763,7 @@ func (c *cmdProfileRename) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Set
+// Set.
 type cmdProfileSet struct {
 	global  *cmdGlobal
 	profile *cmdProfile
@@ -812,7 +822,7 @@ func (c *cmdProfileSet) Run(cmd *cobra.Command, args []string) error {
 	return resource.server.UpdateProfile(resource.name, profile.Writable(), etag)
 }
 
-// Show
+// Show.
 type cmdProfileShow struct {
 	global  *cmdGlobal
 	profile *cmdProfile
@@ -865,7 +875,7 @@ func (c *cmdProfileShow) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Unset
+// Unset.
 type cmdProfileUnset struct {
 	global     *cmdGlobal
 	profile    *cmdProfile

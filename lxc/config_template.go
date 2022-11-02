@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"sort"
 
@@ -50,11 +50,11 @@ func (c *cmdConfigTemplate) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Create
+// Create.
 type cmdConfigTemplateCreate struct {
 	global         *cmdGlobal
 	config         *cmdConfig
@@ -96,7 +96,7 @@ func (c *cmdConfigTemplateCreate) Run(cmd *cobra.Command, args []string) error {
 	return resource.server.CreateInstanceTemplateFile(resource.name, args[1], nil)
 }
 
-// Delete
+// Delete.
 type cmdConfigTemplateDelete struct {
 	global         *cmdGlobal
 	config         *cmdConfig
@@ -139,7 +139,7 @@ func (c *cmdConfigTemplateDelete) Run(cmd *cobra.Command, args []string) error {
 	return resource.server.DeleteInstanceTemplateFile(resource.name, args[1])
 }
 
-// Edit
+// Edit.
 type cmdConfigTemplateEdit struct {
 	global         *cmdGlobal
 	config         *cmdConfig
@@ -186,7 +186,8 @@ func (c *cmdConfigTemplateEdit) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	content, err := ioutil.ReadAll(reader)
+
+	content, err := io.ReadAll(reader)
 	if err != nil {
 		return err
 	}
@@ -214,6 +215,7 @@ func (c *cmdConfigTemplateEdit) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			continue
 		}
 
@@ -223,7 +225,7 @@ func (c *cmdConfigTemplateEdit) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// List
+// List.
 type cmdConfigTemplateList struct {
 	global         *cmdGlobal
 	config         *cmdConfig
@@ -275,6 +277,7 @@ func (c *cmdConfigTemplateList) Run(cmd *cobra.Command, args []string) error {
 	for _, template := range templates {
 		data = append(data, []string{template})
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -284,7 +287,7 @@ func (c *cmdConfigTemplateList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, templates)
 }
 
-// Show
+// Show.
 type cmdConfigTemplateShow struct {
 	global         *cmdGlobal
 	config         *cmdConfig
@@ -328,7 +331,7 @@ func (c *cmdConfigTemplateShow) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	content, err := ioutil.ReadAll(template)
+	content, err := io.ReadAll(template)
 	if err != nil {
 		return err
 	}

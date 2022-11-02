@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 
 	"github.com/lxc/lxd/shared"
 )
@@ -32,7 +32,7 @@ func AskBool(question string, defaultAnswer string) (bool, error) {
 	}
 }
 
-// AskChoice asks the user to select one of multiple options
+// AskChoice asks the user to select one of multiple options.
 func AskChoice(question string, choices []string, defaultAnswer string) (string, error) {
 	for {
 		answer, err := askQuestion(question, defaultAnswer)
@@ -48,7 +48,7 @@ func AskChoice(question string, choices []string, defaultAnswer string) (string,
 	}
 }
 
-// AskInt asks the user to enter an integer between a min and max value
+// AskInt asks the user to enter an integer between a min and max value.
 func AskInt(question string, min int64, max int64, defaultAnswer string, validate func(int64) error) (int64, error) {
 	for {
 		answer, err := askQuestion(question, defaultAnswer)
@@ -109,15 +109,15 @@ func AskString(question string, defaultAnswer string, validate func(string) erro
 // AskPassword asks the user to enter a password.
 func AskPassword(question string) string {
 	for {
-		fmt.Printf(question)
+		fmt.Print(question)
 
-		pwd, _ := terminal.ReadPassword(0)
+		pwd, _ := term.ReadPassword(0)
 		fmt.Println("")
 		inFirst := string(pwd)
 		inFirst = strings.TrimSuffix(inFirst, "\n")
 
 		fmt.Printf("Again: ")
-		pwd, _ = terminal.ReadPassword(0)
+		pwd, _ = term.ReadPassword(0)
 		fmt.Println("")
 		inSecond := string(pwd)
 		inSecond = strings.TrimSuffix(inSecond, "\n")
@@ -136,8 +136,8 @@ func AskPassword(question string) string {
 // It's the same as AskPassword, but it won't ask to enter it again.
 func AskPasswordOnce(question string) string {
 	for {
-		fmt.Printf(question)
-		pwd, _ := terminal.ReadPassword(0)
+		fmt.Print(question)
+		pwd, _ := term.ReadPassword(0)
 		fmt.Println("")
 
 		// refuse empty password
@@ -150,9 +150,9 @@ func AskPasswordOnce(question string) string {
 	}
 }
 
-// Ask a question on the output stream and read the answer from the input stream
+// Ask a question on the output stream and read the answer from the input stream.
 func askQuestion(question, defaultAnswer string) (string, error) {
-	fmt.Printf(question)
+	fmt.Print(question)
 
 	return readAnswer(defaultAnswer)
 }
@@ -168,7 +168,7 @@ func readAnswer(defaultAnswer string) (string, error) {
 	return answer, err
 }
 
-// Print an invalid input message on the error stream
+// Print an invalid input message on the error stream.
 func invalidInput() {
 	fmt.Fprintf(os.Stderr, "Invalid input, try again.\n\n")
 }

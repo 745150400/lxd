@@ -1,6 +1,7 @@
 package project_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/shared/api"
@@ -22,6 +24,7 @@ func TestAllowInstanceCreation_NotConfigured(t *testing.T) {
 		Name: "c1",
 		Type: api.InstanceTypeContainer,
 	}
+
 	err := project.AllowInstanceCreation(tx, "default", req)
 	assert.NoError(t, err)
 }
@@ -31,15 +34,14 @@ func TestAllowInstanceCreation_Below(t *testing.T) {
 	tx, cleanup := db.NewTestClusterTx(t)
 	defer cleanup()
 
-	_, err := tx.CreateProject(db.Project{
-		Name: "p1",
-		Config: map[string]string{
-			"limits.containers": "5",
-		},
-	})
+	ctx := context.Background()
+	id, err := cluster.CreateProject(ctx, tx.Tx(), cluster.Project{Name: "p1"})
 	require.NoError(t, err)
 
-	_, err = tx.CreateInstance(db.Instance{
+	err = cluster.CreateProjectConfig(ctx, tx.Tx(), id, map[string]string{"limits.containers": "5"})
+	require.NoError(t, err)
+
+	_, err = cluster.CreateInstance(ctx, tx.Tx(), cluster.Instance{
 		Project:      "p1",
 		Name:         "c1",
 		Type:         instancetype.Container,
@@ -63,15 +65,14 @@ func TestAllowInstanceCreation_Above(t *testing.T) {
 	tx, cleanup := db.NewTestClusterTx(t)
 	defer cleanup()
 
-	_, err := tx.CreateProject(db.Project{
-		Name: "p1",
-		Config: map[string]string{
-			"limits.containers": "1",
-		},
-	})
+	ctx := context.Background()
+	id, err := cluster.CreateProject(ctx, tx.Tx(), cluster.Project{Name: "p1"})
 	require.NoError(t, err)
 
-	_, err = tx.CreateInstance(db.Instance{
+	err = cluster.CreateProjectConfig(ctx, tx.Tx(), id, map[string]string{"limits.containers": "1"})
+	require.NoError(t, err)
+
+	_, err = cluster.CreateInstance(ctx, tx.Tx(), cluster.Instance{
 		Project:      "p1",
 		Name:         "c1",
 		Type:         instancetype.Container,
@@ -95,15 +96,14 @@ func TestAllowInstanceCreation_DifferentType(t *testing.T) {
 	tx, cleanup := db.NewTestClusterTx(t)
 	defer cleanup()
 
-	_, err := tx.CreateProject(db.Project{
-		Name: "p1",
-		Config: map[string]string{
-			"limits.containers": "1",
-		},
-	})
+	ctx := context.Background()
+	id, err := cluster.CreateProject(ctx, tx.Tx(), cluster.Project{Name: "p1"})
 	require.NoError(t, err)
 
-	_, err = tx.CreateInstance(db.Instance{
+	err = cluster.CreateProjectConfig(ctx, tx.Tx(), id, map[string]string{"limits.containers": "1"})
+	require.NoError(t, err)
+
+	_, err = cluster.CreateInstance(ctx, tx.Tx(), cluster.Instance{
 		Project:      "p1",
 		Name:         "vm1",
 		Type:         instancetype.VM,
@@ -122,21 +122,19 @@ func TestAllowInstanceCreation_DifferentType(t *testing.T) {
 }
 
 // If a limit is configured, but the limit on instances is more
-// restrictive, the check fails
+// restrictive, the check fails.
 func TestAllowInstanceCreation_AboveInstances(t *testing.T) {
 	tx, cleanup := db.NewTestClusterTx(t)
 	defer cleanup()
 
-	_, err := tx.CreateProject(db.Project{
-		Name: "p1",
-		Config: map[string]string{
-			"limits.containers": "5",
-			"limits.instances":  "1",
-		},
-	})
+	ctx := context.Background()
+	id, err := cluster.CreateProject(ctx, tx.Tx(), cluster.Project{Name: "p1"})
 	require.NoError(t, err)
 
-	_, err = tx.CreateInstance(db.Instance{
+	err = cluster.CreateProjectConfig(ctx, tx.Tx(), id, map[string]string{"limits.containers": "5", "limits.instances": "1"})
+	require.NoError(t, err)
+
+	_, err = cluster.CreateInstance(ctx, tx.Tx(), cluster.Instance{
 		Project:      "p1",
 		Name:         "c1",
 		Type:         instancetype.Container,
@@ -159,16 +157,17 @@ func TestCheckClusterTargetRestriction_RestrictedTrue(t *testing.T) {
 	tx, cleanup := db.NewTestClusterTx(t)
 	defer cleanup()
 
-	_, err := tx.CreateProject(db.Project{
-		Name: "p1",
-		Config: map[string]string{
-			"restricted":                "true",
-			"restricted.cluster.target": "block",
-		},
-	})
+	ctx := context.Background()
+	id, err := cluster.CreateProject(ctx, tx.Tx(), cluster.Project{Name: "p1"})
 	require.NoError(t, err)
 
-	p, err := tx.GetProject("p1")
+	err = cluster.CreateProjectConfig(ctx, tx.Tx(), id, map[string]string{"restricted": "true", "restricted.cluster.target": "block"})
+	require.NoError(t, err)
+
+	dbProject, err := cluster.GetProject(ctx, tx.Tx(), "p1")
+	require.NoError(t, err)
+
+	p, err := dbProject.ToAPI(ctx, tx.Tx())
 	require.NoError(t, err)
 
 	req := &http.Request{}
@@ -182,16 +181,17 @@ func TestCheckClusterTargetRestriction_RestrictedFalse(t *testing.T) {
 	tx, cleanup := db.NewTestClusterTx(t)
 	defer cleanup()
 
-	_, err := tx.CreateProject(db.Project{
-		Name: "p1",
-		Config: map[string]string{
-			"restricted":                "false",
-			"restricted.cluster.target": "block",
-		},
-	})
+	ctx := context.Background()
+	id, err := cluster.CreateProject(ctx, tx.Tx(), cluster.Project{Name: "p1"})
 	require.NoError(t, err)
 
-	p, err := tx.GetProject("p1")
+	err = cluster.CreateProjectConfig(ctx, tx.Tx(), id, map[string]string{"restricted": "false", "restricted.cluster.target": "block"})
+	require.NoError(t, err)
+
+	dbProject, err := cluster.GetProject(ctx, tx.Tx(), "p1")
+	require.NoError(t, err)
+
+	p, err := dbProject.ToAPI(ctx, tx.Tx())
 	require.NoError(t, err)
 
 	req := &http.Request{}

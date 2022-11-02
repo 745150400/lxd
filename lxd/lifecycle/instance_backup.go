@@ -1,12 +1,8 @@
 package lifecycle
 
 import (
-	"fmt"
-	"net/url"
-
-	"github.com/lxc/lxd/lxd/project"
-	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/version"
 )
 
 // InstanceBackupAction represents a lifecycle event action for instance backups.
@@ -14,21 +10,17 @@ type InstanceBackupAction string
 
 // All supported lifecycle events for instance backups.
 const (
-	InstanceBackupCreated   = InstanceBackupAction("created")
-	InstanceBackupDeleted   = InstanceBackupAction("deleted")
-	InstanceBackupRenamed   = InstanceBackupAction("renamed")
-	InstanceBackupRetrieved = InstanceBackupAction("retrieved")
+	InstanceBackupCreated   = InstanceBackupAction(api.EventLifecycleInstanceBackupCreated)
+	InstanceBackupDeleted   = InstanceBackupAction(api.EventLifecycleInstanceBackupDeleted)
+	InstanceBackupRenamed   = InstanceBackupAction(api.EventLifecycleInstanceBackupRenamed)
+	InstanceBackupRetrieved = InstanceBackupAction(api.EventLifecycleInstanceBackupRetrieved)
 )
 
 // Event creates the lifecycle event for an action on an instance backup.
-func (a InstanceBackupAction) Event(name string, inst instance, ctx map[string]interface{}) api.EventLifecycle {
-	parentName, instanceName, _ := shared.InstanceGetParentAndSnapshotName(name)
-	u := fmt.Sprintf("/1.0/instances/%s/backups/%s", url.PathEscape(parentName), url.PathEscape(instanceName))
-	eventType := fmt.Sprintf("instance-backup-%s", a)
+func (a InstanceBackupAction) Event(fullBackupName string, inst instance, ctx map[string]any) api.EventLifecycle {
+	_, backupName, _ := api.GetParentAndSnapshotName(fullBackupName)
 
-	if inst.Project() != project.Default {
-		u = fmt.Sprintf("%s?project=%s", u, url.QueryEscape(inst.Project()))
-	}
+	u := api.NewURL().Path(version.APIVersion, "instances", inst.Name(), "backups", backupName).Project(inst.Project().Name)
 
 	var requestor *api.EventLifecycleRequestor
 	if inst.Operation() != nil {
@@ -36,8 +28,8 @@ func (a InstanceBackupAction) Event(name string, inst instance, ctx map[string]i
 	}
 
 	return api.EventLifecycle{
-		Action:    eventType,
-		Source:    u,
+		Action:    string(a),
+		Source:    u.String(),
 		Context:   ctx,
 		Requestor: requestor,
 	}

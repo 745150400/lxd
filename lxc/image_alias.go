@@ -43,11 +43,11 @@ func (c *cmdImageAlias) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Create
+// Create.
 type cmdImageAliasCreate struct {
 	global     *cmdGlobal
 	image      *cmdImage
@@ -93,7 +93,7 @@ func (c *cmdImageAliasCreate) Run(cmd *cobra.Command, args []string) error {
 	return resource.server.CreateImageAlias(alias)
 }
 
-// Delete
+// Delete.
 type cmdImageAliasDelete struct {
 	global     *cmdGlobal
 	image      *cmdImage
@@ -136,7 +136,7 @@ func (c *cmdImageAliasDelete) Run(cmd *cobra.Command, args []string) error {
 	return resource.server.DeleteImageAlias(resource.name)
 }
 
-// List
+// List.
 type cmdImageAliasList struct {
 	global     *cmdGlobal
 	image      *cmdImage
@@ -228,6 +228,7 @@ func (c *cmdImageAliasList) Run(cmd *cobra.Command, args []string) error {
 
 		data = append(data, []string{alias.Name, alias.Target[0:12], strings.ToUpper(alias.Type), alias.Description})
 	}
+
 	sort.Sort(utils.StringList(data))
 
 	header := []string{
@@ -240,7 +241,7 @@ func (c *cmdImageAliasList) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, aliases)
 }
 
-// Rename
+// Rename.
 type cmdImageAliasRename struct {
 	global     *cmdGlobal
 	image      *cmdImage

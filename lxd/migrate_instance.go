@@ -1,22 +1,20 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
+	"github.com/checkpoint-restore/go-criu/v6/crit"
 	"github.com/gorilla/websocket"
+	liblxc "github.com/lxc/go-lxc"
 	"google.golang.org/protobuf/proto"
-	liblxc "gopkg.in/lxc/go-lxc.v2"
 
-	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/operationtype"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/migration"
@@ -29,13 +27,18 @@ import (
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/idmap"
 	"github.com/lxc/lxd/shared/logger"
+	"github.com/lxc/lxd/shared/osarch"
 )
 
-func newMigrationSource(inst instance.Instance, stateful bool, instanceOnly bool) (*migrationSourceWs, error) {
+func newMigrationSource(inst instance.Instance, stateful bool, instanceOnly bool, allowInconsistent bool) (*migrationSourceWs, error) {
 	ret := migrationSourceWs{
-		migrationFields: migrationFields{instance: inst},
-		allConnected:    make(chan struct{}),
+		migrationFields: migrationFields{
+			instance:          inst,
+			allowInconsistent: allowInconsistent,
+		},
+		allConnected: make(chan struct{}),
 	}
+
 	ret.instanceOnly = instanceOnly
 
 	var err error
@@ -79,7 +82,6 @@ fi
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	err = f.Chmod(0500)
 	if err != nil {
@@ -87,19 +89,23 @@ fi
 	}
 
 	_, err = f.WriteString(script)
-	return err
+	if err != nil {
+		return err
+	}
+
+	return f.Close()
 }
 
-func snapshotToProtobuf(c instance.Instance) *migration.Snapshot {
+func snapshotToProtobuf(snap *api.InstanceSnapshot) *migration.Snapshot {
 	config := []*migration.Config{}
-	for k, v := range c.LocalConfig() {
+	for k, v := range snap.Config {
 		kCopy := string(k)
 		vCopy := string(v)
 		config = append(config, &migration.Config{Key: &kCopy, Value: &vCopy})
 	}
 
 	devices := []*migration.Device{}
-	for name, d := range c.LocalDevices() {
+	for name, d := range snap.Devices {
 		props := []*migration.Config{}
 		for k, v := range d {
 			// Local loop vars.
@@ -112,19 +118,18 @@ func snapshotToProtobuf(c instance.Instance) *migration.Snapshot {
 		devices = append(devices, &migration.Device{Name: &nameCopy, Config: props})
 	}
 
-	parts := strings.SplitN(c.Name(), shared.SnapshotDelimiter, 2)
-	isEphemeral := c.IsEphemeral()
-	arch := int32(c.Architecture())
-	stateful := c.IsStateful()
-
-	creationDate := c.CreationDate().UTC().Unix()
-	lastUsedDate := c.LastUsedDate().UTC().Unix()
-	expiryDate := c.ExpiryDate().UTC().Unix()
+	isEphemeral := snap.Ephemeral
+	archID, _ := osarch.ArchitectureId(snap.Architecture)
+	arch := int32(archID)
+	stateful := snap.Stateful
+	creationDate := snap.CreatedAt.UTC().Unix()
+	lastUsedDate := snap.LastUsedAt.UTC().Unix()
+	expiryDate := snap.ExpiresAt.UTC().Unix()
 
 	return &migration.Snapshot{
-		Name:         &parts[len(parts)-1],
+		Name:         &snap.Name,
 		LocalConfig:  config,
-		Profiles:     c.Profiles(),
+		Profiles:     snap.Profiles,
 		Ephemeral:    &isEphemeral,
 		LocalDevices: devices,
 		Architecture: &arch,
@@ -136,7 +141,7 @@ func snapshotToProtobuf(c instance.Instance) *migration.Snapshot {
 }
 
 // Check if CRIU supports pre-dumping and number of
-// pre-dump iterations
+// pre-dump iterations.
 func (s *migrationSourceWs) checkForPreDumpSupport() (bool, int) {
 	// Ask CRIU if this architecture/kernel/criu combination
 	// supports pre-copy (dirty memory tracking)
@@ -186,6 +191,7 @@ func (s *migrationSourceWs) checkForPreDumpSupport() (bool, int) {
 		// default to 10
 		maxIterations = 10
 	}
+
 	if maxIterations > 999 {
 		// the pre-dump directory is hardcoded to a string
 		// with maximal 3 digits. 999 pre-dumps makes no
@@ -193,6 +199,7 @@ func (s *migrationSourceWs) checkForPreDumpSupport() (bool, int) {
 		// is not higher than this.
 		maxIterations = 999
 	}
+
 	logger.Debugf("Using maximal %d iterations for pre-dumping", maxIterations)
 
 	return usePreDumps, maxIterations
@@ -201,39 +208,14 @@ func (s *migrationSourceWs) checkForPreDumpSupport() (bool, int) {
 // The function readCriuStatsDump() reads the CRIU 'stats-dump' file
 // in path and returns the pages_written, pages_skipped_parent, error.
 func readCriuStatsDump(path string) (uint64, uint64, error) {
-	statsDump := shared.AddSlash(path) + "stats-dump"
-	in, err := ioutil.ReadFile(statsDump)
+	// Get dump statistics with crit
+	dumpStats, err := crit.GetDumpStats(path)
 	if err != nil {
-		logger.Errorf("Error reading CRIU's 'stats-dump' file: %s", err.Error())
-		return 0, 0, err
-	}
-
-	// According to the CRIU file image format it starts with two magic values.
-	// First magic IMG_SERVICE: 1427134784
-	if binary.LittleEndian.Uint32(in[0:4]) != 1427134784 {
-		msg := "IMG_SERVICE(1427134784) criu magic not found"
-		logger.Errorf(msg)
-		return 0, 0, fmt.Errorf(msg)
-	}
-	// Second magic STATS: 1460220678
-	if binary.LittleEndian.Uint32(in[4:8]) != 1460220678 {
-		msg := "STATS(1460220678) criu magic not found"
-		logger.Errorf(msg)
-		return 0, 0, fmt.Errorf(msg)
-	}
-
-	// Next, read the size of the image payload
-	size := binary.LittleEndian.Uint32(in[8:12])
-
-	statsEntry := &migration.StatsEntry{}
-	if err = proto.Unmarshal(in[12:12+size], statsEntry); err != nil {
 		logger.Errorf("Failed to parse CRIU's 'stats-dump' file: %s", err.Error())
 		return 0, 0, err
 	}
 
-	written := statsEntry.GetDump().GetPagesWritten()
-	skipped := statsEntry.GetDump().GetPagesSkippedParent()
-	return written, skipped, nil
+	return dumpStats.GetPagesWritten(), dumpStats.GetPagesSkippedParent(), nil
 }
 
 type preDumpLoopArgs struct {
@@ -275,7 +257,7 @@ func (s *migrationSourceWs) preDumpLoop(state *state.State, args *preDumpLoopArg
 	}
 
 	// Send the pre-dump.
-	ctName, _, _ := shared.InstanceGetParentAndSnapshotName(s.instance.Name())
+	ctName, _, _ := api.GetParentAndSnapshotName(s.instance.Name())
 	err = rsync.Send(ctName, shared.AddSlash(args.checkpointDir), &shared.WebsocketIO{Conn: s.criuConn}, nil, args.rsyncFeatures, args.bwlimit, state.OS.ExecPath)
 	if err != nil {
 		return final, err
@@ -334,28 +316,46 @@ func (s *migrationSourceWs) preDumpLoop(state *state.State, args *preDumpLoopArg
 		s.sendControl(err)
 		return final, err
 	}
+
 	logger.Debugf("Sending another header done")
 
 	return final, nil
 }
 
 func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operation) error {
-	logger.Info("Waiting for migration channel connections")
+	l := logger.AddContext(logger.Log, logger.Ctx{"project": s.instance.Project(), "instance": s.instance.Name()})
+
+	l.Info("Waiting for migration channel connections on source")
+
 	select {
 	case <-time.After(time.Second * 10):
-		return fmt.Errorf("Timed out waiting for connections")
+		return fmt.Errorf("Timed out waiting for migration connections")
 	case <-s.allConnected:
 	}
 
-	logger.Info("Migration channels connected")
+	l.Info("Migration channels connected on source")
 
+	defer l.Info("Migration channels disconnected on source")
 	defer s.disconnect()
+
+	// All failure paths need to do a few things to correctly handle errors before returning.
+	// Unfortunately, handling errors is not well-suited to defer as the code depends on the
+	// status of driver and the error value. The error value is especially tricky due to the
+	// common case of creating a new err variable (intentional or not) due to scoping and use
+	// of ":=".  Capturing err in a closure for use in defer would be fragile, which defeats
+	// the purpose of using defer. An abort function reduces the odds of mishandling errors
+	// without introducing the fragility of closing on err.
+	abort := func(err error) error {
+		l.Error("Migration failed on source", logger.Ctx{"err": err})
+		s.sendControl(err)
+		return err
+	}
 
 	var poolMigrationTypes []migration.Type
 
-	pool, err := storagePools.GetPoolByInstance(state, s.instance)
+	pool, err := storagePools.LoadByInstance(state, s.instance)
 	if err != nil {
-		return err
+		return abort(fmt.Errorf("Failed loading instance: %w", err))
 	}
 
 	// The refresh argument passed to MigrationTypes() is always set
@@ -363,13 +363,17 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 	// or not it's doing a refresh as the migration sink/receiver will know
 	// this, and adjust the migration types accordingly.
 	poolMigrationTypes = pool.MigrationTypes(storagePools.InstanceContentType(s.instance), false)
-	if len(poolMigrationTypes) < 0 {
-		return fmt.Errorf("No source migration types available")
+	if len(poolMigrationTypes) == 0 {
+		return abort(fmt.Errorf("No source migration types available"))
 	}
 
 	// Convert the pool's migration type options to an offer header to target.
 	// Populate the Fs, ZfsFeatures and RsyncFeatures fields.
 	offerHeader := migration.TypesToHeader(poolMigrationTypes...)
+
+	// Offer to send index header.
+	indexHeaderVersion := migration.IndexHeaderVersion
+	offerHeader.IndexHeaderVersion = &indexHeaderVersion
 
 	maxDumpIterations := 0
 
@@ -389,7 +393,7 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 		idmaps := make([]*migration.IDMapType, 0)
 		idmapset, err := ct.DiskIdmap()
 		if err != nil {
-			return err
+			return abort(err)
 		} else if idmapset != nil {
 			for _, ctnIdmap := range idmapset.Idmap {
 				idmap := migration.IDMapType{
@@ -415,47 +419,44 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 		offerHeader.Predump = proto.Bool(offerUsePreDumps)
 	}
 
-	// Add snapshot info to source header if needed.
-	snapshots := []*migration.Snapshot{}
-	snapshotNames := []string{}
-	if !s.instanceOnly {
-		fullSnaps, err := s.instance.Snapshots()
-		if err == nil {
-			for _, snap := range fullSnaps {
-				snapshots = append(snapshots, snapshotToProtobuf(snap))
-				_, snapName, _ := shared.InstanceGetParentAndSnapshotName(snap.Name())
-				snapshotNames = append(snapshotNames, snapName)
-			}
-		}
+	srcConfig, err := pool.GenerateInstanceBackupConfig(s.instance, !s.instanceOnly, migrateOp)
+	if err != nil {
+		return abort(fmt.Errorf("Failed generating instance migration config: %w", err))
 	}
 
-	offerHeader.SnapshotNames = snapshotNames
-	offerHeader.Snapshots = snapshots
+	// If we are copying snapshots, retrieve a list of snapshots from source volume.
+	if !s.instanceOnly {
+		offerHeader.SnapshotNames = make([]string, 0, len(srcConfig.Snapshots))
+		offerHeader.Snapshots = make([]*migration.Snapshot, 0, len(srcConfig.Snapshots))
+
+		for i := range srcConfig.Snapshots {
+			offerHeader.SnapshotNames = append(offerHeader.SnapshotNames, srcConfig.Snapshots[i].Name)
+			offerHeader.Snapshots = append(offerHeader.Snapshots, snapshotToProtobuf(srcConfig.Snapshots[i]))
+		}
+	}
 
 	// For VMs, send block device size hint in offer header so that target can create the volume the same size.
 	if s.instance.Type() == instancetype.VM {
 		blockSize, err := storagePools.InstanceDiskBlockSize(pool, s.instance, migrateOp)
 		if err != nil {
-			return fmt.Errorf("Failed getting source disk size: %w", err)
+			return abort(fmt.Errorf("Failed getting source disk size: %w", err))
 		}
 
-		logger.Debugf("Set migration offer volume size for %q: %d", s.instance.Name(), blockSize)
+		l.Debug("Set migration offer volume size", logger.Ctx{"blockSize": blockSize})
 		offerHeader.VolumeSize = &blockSize
 	}
 
 	// Send offer to target.
 	err = s.send(offerHeader)
 	if err != nil {
-		s.sendControl(err)
-		return err
+		return abort(fmt.Errorf("Failed sending migration offer header: %w", err))
 	}
 
 	// Receive response from target.
 	respHeader := &migration.MigrationHeader{}
 	err = s.recv(respHeader)
 	if err != nil {
-		s.sendControl(err)
-		return err
+		return abort(err)
 	}
 
 	var migrationTypes []migration.Type // Negotiated migration types.
@@ -470,33 +471,37 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 		rsyncFeatures = []string{"xattrs", "delete", "compress"}
 	}
 
-	// All failure paths need to do a few things to correctly handle errors before returning.
-	// Unfortunately, handling errors is not well-suited to defer as the code depends on the
-	// status of driver and the error value. The error value is especially tricky due to the
-	// common case of creating a new err variable (intentional or not) due to scoping and use
-	// of ":=".  Capturing err in a closure for use in defer would be fragile, which defeats
-	// the purpose of using defer. An abort function reduces the odds of mishandling errors
-	// without introducing the fragility of closing on err.
-	abort := func(err error) error {
-		go s.sendControl(err)
-		return err
-	}
-
 	rsyncBwlimit = pool.Driver().Config()["rsync.bwlimit"]
 	migrationTypes, err = migration.MatchTypes(respHeader, migration.MigrationFSType_RSYNC, poolMigrationTypes)
 	if err != nil {
-		logger.Errorf("Failed to negotiate migration type: %v", err)
-		return abort(err)
+		return abort(fmt.Errorf("Failed to negotiate migration type: %w", err))
 	}
 
-	sendSnapshotNames := snapshotNames
+	volSourceArgs := &migration.VolumeSourceArgs{
+		IndexHeaderVersion: respHeader.GetIndexHeaderVersion(), // Enable index header frame if supported.
+		Name:               s.instance.Name(),
+		MigrationType:      migrationTypes[0],
+		Snapshots:          offerHeader.SnapshotNames,
+		TrackProgress:      true,
+		Refresh:            respHeader.GetRefresh(),
+		AllowInconsistent:  s.migrationFields.allowInconsistent,
+		VolumeOnly:         s.instanceOnly,
+		Info:               &migration.Info{Config: srcConfig},
+	}
 
-	// If we are in refresh mode, only send the snapshots the target has asked for.
+	// Only send the snapshots that the target requests when refreshing.
 	if respHeader.GetRefresh() {
-		sendSnapshotNames = respHeader.GetSnapshotNames()
-	}
+		volSourceArgs.Snapshots = respHeader.GetSnapshotNames()
+		allSnapshots := volSourceArgs.Info.Config.VolumeSnapshots
 
-	volSourceArgs := &migration.VolumeSourceArgs{}
+		// Ensure that only the requested snapshots are included in the migration index header.
+		volSourceArgs.Info.Config.VolumeSnapshots = make([]*api.StorageVolumeSnapshot, 0, len(volSourceArgs.Snapshots))
+		for i := range allSnapshots {
+			if shared.StringInSlice(allSnapshots[i].Name, volSourceArgs.Snapshots) {
+				volSourceArgs.Info.Config.VolumeSnapshots = append(volSourceArgs.Info.Config.VolumeSnapshots, allSnapshots[i])
+			}
+		}
+	}
 
 	// If s.live is true or Criu is set to CRIUTYPE_NONE rather than nil, it indicates that the
 	// source instance is running and that we should do a two stage transfer to minimize downtime.
@@ -511,11 +516,6 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 			return abort(fmt.Errorf("Failed statefully stopping instance: %w", err))
 		}
 	}
-
-	volSourceArgs.Name = s.instance.Name()
-	volSourceArgs.MigrationType = migrationTypes[0]
-	volSourceArgs.Snapshots = sendSnapshotNames
-	volSourceArgs.TrackProgress = true
 
 	err = pool.MigrateInstance(s.instance, &shared.WebsocketIO{Conn: s.fsConn}, volSourceArgs, migrateOp)
 	if err != nil {
@@ -532,12 +532,12 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 			return abort(fmt.Errorf("Formats other than criu rsync not understood"))
 		}
 
-		checkpointDir, err := ioutil.TempDir("", "lxd_checkpoint_")
+		checkpointDir, err := os.MkdirTemp("", "lxd_checkpoint_")
 		if err != nil {
 			return abort(err)
 		}
 
-		if instance.RuntimeLiblxcVersionAtLeast(liblxc.Version(), 2, 0, 4) {
+		if liblxc.RuntimeLiblxcVersionAtLeast(liblxc.Version(), 2, 0, 4) {
 			// What happens below is slightly convoluted. Due to various complications
 			// with networking, there's no easy way for criu to exit and leave the
 			// container in a frozen state for us to somehow resume later.
@@ -551,15 +551,15 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 			dumpDone := make(chan bool, 1)
 			actionScriptOpSecret, err := shared.RandomCryptoString()
 			if err != nil {
-				os.RemoveAll(checkpointDir)
+				_ = os.RemoveAll(checkpointDir)
 				return abort(err)
 			}
 
 			actionScriptOp, err := operations.OperationCreate(
 				state,
-				s.instance.Project(),
+				s.instance.Project().Name,
 				operations.OperationClassWebsocket,
-				db.OperationInstanceLiveMigrate,
+				operationtype.InstanceLiveMigrate,
 				nil,
 				nil,
 				func(op *operations.Operation) error {
@@ -567,6 +567,7 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 					if !result {
 						return fmt.Errorf("restore failed, failing CRIU")
 					}
+
 					return nil
 				},
 				nil,
@@ -593,13 +594,13 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 				nil,
 			)
 			if err != nil {
-				os.RemoveAll(checkpointDir)
+				_ = os.RemoveAll(checkpointDir)
 				return abort(err)
 			}
 
 			err = writeActionScript(checkpointDir, actionScriptOp.URL(), actionScriptOpSecret, state.OS.ExecPath)
 			if err != nil {
-				os.RemoveAll(checkpointDir)
+				_ = os.RemoveAll(checkpointDir)
 				return abort(err)
 			}
 
@@ -609,7 +610,7 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 			// Check if the other side knows about pre-dumping and the associated
 			// rsync protocol.
 			if respHeader.GetPredump() {
-				logger.Debugf("The other side does support pre-copy")
+				l.Debug("The other side does support pre-copy")
 				final := false
 				for !final {
 					preDumpCounter++
@@ -618,6 +619,7 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 					} else {
 						final = true
 					}
+
 					dumpDir := fmt.Sprintf("%03d", preDumpCounter)
 					loopArgs := preDumpLoopArgs{
 						checkpointDir: checkpointDir,
@@ -627,21 +629,23 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 						final:         final,
 						rsyncFeatures: rsyncFeatures,
 					}
+
 					final, err = s.preDumpLoop(state, &loopArgs)
 					if err != nil {
-						os.RemoveAll(checkpointDir)
+						_ = os.RemoveAll(checkpointDir)
 						return abort(err)
 					}
+
 					preDumpDir = fmt.Sprintf("%03d", preDumpCounter)
 					preDumpCounter++
 				}
 			} else {
-				logger.Debugf("The other side does not support pre-copy")
+				l.Debug("The other side does not support pre-copy")
 			}
 
-			_, err = actionScriptOp.Run()
+			err = actionScriptOp.Start()
 			if err != nil {
-				os.RemoveAll(checkpointDir)
+				_ = os.RemoveAll(checkpointDir)
 				return abort(err)
 			}
 
@@ -659,7 +663,7 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 				// Do the final CRIU dump. This is needs no special handling if
 				// pre-dumps are used or not.
 				dumpSuccess <- s.instance.Migrate(&criuMigrationArgs)
-				os.RemoveAll(checkpointDir)
+				_ = os.RemoveAll(checkpointDir)
 			}()
 
 			select {
@@ -668,11 +672,11 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 				return abort(err)
 			// The dump finished, let's continue on to the restore.
 			case <-dumpDone:
-				logger.Debugf("Dump finished, continuing with restore...")
+				l.Debug("Dump finished, continuing with restore...")
 			}
 		} else {
-			logger.Debugf("The version of liblxc is older than 2.0.4 and the live migration will probably fail")
-			defer os.RemoveAll(checkpointDir)
+			l.Debug("The version of liblxc is older than 2.0.4 and the live migration will probably fail")
+			defer func() { _ = os.RemoveAll(checkpointDir) }()
 			criuMigrationArgs := instance.CriuMigrationArgs{
 				Cmd:          liblxc.MIGRATE_DUMP,
 				StateDir:     checkpointDir,
@@ -694,7 +698,7 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 		// However assuming we're network bound, there's really no reason to do these in.
 		// parallel. In the future when we're using p.haul's protocol, it will make sense
 		// to do these in parallel.
-		ctName, _, _ := shared.InstanceGetParentAndSnapshotName(s.instance.Name())
+		ctName, _, _ := api.GetParentAndSnapshotName(s.instance.Name())
 		err = rsync.Send(ctName, shared.AddSlash(checkpointDir), &shared.WebsocketIO{Conn: s.criuConn}, nil, rsyncFeatures, rsyncBwlimit, state.OS.ExecPath)
 		if err != nil {
 			return abort(err)
@@ -707,6 +711,7 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 		// snapshots as they don't need to have a final sync as not being modified.
 		volSourceArgs.FinalSync = true
 		volSourceArgs.Snapshots = nil
+		volSourceArgs.Info.Config.VolumeSnapshots = nil
 
 		err = pool.MigrateInstance(s.instance, &shared.WebsocketIO{Conn: s.fsConn}, volSourceArgs, migrateOp)
 		if err != nil {
@@ -717,20 +722,19 @@ func (s *migrationSourceWs) Do(state *state.State, migrateOp *operations.Operati
 	msg := migration.MigrationControl{}
 	err = s.recv(&msg)
 	if err != nil {
-		s.disconnect()
-		return err
+		return abort(err)
 	}
 
 	if s.live && s.instance.Type() == instancetype.Container {
 		restoreSuccess <- *msg.Success
 		err := <-dumpSuccess
 		if err != nil {
-			logger.Errorf("Dump failed after successful restore?: %q", err)
+			l.Error("Dump failed after successful restore", logger.Ctx{"err": err})
 		}
 	}
 
 	if !*msg.Success {
-		return fmt.Errorf(*msg.Message)
+		return abort(fmt.Errorf(*msg.Message))
 	}
 
 	return nil
@@ -740,7 +744,7 @@ func newMigrationSink(args *MigrationSinkArgs) (*migrationSink, error) {
 	sink := migrationSink{
 		src:     migrationFields{instance: args.Instance, instanceOnly: args.InstanceOnly},
 		dest:    migrationFields{instanceOnly: args.InstanceOnly},
-		url:     args.Url,
+		url:     args.URL,
 		dialer:  args.Dialer,
 		push:    args.Push,
 		refresh: args.Refresh,
@@ -798,30 +802,32 @@ func newMigrationSink(args *MigrationSinkArgs) (*migrationSink, error) {
 }
 
 func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateOp *operations.Operation) error {
+	l := logger.AddContext(logger.Log, logger.Ctx{"push": c.push, "project": c.src.instance.Project(), "instance": c.src.instance.Name()})
+
 	var err error
 
+	l.Info("Waiting for migration channel connections on target")
+
 	if c.push {
-		logger.Info("Waiting for migration channel connections")
 		select {
 		case <-time.After(time.Second * 10):
-			return fmt.Errorf("Timed out waiting for connections")
+			return fmt.Errorf("Timed out waiting for migration connections")
 		case <-c.allConnected:
 		}
-		logger.Info("Migration channels connected")
 	}
 
-	disconnector := c.src.disconnect
+	var disconnector func()
+
 	if c.push {
 		disconnector = c.dest.disconnect
-	}
-
-	if c.push {
 		defer disconnector()
 	} else {
+		disconnector = c.src.disconnect
 		c.src.controlConn, err = c.connectWithSecret(c.src.controlSecret)
 		if err != nil {
 			return err
 		}
+
 		defer c.src.disconnect()
 
 		c.src.fsConn, err = c.connectWithSecret(c.src.fsSecret)
@@ -838,6 +844,9 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 			}
 		}
 	}
+
+	l.Info("Migration channels connected on target")
+	defer l.Info("Migration channels disconnected on target")
 
 	receiver := c.src.recv
 	if c.push {
@@ -857,6 +866,7 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 	offerHeader := &migration.MigrationHeader{}
 	err = receiver(offerHeader)
 	if err != nil {
+		err = fmt.Errorf("Failed receiving migration offer header: %w", err)
 		controller(err)
 		return err
 	}
@@ -878,10 +888,14 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 	// The function that will be executed to receive the sender's migration data.
 	var myTarget func(conn *websocket.Conn, op *operations.Operation, args MigrationSinkArgs) error
 
-	pool, err := storagePools.GetPoolByInstance(state, c.src.instance)
+	pool, err := storagePools.LoadByInstance(state, c.src.instance)
 	if err != nil {
 		return err
 	}
+
+	// The source/sender will never set Refresh. However, to determine the correct migration type
+	// Refresh needs to be set.
+	offerHeader.Refresh = &c.refresh
 
 	// Extract the source's migration type and then match it against our pool's
 	// supported types and features. If a match is found the combined features list
@@ -895,6 +909,15 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 	// The migration header to be sent back to source with our target options.
 	// Convert response type to response header and copy snapshot info into it.
 	respHeader := migration.TypesToHeader(respTypes...)
+
+	// Respond with our maximum supported header version if the requested version is higher than ours.
+	// Otherwise just return the requested header version to the source.
+	indexHeaderVersion := offerHeader.GetIndexHeaderVersion()
+	if indexHeaderVersion > migration.IndexHeaderVersion {
+		indexHeaderVersion = migration.IndexHeaderVersion
+	}
+
+	respHeader.IndexHeaderVersion = &indexHeaderVersion
 	respHeader.SnapshotNames = offerHeader.SnapshotNames
 	respHeader.Snapshots = offerHeader.Snapshots
 	respHeader.Refresh = &c.refresh
@@ -903,12 +926,14 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 	// with the new storage layer.
 	myTarget = func(conn *websocket.Conn, op *operations.Operation, args MigrationSinkArgs) error {
 		volTargetArgs := migration.VolumeTargetArgs{
-			Name:          args.Instance.Name(),
-			MigrationType: respTypes[0],
-			Refresh:       args.Refresh,    // Indicate to receiver volume should exist.
-			TrackProgress: true,            // Use a progress tracker on receiver to get in-cluster progress information.
-			Live:          args.Live,       // Indicates we will get a final rootfs sync.
-			VolumeSize:    args.VolumeSize, // Block size setting override.
+			IndexHeaderVersion: respHeader.GetIndexHeaderVersion(),
+			Name:               args.Instance.Name(),
+			MigrationType:      respTypes[0],
+			Refresh:            args.Refresh,    // Indicate to receiver volume should exist.
+			TrackProgress:      true,            // Use a progress tracker on receiver to get in-cluster progress information.
+			Live:               args.Live,       // Indicates we will get a final rootfs sync.
+			VolumeSize:         args.VolumeSize, // Block size setting override.
+			VolumeOnly:         args.VolumeOnly,
 		}
 
 		// At this point we have already figured out the parent container's root
@@ -930,7 +955,10 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 			volTargetArgs.Snapshots = make([]string, 0, len(args.Snapshots))
 			for _, snap := range args.Snapshots {
 				volTargetArgs.Snapshots = append(volTargetArgs.Snapshots, *snap.Name)
-				snapArgs := snapshotProtobufToInstanceArgs(args.Instance, snap)
+				snapArgs, err := snapshotProtobufToInstanceArgs(state, args.Instance, snap)
+				if err != nil {
+					return err
+				}
 
 				// Ensure that snapshot and parent container have the same
 				// storage pool in their local root disk device. If the root
@@ -943,30 +971,26 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 					}
 				}
 
-				// Check if snapshot exists already and if not then create
-				// a new snapshot DB record so that the storage layer can
-				// populate the volume on the storage device.
-				_, err := instance.LoadByProjectAndName(state, args.Instance.Project(), snapArgs.Name)
+				// Create the snapshot instance.
+				_, snapInstOp, cleanup, err := instance.CreateInternal(state, *snapArgs, true)
 				if err != nil {
-					// Create the snapshot as it doesn't seem to exist.
-					_, snapInstOp, err := instance.CreateInternal(state, snapArgs, true, nil, revert)
-					if err != nil {
-						return fmt.Errorf("Failed creating instance snapshot record %q: %w", snapArgs.Name, err)
-					}
-					defer snapInstOp.Done(err)
+					return fmt.Errorf("Failed creating instance snapshot record %q: %w", snapArgs.Name, err)
 				}
+
+				revert.Add(cleanup)
+				defer snapInstOp.Done(err)
 			}
 		}
 
 		err = pool.CreateInstanceFromMigration(args.Instance, &shared.WebsocketIO{Conn: conn}, volTargetArgs, op)
 		if err != nil {
-			return err
+			return fmt.Errorf("Failed creating instance on target: %w", err)
 		}
 
 		// Only delete entire instance on error if the pool volume creation has succeeded to avoid
 		// deleting an existing conflicting volume.
 		if !volTargetArgs.Refresh {
-			revert.Add(func() { args.Instance.Delete(true) })
+			revert.Add(func() { _ = args.Instance.Delete(true) })
 		}
 
 		return nil
@@ -1009,7 +1033,7 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 		offerHeader.SnapshotNames = snapshotNames
 	}
 
-	if offerHeader.GetPredump() == true {
+	if offerHeader.GetPredump() {
 		// If the other side wants pre-dump and if this side supports it, let's use it.
 		respHeader.Predump = proto.Bool(true)
 	} else {
@@ -1039,6 +1063,7 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 				Hostid:   int64(*idmapSet.Hostid),
 				Maprange: int64(*idmapSet.Maprange),
 			}
+
 			srcIdmap.Idmap = idmap.Extend(srcIdmap.Idmap, e)
 		}
 
@@ -1053,8 +1078,30 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 			// Legacy: we only sent the snapshot names, so we just copy the container's
 			// config over, same as we used to do.
 			if len(offerHeader.SnapshotNames) != len(offerHeader.Snapshots) {
+				// Convert the instance to an api.InstanceSnapshot.
+
+				profileNames := make([]string, 0, len(c.src.instance.Profiles()))
+				for _, p := range c.src.instance.Profiles() {
+					profileNames = append(profileNames, p.Name)
+				}
+
+				architectureName, _ := osarch.ArchitectureName(c.src.instance.Architecture())
+				apiInstSnap := &api.InstanceSnapshot{
+					InstanceSnapshotPut: api.InstanceSnapshotPut{
+						ExpiresAt: time.Time{},
+					},
+					Architecture: architectureName,
+					CreatedAt:    c.src.instance.CreationDate(),
+					LastUsedAt:   c.src.instance.LastUsedDate(),
+					Config:       c.src.instance.LocalConfig(),
+					Devices:      c.src.instance.LocalDevices().CloneNative(),
+					Ephemeral:    c.src.instance.IsEphemeral(),
+					Stateful:     c.src.instance.IsStateful(),
+					Profiles:     profileNames,
+				}
+
 				for _, name := range offerHeader.SnapshotNames {
-					base := snapshotToProtobuf(c.src.instance)
+					base := snapshotToProtobuf(apiInstSnap)
 					base.Name = &name
 					snapshots = append(snapshots, base)
 				}
@@ -1117,13 +1164,13 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 
 		if live && c.src.instance.Type() == instancetype.Container {
 			var err error
-			imagesDir, err = ioutil.TempDir("", "lxd_restore_")
+			imagesDir, err = os.MkdirTemp("", "lxd_restore_")
 			if err != nil {
 				restore <- err
 				return
 			}
 
-			defer os.RemoveAll(imagesDir)
+			defer func() { _ = os.RemoveAll(imagesDir) }()
 
 			var criuConn *websocket.Conn
 			if c.push {
@@ -1138,16 +1185,17 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 
 			if respHeader.GetPredump() {
 				for !sync.GetFinalPreDump() {
-					logger.Debugf("About to receive rsync")
+					l.Debug("About to receive rsync")
 					// Transfer a CRIU pre-dump.
 					err = rsync.Recv(shared.AddSlash(imagesDir), &shared.WebsocketIO{Conn: criuConn}, nil, rsyncFeatures)
 					if err != nil {
 						restore <- err
 						return
 					}
-					logger.Debugf("Done receiving from rsync")
 
-					logger.Debugf("About to receive header")
+					l.Debug("Done receiving from rsync")
+
+					l.Debug("About to receive header")
 					// Check if this was the last pre-dump.
 					// Only the FinalPreDump element if of interest.
 					mtype, data, err := criuConn.ReadMessage()
@@ -1155,10 +1203,12 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 						restore <- err
 						return
 					}
+
 					if mtype != websocket.BinaryMessage {
 						restore <- err
 						return
 					}
+
 					err = proto.Unmarshal(data, sync)
 					if err != nil {
 						restore <- err
@@ -1214,7 +1264,7 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 		restore <- nil
 	}(c)
 
-	var source <-chan *migration.MigrationControl
+	var source <-chan *migrationControlResponse
 	if c.push {
 		source = c.dest.controlChannel()
 	} else {
@@ -1228,21 +1278,25 @@ func (c *migrationSink) Do(state *state.State, revert *revert.Reverter, migrateO
 				disconnector()
 				return err
 			}
+
 			controller(err)
 			return err
-		case msg, ok := <-source:
-			if !ok {
+		case msg := <-source:
+			if msg.err != nil {
 				disconnector()
-				return fmt.Errorf("Got error reading source")
+
+				return fmt.Errorf("Got error reading migration source: %w", msg.err)
 			}
+
 			if !*msg.Success {
 				disconnector()
+
 				return fmt.Errorf(*msg.Message)
 			}
 
 			// The source can only tell us it failed (e.g. if checkpointing failed).
 			// We have to tell the source whether or not the restore was successful.
-			logger.Debugf("Unknown message %q from source", *msg.Message)
+			logger.Warn("Unknown message from migration source", logger.Ctx{"message": *msg.Message})
 		}
 	}
 }
@@ -1266,7 +1320,7 @@ func migrationCompareSnapshots(sourceSnapshots []*migration.Snapshot, targetSnap
 	}
 
 	for _, snap := range targetSnapshots {
-		_, snapName, _ := shared.InstanceGetParentAndSnapshotName(snap.Name())
+		_, snapName, _ := api.GetParentAndSnapshotName(snap.Name())
 
 		targetSnapshotsTime[snapName] = snap.CreationDate().Unix()
 		existDate, exists := sourceSnapshotsTime[snapName]

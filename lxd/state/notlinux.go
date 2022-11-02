@@ -1,5 +1,4 @@
 //go:build !linux || !cgo || agent
-// +build !linux !cgo agent
 
 package state
 
@@ -11,6 +10,7 @@ import (
 
 // State here is just an empty shim to statisfy dependencies.
 type State struct {
-	Events  *events.Server
-	Context context.Context
+	Events      *events.Server
+	ShutdownCtx context.Context
+	ServerName  string
 }

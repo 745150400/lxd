@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -13,10 +15,12 @@ import (
 
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	dbCluster "github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/lxd/filter"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
+	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/rbac"
 	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/shared"
@@ -38,6 +42,7 @@ func urlInstanceTypeDetect(r *http.Request) (instancetype.Type, error) {
 		if err != nil {
 			return instancetype.Any, err
 		}
+
 		return instanceType, nil
 	}
 
@@ -218,6 +223,7 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 		if err == nil {
 			return response.SyncResponse(true, result)
 		}
+
 		if !query.IsRetriableError(err) {
 			logger.Debugf("DBERR: containersGet: error %q", err)
 			return response.SmartError(err)
@@ -232,7 +238,7 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 	return response.InternalError(fmt.Errorf("DB is locked"))
 }
 
-func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
+func doInstancesGet(d *Daemon, r *http.Request) (any, error) {
 	resultString := []string{}
 	resultList := []*api.Instance{}
 	resultFullList := []*api.InstanceFull{}
@@ -261,21 +267,25 @@ func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
 		}
 	}
 
-	// Parse the project field
-	projectName := projectParam(r)
+	// Detect project mode.
+	projectName := queryParam(r, "project")
+	allProjects := shared.IsTrue(r.FormValue("all-projects"))
 
-	// Parse all-projects field
-	allProjects := r.FormValue("all-projects")
+	if allProjects && projectName != "" {
+		return nil, api.StatusErrorf(http.StatusBadRequest, "Cannot specify a project when requesting all projects")
+	} else if !allProjects && projectName == "" {
+		projectName = project.Default
+	}
 
 	// Get the list and location of all containers
 	var nodesProjectsInstances map[string][][2]string  // Projects & Instances by node address
 	var projectInstanceToNodeName map[[2]string]string // Node names by Project & Instance
 	filteredProjects := []string{}
-	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+	err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
-		if allProjects == "true" {
-			projects, err := tx.GetProjects(db.ProjectFilter{})
+		if allProjects {
+			projects, err := dbCluster.GetProjects(context.Background(), tx.Tx())
 			if err != nil {
 				return err
 			}
@@ -291,12 +301,12 @@ func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
 			filteredProjects = []string{projectName}
 		}
 
-		nodesProjectsInstances, err = tx.GetProjectAndInstanceNamesByNodeAddress(filteredProjects, db.InstanceTypeFilter(instanceType))
+		nodesProjectsInstances, err = tx.GetProjectAndInstanceNamesByNodeAddress(ctx, filteredProjects, instanceType)
 		if err != nil {
 			return err
 		}
 
-		projectInstanceToNodeName, err = tx.GetProjectInstanceToNodeMap(filteredProjects, db.InstanceTypeFilter(instanceType))
+		projectInstanceToNodeName, err = tx.GetProjectInstanceToNodeMap(ctx, filteredProjects, instanceType)
 		if err != nil {
 			return err
 		}
@@ -318,7 +328,7 @@ func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
 			}
 
 			for _, inst := range insts {
-				nodeInstances[[2]string{inst.Project(), inst.Name()}] = inst
+				nodeInstances[[2]string{inst.Project().Name, inst.Name()}] = inst
 			}
 		}
 	}
@@ -349,6 +359,7 @@ func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
 				Project:    projectInstance[0],
 			}}
 		}
+
 		resultMu.Lock()
 		resultFullList = append(resultFullList, &c)
 		resultMu.Unlock()
@@ -418,6 +429,7 @@ func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
 
 			continue
 		}
+
 		if !mustLoadObjects {
 			for _, projectInstance := range projectsInstances {
 				instancePath := "instances"
@@ -426,6 +438,7 @@ func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
 				} else if strings.HasPrefix(mux.CurrentRoute(r).GetName(), "vm") {
 					instancePath = "virtual-machines"
 				}
+
 				url := api.NewURL().Path(version.APIVersion, instancePath, projectInstance[1]).Project(projectInstance[0])
 				resultString = append(resultString, url.String())
 			}
@@ -435,6 +448,7 @@ func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
 				threads = len(projectsInstances)
 			}
 
+			hostInterfaces, _ := net.Interfaces()
 			queue := make(chan [2]string, threads)
 
 			for i := 0; i < threads; i++ {
@@ -463,8 +477,9 @@ func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
 							continue
 						}
 
-						c, _, err := inst.RenderFull()
+						c, _, err := inst.RenderFull(hostInterfaces)
 						if err != nil {
+							logger.Error("Unable to list instance", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "err": err})
 							resultFullListAppend(projectInstance, api.InstanceFull{}, err)
 						} else {
 							resultFullListAppend(projectInstance, *c, err)
@@ -493,6 +508,7 @@ func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
 				} else if strings.HasPrefix(mux.CurrentRoute(r).GetName(), "vm") {
 					instancePath = "virtual-machines"
 				}
+
 				url := api.NewURL().Path(version.APIVersion, instancePath, container.Name).Project(container.Project)
 				resultString = append(resultString, url.String())
 			}
@@ -502,53 +518,55 @@ func doInstancesGet(d *Daemon, r *http.Request) (interface{}, error) {
 
 	if recursion == 1 {
 		// Sort the result list by name.
-		sort.Slice(resultList, func(i, j int) bool {
+		sort.SliceStable(resultList, func(i, j int) bool {
 			return resultList[i].Name < resultList[j].Name
 		})
+
 		if clauses != nil {
 			resultList = instance.Filter(resultList, clauses)
 		}
+
 		return resultList, nil
 	}
 
 	// Sort the result list by name.
-	sort.Slice(resultFullList, func(i, j int) bool {
+	sort.SliceStable(resultFullList, func(i, j int) bool {
 		return resultFullList[i].Name < resultFullList[j].Name
 	})
 
 	if clauses != nil {
 		resultFullList = instance.FilterFull(resultFullList, clauses)
 	}
+
 	return resultFullList, nil
 }
 
 // Fetch information about the containers on the given remote node, using the
 // rest API and with a timeout of 30 seconds.
-func doContainersGetFromNode(projects []string, node, allProjects string, networkCert *shared.CertInfo, serverCert *shared.CertInfo, r *http.Request, instanceType instancetype.Type) ([]api.Instance, error) {
+func doContainersGetFromNode(projects []string, node string, allProjects bool, networkCert *shared.CertInfo, serverCert *shared.CertInfo, r *http.Request, instanceType instancetype.Type) ([]api.Instance, error) {
 	f := func() ([]api.Instance, error) {
 		client, err := cluster.Connect(node, networkCert, serverCert, r, true)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to connect to node %s: %w", node, err)
+			return nil, fmt.Errorf("Failed to connect to member %s: %w", node, err)
 		}
 
 		var containers []api.Instance
-		if allProjects == "true" {
+		if allProjects {
 			containers, err = client.GetInstancesAllProjects(api.InstanceType(instanceType.String()))
 			if err != nil {
-				return nil, fmt.Errorf("Failed to get instances from node %s: %w", node, err)
+				return nil, fmt.Errorf("Failed to get instances from member %s: %w", node, err)
 			}
-
 		} else {
 			for _, project := range projects {
 				client = client.UseProject(project)
 
 				tmpContainers, err := client.GetInstances(api.InstanceType(instanceType.String()))
 				if err != nil {
-					return nil, fmt.Errorf("Failed to get instances from node %s: %w", node, err)
+					return nil, fmt.Errorf("Failed to get instances from member %s: %w", node, err)
 				}
+
 				containers = append(containers, tmpContainers...)
 			}
-
 		}
 
 		return containers, nil
@@ -567,25 +585,25 @@ func doContainersGetFromNode(projects []string, node, allProjects string, networ
 
 	select {
 	case <-timeout:
-		err = fmt.Errorf("Timeout getting instances from node %s", node)
+		err = fmt.Errorf("Timeout getting instances from member %s", node)
 	case <-done:
 	}
 
 	return containers, err
 }
 
-func doContainersFullGetFromNode(projects []string, node, allProjects string, networkCert *shared.CertInfo, serverCert *shared.CertInfo, r *http.Request, instanceType instancetype.Type) ([]api.InstanceFull, error) {
+func doContainersFullGetFromNode(projects []string, node string, allProjects bool, networkCert *shared.CertInfo, serverCert *shared.CertInfo, r *http.Request, instanceType instancetype.Type) ([]api.InstanceFull, error) {
 	f := func() ([]api.InstanceFull, error) {
 		client, err := cluster.Connect(node, networkCert, serverCert, r, true)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to connect to node %s: %w", node, err)
+			return nil, fmt.Errorf("Failed to connect to member %s: %w", node, err)
 		}
 
 		var instances []api.InstanceFull
-		if allProjects == "true" {
+		if allProjects {
 			instances, err = client.GetInstancesFullAllProjects(api.InstanceType(instanceType.String()))
 			if err != nil {
-				return nil, fmt.Errorf("Failed to get instances from node %s: %w", node, err)
+				return nil, fmt.Errorf("Failed to get instances from member %s: %w", node, err)
 			}
 		} else {
 			for _, project := range projects {
@@ -593,7 +611,7 @@ func doContainersFullGetFromNode(projects []string, node, allProjects string, ne
 
 				tmpInstances, err := client.GetInstancesFull(api.InstanceType(instanceType.String()))
 				if err != nil {
-					return nil, fmt.Errorf("Failed to get instances from node %s: %w", node, err)
+					return nil, fmt.Errorf("Failed to get instances from member %s: %w", node, err)
 				}
 
 				instances = append(instances, tmpInstances...)
@@ -616,7 +634,7 @@ func doContainersFullGetFromNode(projects []string, node, allProjects string, ne
 
 	select {
 	case <-timeout:
-		err = fmt.Errorf("Timeout getting instances from node %s", node)
+		err = fmt.Errorf("Timeout getting instances from member %s", node)
 	case <-done:
 	}
 

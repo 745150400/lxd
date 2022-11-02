@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package subprocess
 
@@ -7,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
@@ -18,7 +16,7 @@ import (
 	"github.com/lxc/lxd/shared"
 )
 
-// Process struct. Has ability to set runtime arguments
+// Process struct. Has ability to set runtime arguments.
 type Process struct {
 	exitCode int64 `yaml:"-"`
 	exitErr  error `yaml:"-"`
@@ -38,6 +36,8 @@ type Process struct {
 	UID       uint32 `yaml:"uid"`
 	GID       uint32 `yaml:"gid"`
 	SetGroups bool   `yaml:"set_groups"`
+
+	SysProcAttr *syscall.SysProcAttr
 }
 
 func (p *Process) hasApparmor() bool {
@@ -53,7 +53,7 @@ func (p *Process) hasApparmor() bool {
 	return true
 }
 
-// GetPid returns the pid for the given process object
+// GetPid returns the pid for the given process object.
 func (p *Process) GetPid() (int64, error) {
 	pr, _ := os.FindProcess(int(p.PID))
 	err := pr.Signal(syscall.Signal(0))
@@ -75,7 +75,7 @@ func (p *Process) SetCreds(uid uint32, gid uint32) {
 	p.GID = gid
 }
 
-// Stop will stop the given process object
+// Stop will stop the given process object.
 func (p *Process) Stop() error {
 	pr, _ := os.FindProcess(int(p.PID))
 
@@ -104,28 +104,33 @@ func (p *Process) Stop() error {
 	return fmt.Errorf("Could not kill process: %w", err)
 }
 
-// Start will start the given process object
-func (p *Process) Start() error {
-	return p.start(nil)
+// Start will start the given process object.
+func (p *Process) Start(ctx context.Context) error {
+	return p.start(ctx, nil)
 }
 
-// StartWithFiles will start the given process object with extra file descriptors
-func (p *Process) StartWithFiles(fds []*os.File) error {
-	return p.start(fds)
+// StartWithFiles will start the given process object with extra file descriptors.
+func (p *Process) StartWithFiles(ctx context.Context, fds []*os.File) error {
+	return p.start(ctx, fds)
 }
 
-func (p *Process) start(fds []*os.File) error {
+func (p *Process) start(ctx context.Context, fds []*os.File) error {
 	var cmd *exec.Cmd
 
 	if p.Apparmor != "" && p.hasApparmor() {
-		cmd = exec.Command("aa-exec", append([]string{"-p", p.Apparmor, p.Name}, p.Args...)...)
+		cmd = exec.CommandContext(ctx, "aa-exec", append([]string{"-p", p.Apparmor, p.Name}, p.Args...)...)
 	} else {
-		cmd = exec.Command(p.Name, p.Args...)
+		cmd = exec.CommandContext(ctx, p.Name, p.Args...)
 	}
+
 	cmd.Stdout = p.Stdout
 	cmd.Stderr = p.Stderr
 	cmd.Stdin = p.Stdin
-	cmd.SysProcAttr = &syscall.SysProcAttr{}
+	cmd.SysProcAttr = p.SysProcAttr
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+
 	cmd.SysProcAttr.Setsid = true
 
 	if p.UID != 0 || p.GID != 0 {
@@ -139,11 +144,11 @@ func (p *Process) start(fds []*os.File) error {
 	}
 
 	if p.Stdout != nil && p.closeFds {
-		defer p.Stdout.Close()
+		defer func() { _ = p.Stdout.Close() }()
 	}
 
 	if p.Stderr != nil && p.Stderr != p.Stdout && p.closeFds {
-		defer p.Stderr.Close()
+		defer func() { _ = p.Stderr.Close() }()
 	}
 
 	// Start the process.
@@ -182,14 +187,14 @@ func (p *Process) start(fds []*os.File) error {
 	return nil
 }
 
-// Restart stop and starts the given process object
-func (p *Process) Restart() error {
+// Restart stop and starts the given process object.
+func (p *Process) Restart(ctx context.Context) error {
 	err := p.Stop()
 	if err != nil {
 		return fmt.Errorf("Unable to stop process: %w", err)
 	}
 
-	err = p.Start()
+	err = p.Start(ctx)
 	if err != nil {
 		return fmt.Errorf("Unable to start process: %w", err)
 	}
@@ -197,7 +202,7 @@ func (p *Process) Restart() error {
 	return nil
 }
 
-// Reload sends the SIGHUP signal to the given process object
+// Reload sends the SIGHUP signal to the given process object.
 func (p *Process) Reload() error {
 	pr, _ := os.FindProcess(int(p.PID))
 	err := pr.Signal(syscall.Signal(0))
@@ -206,6 +211,7 @@ func (p *Process) Reload() error {
 		if err != nil {
 			return fmt.Errorf("Could not reload process: %w", err)
 		}
+
 		return nil
 	} else if strings.Contains(err.Error(), "process already finished") {
 		return ErrNotRunning
@@ -221,7 +227,7 @@ func (p *Process) Save(path string) error {
 		return fmt.Errorf("Unable to serialize process struct to YAML: %w", err)
 	}
 
-	err = ioutil.WriteFile(path, dat, 0644)
+	err = os.WriteFile(path, dat, 0644)
 	if err != nil {
 		return fmt.Errorf("Unable to write to file '%s': %w", path, err)
 	}
@@ -229,7 +235,7 @@ func (p *Process) Save(path string) error {
 	return nil
 }
 
-// Signal will send a signal to the given process object given a signal value
+// Signal will send a signal to the given process object given a signal value.
 func (p *Process) Signal(signal int64) error {
 	pr, _ := os.FindProcess(int(p.PID))
 	err := pr.Signal(syscall.Signal(0))
@@ -238,6 +244,7 @@ func (p *Process) Signal(signal int64) error {
 		if err != nil {
 			return fmt.Errorf("Could not signal process: %w", err)
 		}
+
 		return nil
 	} else if strings.Contains(err.Error(), "process already finished") {
 		return ErrNotRunning
@@ -246,7 +253,7 @@ func (p *Process) Signal(signal int64) error {
 	return fmt.Errorf("Could not signal process: %w", err)
 }
 
-// Wait will wait for the given process object exit code
+// Wait will wait for the given process object exit code.
 func (p *Process) Wait(ctx context.Context) (int64, error) {
 	if !p.hasMonitor {
 		return -1, fmt.Errorf("Unable to wait on process we didn't spawn")

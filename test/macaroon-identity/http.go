@@ -29,6 +29,7 @@ func (s *httpService) Start(background bool) error {
 	if err != nil {
 		return err
 	}
+
 	s.listener = listener
 	if s.Name != "" {
 		s.Logger.Printf("%s - running at %s", s.Name, s.Endpoint())
@@ -51,7 +52,7 @@ func (s *httpService) LogRequest(req *http.Request) {
 	s.Logger.Printf("%s - %s %s", s.Name, req.Method, req.URL.Path)
 }
 
-// Fail returns an HTTP error with the specified message
-func (s *httpService) Fail(w http.ResponseWriter, code int, msg string, args ...interface{}) {
+// Fail returns an HTTP error with the specified message.
+func (s *httpService) Fail(w http.ResponseWriter, code int, msg string, args ...any) {
 	http.Error(w, fmt.Sprintf(msg, args...), code)
 }

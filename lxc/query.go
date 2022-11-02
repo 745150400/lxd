@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strings"
@@ -46,7 +45,7 @@ func (c *cmdQuery) Command() *cobra.Command {
 	return cmd
 }
 
-func (c *cmdQuery) pretty(input interface{}) string {
+func (c *cmdQuery) pretty(input any) string {
 	pretty := bytes.NewBufferString("")
 	enc := json.NewEncoder(pretty)
 	enc.SetEscapeHTML(false)
@@ -90,7 +89,7 @@ func (c *cmdQuery) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Guess the encoding of the input
-	var data interface{}
+	var data any
 	err = json.Unmarshal([]byte(c.flagData), &data)
 	if err != nil {
 		data = c.flagData
@@ -131,7 +130,7 @@ func (c *cmdQuery) Run(cmd *cobra.Command, args []string) error {
 			return cleanErr
 		}
 
-		content, err := ioutil.ReadAll(resp.Body)
+		content, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return err
 		}
@@ -162,7 +161,7 @@ func (c *cmdQuery) Run(cmd *cobra.Command, args []string) error {
 	if c.flagRespRaw {
 		fmt.Println(c.pretty(resp))
 	} else if resp.Metadata != nil && string(resp.Metadata) != "{}" {
-		var content interface{}
+		var content any
 		err := json.Unmarshal(resp.Metadata, &content)
 		if err != nil {
 			return err

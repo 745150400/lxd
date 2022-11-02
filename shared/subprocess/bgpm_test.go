@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package subprocess
 
@@ -22,7 +21,7 @@ func TestSignalHandling(t *testing.T) {
 		t.Error("Failed process creation: ", err)
 	}
 
-	err = p.Start()
+	err = p.Start(context.Background())
 	if err != nil {
 		t.Error("Failed to start process ", err)
 	}
@@ -50,7 +49,8 @@ func TestSignalHandling(t *testing.T) {
 	if err != nil {
 		t.Error("Could not open file ", err)
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	var text = make([]byte, 1024)
 	for {
@@ -80,7 +80,7 @@ func TestSignalHandling(t *testing.T) {
 	}
 }
 
-//tests newprocess, start, stop, save, import, restart, wait
+// tests newprocess, start, stop, save, import, restart, wait.
 func TestStopRestart(t *testing.T) {
 	var a []string
 	a = append(a, "testscript/stoprestart.sh")
@@ -90,7 +90,7 @@ func TestStopRestart(t *testing.T) {
 		t.Error("Failed process creation: ", err)
 	}
 
-	err = p.Start()
+	err = p.Start(context.Background())
 	if err != nil {
 		t.Error("Failed to start process: ", err)
 	}
@@ -110,12 +110,12 @@ func TestStopRestart(t *testing.T) {
 		t.Error("Failed to import process: ", err)
 	}
 
-	err = p.Start()
+	err = p.Start(context.Background())
 	if err != nil {
 		t.Error("Failed to start process: ", err)
 	}
 
-	err = p.Restart()
+	err = p.Restart(context.Background())
 	if err != nil {
 		t.Error("Failed to restart process: ", err)
 	}
@@ -144,7 +144,7 @@ func TestProcessStartWaitExit(t *testing.T) {
 		t.Error("Failed process creation: ", err)
 	}
 
-	err = p.Start()
+	err = p.Start(context.Background())
 	if err != nil {
 		t.Error("Failed to start process: ", err)
 	}
@@ -160,7 +160,8 @@ func TestProcessStartWaitExit(t *testing.T) {
 	if err != nil {
 		t.Error("Could not open file: ", err)
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	exp = "hello again\nwaiting now\n"
 	// Read file, line by line

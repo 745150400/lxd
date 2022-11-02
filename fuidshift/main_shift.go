@@ -56,9 +56,10 @@ func (c *cmdShift) Run(cmd *cobra.Command, args []string) error {
 
 	// Handle mandatory arguments
 	if len(args) < 2 {
-		cmd.Help()
+		_ = cmd.Help()
 		return fmt.Errorf("Missing required arguments")
 	}
+
 	directory := args[0]
 
 	// Parse the maps

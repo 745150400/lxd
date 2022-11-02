@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"strings"
 
@@ -22,6 +22,7 @@ type cmdInit struct {
 	global *cmdGlobal
 
 	flagConfig     []string
+	flagDevice     []string
 	flagEphemeral  bool
 	flagNetwork    string
 	flagProfile    []string
@@ -35,18 +36,19 @@ type cmdInit struct {
 
 func (c *cmdInit) Command() *cobra.Command {
 	cmd := &cobra.Command{}
-	cmd.Use = usage("init", i18n.G("[[<remote>:]<image>] [<remote>:][<name>] [< config"))
+	cmd.Use = usage("init", i18n.G("[<remote>:]<image> [<remote>:][<name>]"))
 	cmd.Short = i18n.G("Create instances from images")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(`Create instances from images`))
-	cmd.Example = cli.FormatSection("", i18n.G(`lxc init ubuntu:20.04 u1
+	cmd.Example = cli.FormatSection("", i18n.G(`lxc init ubuntu:22.04 u1
 
-lxc init ubuntu:20.04 u1 < config.yaml
+lxc init ubuntu:22.04 u1 < config.yaml
     Create the instance with configuration from config.yaml`))
 	cmd.Hidden = true
 
 	cmd.RunE = c.Run
 	cmd.Flags().StringArrayVarP(&c.flagConfig, "config", "c", nil, i18n.G("Config key/value to apply to the new instance")+"``")
 	cmd.Flags().StringArrayVarP(&c.flagProfile, "profile", "p", nil, i18n.G("Profile to apply to the new instance")+"``")
+	cmd.Flags().StringArrayVarP(&c.flagDevice, "device", "d", nil, i18n.G("New key/value to apply to a specific device")+"``")
 	cmd.Flags().BoolVarP(&c.flagEphemeral, "ephemeral", "e", false, i18n.G("Ephemeral instance"))
 	cmd.Flags().StringVarP(&c.flagNetwork, "network", "n", "", i18n.G("Network name")+"``")
 	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", i18n.G("Storage pool name")+"``")
@@ -67,7 +69,7 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(args) == 0 && !c.flagEmpty {
-		cmd.Usage()
+		_ = cmd.Usage()
 		return nil
 	}
 
@@ -88,7 +90,7 @@ func (c *cmdInit) create(conf *config.Config, args []string) (lxd.InstanceServer
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return nil, "", err
 		}
@@ -202,6 +204,7 @@ func (c *cmdInit) create(conf *config.Config, args []string) (lxd.InstanceServer
 	} else {
 		configMap = map[string]string{}
 	}
+
 	for _, entry := range c.flagConfig {
 		if !strings.Contains(entry, "=") {
 			return nil, "", fmt.Errorf(i18n.G("Bad key=value pair: %s"), entry)
@@ -237,8 +240,9 @@ func (c *cmdInit) create(conf *config.Config, args []string) (lxd.InstanceServer
 		InstanceType: c.flagType,
 		Type:         instanceDBType,
 	}
+
 	req.Config = configMap
-	req.Devices = devicesMap
+	req.Ephemeral = c.flagEphemeral
 
 	if !c.flagNoProfiles && len(profiles) == 0 {
 		if len(stdinData.Profiles) > 0 {
@@ -249,7 +253,49 @@ func (c *cmdInit) create(conf *config.Config, args []string) (lxd.InstanceServer
 	} else {
 		req.Profiles = profiles
 	}
-	req.Ephemeral = c.flagEphemeral
+
+	if c.flagDevice != nil {
+		deviceOverrides, err := parseDeviceOverrides(c.flagDevice)
+		if err != nil {
+			return nil, "", err
+		}
+
+		// Get a list of profiles that will be applied server-side. If the list of profiles is empty we will apply the
+		// default profile on the server side.
+		serverSideProfiles := req.Profiles
+		if len(serverSideProfiles) == 0 {
+			serverSideProfiles = []string{"default"}
+		}
+
+		// Get the effective expanded devices by querying for each profile.
+		profileDevices := make(map[string]map[string]string)
+		for _, profileName := range serverSideProfiles {
+			profile, _, err := d.GetProfile(profileName)
+			if err != nil {
+				return nil, "", fmt.Errorf(i18n.G("Cannot override devices: %w"), err)
+			}
+
+			for k, v := range profile.Devices {
+				profileDevices[k] = v
+			}
+		}
+
+		// Override profile devices by adding instance devices containing the profile device with the overridden config.
+		for deviceName, deviceConfig := range deviceOverrides {
+			profileDeviceConfig, ok := profileDevices[deviceName]
+			if !ok {
+				return nil, "", fmt.Errorf(i18n.G("Cannot override config for device %q: Device not found in profile devices"), deviceName)
+			}
+
+			for k, v := range deviceConfig {
+				profileDeviceConfig[k] = v
+			}
+
+			devicesMap[deviceName] = profileDeviceConfig
+		}
+	}
+
+	req.Devices = devicesMap
 
 	var opInfo api.Operation
 	if !c.flagEmpty {
@@ -323,6 +369,7 @@ func (c *cmdInit) create(conf *config.Config, args []string) (lxd.InstanceServer
 			progress.Done("")
 			return nil, "", err
 		}
+
 		progress.Done("")
 
 		// Extract the instance name

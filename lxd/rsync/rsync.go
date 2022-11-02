@@ -3,7 +3,6 @@ package rsync
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
@@ -67,13 +66,14 @@ func LocalCopy(source string, dest string, bwlimit string, xattrs bool, rsyncArg
 	if err != nil {
 		runError, ok := err.(shared.RunError)
 		if ok {
-			exitError, ok := runError.Err.(*exec.ExitError)
+			exitError, ok := runError.Unwrap().(*exec.ExitError)
 			if ok {
 				if exitError.ExitCode() == 24 {
 					return msg, nil
 				}
 			}
 		}
+
 		return msg, err
 	}
 
@@ -101,11 +101,13 @@ func sendSetup(name string, path string, bwlimit string, execPath string, featur
 	if len(auds) > shared.ABSTRACT_UNIX_SOCK_LEN-1 {
 		auds = auds[:shared.ABSTRACT_UNIX_SOCK_LEN-1]
 	}
+
 	l, err := net.Listen("unix", auds)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	defer l.Close()
+
+	defer func() { _ = l.Close() }()
 
 	/*
 	 * Here, the path /tmp/foo is ignored. Since we specify localhost,
@@ -132,7 +134,7 @@ func sendSetup(name string, path string, bwlimit string, execPath string, featur
 		args = append(args, "--bwlimit", bwlimit)
 	}
 
-	if features != nil && len(features) > 0 {
+	if len(features) > 0 {
 		args = append(args, rsyncFeatureArgs(features)...)
 	}
 
@@ -153,7 +155,8 @@ func sendSetup(name string, path string, bwlimit string, execPath string, featur
 		return nil, nil, nil, err
 	}
 
-	if err := cmd.Start(); err != nil {
+	err = cmd.Start()
+	if err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -173,16 +176,16 @@ func sendSetup(name string, path string, bwlimit string, execPath string, featur
 	select {
 	case conn = <-chConn:
 		if conn == nil {
-			output, _ := ioutil.ReadAll(stderr)
-			cmd.Process.Kill()
-			cmd.Wait()
+			output, _ := io.ReadAll(stderr)
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
 			return nil, nil, nil, fmt.Errorf("Failed to connect to rsync socket (%s)", string(output))
 		}
 
 	case <-time.After(10 * time.Second):
-		output, _ := ioutil.ReadAll(stderr)
-		cmd.Process.Kill()
-		cmd.Wait()
+		output, _ := io.ReadAll(stderr)
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return nil, nil, nil, fmt.Errorf("rsync failed to spawn after 10s (%s)", string(output))
 	}
 
@@ -211,9 +214,9 @@ func Send(name string, path string, conn io.ReadWriteCloser, tracker *ioprogress
 	go func() {
 		_, err := io.Copy(conn, readNetcatPipe)
 		chCopyNetcat <- err
-		readNetcatPipe.Close()
-		netcatConn.Close()
-		conn.Close() // sends barrier message.
+		_ = readNetcatPipe.Close()
+		_ = netcatConn.Close()
+		_ = conn.Close() // sends barrier message.
 	}()
 
 	// Forward from target to netcat.
@@ -222,13 +225,13 @@ func Send(name string, path string, conn io.ReadWriteCloser, tracker *ioprogress
 	go func() {
 		_, err := io.Copy(writeNetcatPipe, conn)
 		chCopyTarget <- err
-		writeNetcatPipe.Close()
+		_ = writeNetcatPipe.Close()
 	}()
 
 	// Wait for rsync to complete.
-	output, err := ioutil.ReadAll(stderr)
+	output, err := io.ReadAll(stderr)
 	if err != nil {
-		cmd.Process.Kill()
+		_ = cmd.Process.Kill()
 		logger.Errorf("Rsync stderr read failed: %s: %v", path, err)
 	}
 
@@ -270,7 +273,7 @@ func Recv(path string, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTrac
 		"--sparse",
 	}
 
-	if features != nil && len(features) > 0 {
+	if len(features) > 0 {
 		args = append(args, rsyncFeatureArgs(features)...)
 	}
 
@@ -287,8 +290,8 @@ func Recv(path string, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTrac
 	chCopyRsync := make(chan error, 1)
 	go func() {
 		_, err := io.Copy(conn, stdout)
-		stdout.Close()
-		conn.Close() // sends barrier message.
+		_ = stdout.Close()
+		_ = conn.Close() // sends barrier message.
 		chCopyRsync <- err
 	}()
 
@@ -309,13 +312,13 @@ func Recv(path string, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTrac
 	chCopySource := make(chan error, 1)
 	go func() {
 		_, err := io.Copy(stdin, readSourcePipe)
-		stdin.Close()
+		_ = stdin.Close()
 		chCopySource <- err
 	}()
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		cmd.Process.Kill()
+		_ = cmd.Process.Kill()
 		logger.Errorf("Rsync stderr read failed: %s: %v", path, err)
 	}
 
@@ -324,7 +327,7 @@ func Recv(path string, conn io.ReadWriteCloser, tracker *ioprogress.ProgressTrac
 		return err
 	}
 
-	output, err := ioutil.ReadAll(stderr)
+	output, err := io.ReadAll(stderr)
 	if err != nil {
 		logger.Errorf("Rsync stderr read failed: %s: %v", path, err)
 	}

@@ -4,10 +4,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
+	"os"
 	"path/filepath"
-	"sync/atomic"
 
 	log "github.com/sirupsen/logrus"
 
@@ -17,51 +16,51 @@ import (
 
 func tlsConfig(uid uint32) (*tls.Config, error) {
 	// Load the client certificate.
-	content, err := ioutil.ReadFile(filepath.Join("users", fmt.Sprintf("%d", uid), "client.crt"))
+	content, err := os.ReadFile(filepath.Join("users", fmt.Sprintf("%d", uid), "client.crt"))
 	if err != nil {
 		return nil, fmt.Errorf("Unable to open client certificate: %w", err)
 	}
+
 	tlsClientCert := string(content)
 
 	// Load the client key.
-	content, err = ioutil.ReadFile(filepath.Join("users", fmt.Sprintf("%d", uid), "client.key"))
+	content, err = os.ReadFile(filepath.Join("users", fmt.Sprintf("%d", uid), "client.key"))
 	if err != nil {
 		return nil, fmt.Errorf("Unable to open client key: %w", err)
 	}
+
 	tlsClientKey := string(content)
 
 	// Load the server certificate.
-	content, err = ioutil.ReadFile(shared.VarPath("server.crt"))
+	certPath := shared.VarPath("cluster.crt")
+	if !shared.PathExists(certPath) {
+		certPath = shared.VarPath("server.crt")
+	}
+
+	content, err = os.ReadFile(certPath)
 	if err != nil {
 		return nil, fmt.Errorf("Unable to open server certificate: %w", err)
 	}
+
 	tlsServerCert := string(content)
 
 	return shared.GetTLSConfigMem(tlsClientCert, tlsClientKey, "", tlsServerCert, false)
 }
 
 func proxyConnection(conn *net.UnixConn) {
-	// Setup connection counter.
-	for {
-		count := atomic.LoadInt64(&connections)
-		if count == -1 {
-			return
-		}
-
-		// Ideally we'd loop here but we can't because go's cmpxchg
-		// strangely doesn't return the old value it rather returns a
-		// bool preventing such patterns as the one we use here.
-		if atomic.CompareAndSwapInt64(&connections, count, count+1) {
-			break
-		}
-	}
-
 	defer func() {
-		atomic.AddInt64(&connections, -1)
+		_ = conn.Close()
+
+		mu.Lock()
+		connections -= 1
+		mu.Unlock()
 	}()
 
-	// Close on exit.
-	defer conn.Close()
+	// Increase counters.
+	mu.Lock()
+	transactions += 1
+	connections += 1
+	mu.Unlock()
 
 	// Get credentials.
 	creds, err := ucred.GetCred(conn)
@@ -102,7 +101,8 @@ func proxyConnection(conn *net.UnixConn) {
 		log.Errorf("Unable to connect to target server: %v", err)
 		return
 	}
-	defer client.Close()
+
+	defer func() { _ = client.Close() }()
 
 	// Get the TLS configuration
 	tlsConfig, err := tlsConfig(creds.Uid)
@@ -123,12 +123,12 @@ func proxyConnection(conn *net.UnixConn) {
 	// Establish the TLS handshake.
 	err = tlsClient.Handshake()
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		log.Errorf("Failed TLS handshake with target server: %v", err)
 		return
 	}
 
 	// Start proxying.
-	go io.Copy(conn, tlsClient)
-	io.Copy(tlsClient, conn)
+	go func() { _, _ = io.Copy(conn, tlsClient) }()
+	_, _ = io.Copy(tlsClient, conn)
 }

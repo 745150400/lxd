@@ -1,15 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/lxd/backup"
+	backupConfig "github.com/lxc/lxd/lxd/backup/config"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	dbCluster "github.com/lxc/lxd/lxd/db/cluster"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
@@ -70,27 +71,32 @@ type internalRecoverImportPost struct {
 // internalRecoverScan provides the discovery and import functionality for both recovery validate and import steps.
 func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOnly bool) response.Response {
 	var err error
-	var projects map[string]*db.Project
+	var projects map[string]*api.Project
 	var projectProfiles map[string][]*api.Profile
 	var projectNetworks map[string]map[int64]api.Network
 
 	// Retrieve all project, profile and network info in a single transaction so we can use it for all
 	// imported instances and volumes, and avoid repeatedly querying the same information.
-	err = d.State().Cluster.Transaction(func(tx *db.ClusterTx) error {
+	err = d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		// Load list of projects for validation.
-		ps, err := tx.GetProjects(db.ProjectFilter{})
+		ps, err := dbCluster.GetProjects(ctx, tx.Tx())
 		if err != nil {
 			return err
 		}
 
 		// Convert to map for lookups by name later.
-		projects = make(map[string]*db.Project, len(ps))
+		projects = make(map[string]*api.Project, len(ps))
 		for i := range ps {
-			projects[ps[i].Name] = &ps[i]
+			project, err := ps[i].ToAPI(ctx, tx.Tx())
+			if err != nil {
+				return err
+			}
+
+			projects[ps[i].Name] = project
 		}
 
 		// Load list of project/profile names for validation.
-		profiles, err := tx.GetProfiles(db.ProfileFilter{})
+		profiles, err := dbCluster.GetProfiles(ctx, tx.Tx())
 		if err != nil {
 			return err
 		}
@@ -99,14 +105,19 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 		projectProfiles = make(map[string][]*api.Profile)
 		for _, profile := range profiles {
 			if projectProfiles[profile.Project] == nil {
-				projectProfiles[profile.Project] = []*api.Profile{db.ProfileToAPI(&profile)}
-			} else {
-				projectProfiles[profile.Project] = append(projectProfiles[profile.Project], db.ProfileToAPI(&profile))
+				projectProfiles[profile.Project] = []*api.Profile{}
 			}
+
+			apiProfile, err := profile.ToAPI(ctx, tx.Tx())
+			if err != nil {
+				return err
+			}
+
+			projectProfiles[profile.Project] = append(projectProfiles[profile.Project], apiProfile)
 		}
 
 		// Load list of project/network names for validation.
-		projectNetworks, err = tx.GetCreatedNetworks()
+		projectNetworks, err = tx.GetCreatedNetworks(ctx)
 		if err != nil {
 			return err
 		}
@@ -117,7 +128,7 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 		return response.SmartError(fmt.Errorf("Failed getting validate dependency check info: %w", err))
 	}
 
-	isClustered, err := cluster.Enabled(d.db)
+	isClustered, err := cluster.Enabled(d.db.Node)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -137,14 +148,14 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 	}
 
 	// Used to store the unknown volumes for each pool & project.
-	poolsProjectVols := make(map[string]map[string][]*backup.Config)
+	poolsProjectVols := make(map[string]map[string][]*backupConfig.Config)
 
 	// Used to store a handle to each pool containing user supplied config.
 	pools := make(map[string]storagePools.Pool)
 
 	// Iterate the pools finding unknown volumes and perform validation.
 	for _, p := range userPools {
-		pool, err := storagePools.GetPoolByName(d.State(), p.Name)
+		pool, err := storagePools.LoadByName(d.State(), p.Name)
 		if err != nil {
 			if response.IsNotFoundError(err) {
 				// If the pool DB record doesn't exist, and we are clustered, then don't proceed
@@ -191,13 +202,13 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 			defer func() {
 				cleanupPool := pools[pool.Name()]
 				if cleanupPool != nil && cleanupPool.ID() == storagePools.PoolIDTemporary {
-					cleanupPool.Unmount()
+					_, _ = cleanupPool.Unmount()
 				}
 			}()
 
 			revert.Add(func() {
 				cleanupPool := pools[pool.Name()]
-				cleanupPool.Unmount() // Defer won't do it if record exists, so unmount on failure.
+				_, _ = cleanupPool.Unmount() // Defer won't do it if record exists, so unmount on failure.
 			})
 		}
 
@@ -323,8 +334,8 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 
 			// Create missing storage pool DB record if neeed.
 			if pool.ID() == storagePools.PoolIDTemporary {
-				var instPoolVol *backup.Config // Instance volume used for new pool record.
-				var poolID int64               // Pool ID of created pool record.
+				var instPoolVol *backupConfig.Config // Instance volume used for new pool record.
+				var poolID int64                     // Pool ID of created pool record.
 
 				// Search unknown volumes looking for an instance volume that can be used to
 				// restore the pool DB config from. This is preferable over using the user
@@ -338,7 +349,7 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 
 				if instPoolVol != nil {
 					// Create storage pool DB record from config in the instance.
-					logger.Info("Creating storage pool DB record from instance config", log.Ctx{"name": instPoolVol.Pool.Name, "description": instPoolVol.Pool.Description, "driver": instPoolVol.Pool.Driver, "config": instPoolVol.Pool.Config})
+					logger.Info("Creating storage pool DB record from instance config", logger.Ctx{"name": instPoolVol.Pool.Name, "description": instPoolVol.Pool.Description, "driver": instPoolVol.Pool.Driver, "config": instPoolVol.Pool.Config})
 					poolID, err = dbStoragePoolCreateAndUpdateCache(d.State(), instPoolVol.Pool.Name, instPoolVol.Pool.Description, instPoolVol.Pool.Driver, instPoolVol.Pool.Config)
 					if err != nil {
 						return response.SmartError(fmt.Errorf("Failed creating storage pool %q database entry: %w", pool.Name(), err))
@@ -348,7 +359,7 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 					// instance volume pool config found.
 					poolDriverName := pool.Driver().Info().Name
 					poolDriverConfig := pool.Driver().Config()
-					logger.Info("Creating storage pool DB record from user config", log.Ctx{"name": pool.Name(), "driver": poolDriverName, "config": poolDriverConfig})
+					logger.Info("Creating storage pool DB record from user config", logger.Ctx{"name": pool.Name(), "driver": poolDriverName, "config": poolDriverConfig})
 					poolID, err = dbStoragePoolCreateAndUpdateCache(d.State(), pool.Name(), "", poolDriverName, poolDriverConfig)
 					if err != nil {
 						return response.SmartError(fmt.Errorf("Failed creating storage pool %q database entry: %w", pool.Name(), err))
@@ -356,20 +367,21 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 				}
 
 				revert.Add(func() {
-					dbStoragePoolDeleteAndUpdateCache(d.State(), pool.Name())
+					_ = dbStoragePoolDeleteAndUpdateCache(d.State(), pool.Name())
 				})
 
 				// Set storage pool node to storagePoolCreated.
 				// Must come before storage pool is loaded from the database.
-				err = d.State().Cluster.Transaction(func(tx *db.ClusterTx) error {
+				err = d.State().DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 					return tx.StoragePoolNodeCreated(poolID)
 				})
 				if err != nil {
 					return response.SmartError(fmt.Errorf("Failed marking storage pool %q local status as created: %w", pool.Name(), err))
 				}
-				logger.Debug("Marked storage pool local status as created", log.Ctx{"pool": pool.Name()})
 
-				newPool, err := storagePools.GetPoolByName(d.State(), pool.Name())
+				logger.Debug("Marked storage pool local status as created", logger.Ctx{"pool": pool.Name()})
+
+				newPool, err := storagePools.LoadByName(d.State(), pool.Name())
 				if err != nil {
 					return response.SmartError(fmt.Errorf("Failed loading created storage pool %q: %w", pool.Name(), err))
 				}
@@ -389,7 +401,7 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 				}
 
 				// Import custom volume and any snapshots.
-				err = pool.ImportCustomVolume(customStorageProjectName, *poolVol, nil)
+				err = pool.ImportCustomVolume(customStorageProjectName, poolVol, nil)
 				if err != nil {
 					return response.SmartError(fmt.Errorf("Failed importing custom volume %q in project %q: %w", poolVol.Volume.Name, projectName, err))
 				}
@@ -411,10 +423,12 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 					}
 				}
 
-				inst, err := internalRecoverImportInstance(d.State(), pool, projectName, poolVol, profiles, revert)
+				inst, cleanup, err := internalRecoverImportInstance(d.State(), pool, projectName, poolVol, profiles)
 				if err != nil {
 					return response.SmartError(fmt.Errorf("Failed creating instance %q record in project %q: %w", poolVol.Container.Name, projectName, err))
 				}
+
+				revert.Add(cleanup)
 
 				// Recover instance volume snapshots.
 				for _, poolInstSnap := range poolVol.Snapshots {
@@ -427,14 +441,16 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 						}
 					}
 
-					err = internalRecoverImportInstanceSnapshot(d.State(), pool, projectName, poolVol, poolInstSnap, profiles, revert)
+					cleanup, err := internalRecoverImportInstanceSnapshot(d.State(), pool, projectName, poolVol, poolInstSnap, profiles)
 					if err != nil {
 						return response.SmartError(fmt.Errorf("Failed creating instance %q snapshot %q record in project %q: %w", poolVol.Container.Name, poolInstSnap.Name, projectName, err))
 					}
+
+					revert.Add(cleanup)
 				}
 
 				// Recreate instance mount path and symlinks (must come after snapshot recovery).
-				err = pool.ImportInstance(inst, nil)
+				err = pool.ImportInstance(inst, poolVol, nil)
 				if err != nil {
 					return response.SmartError(fmt.Errorf("Failed importing instance %q in project %q: %w", poolVol.Container.Name, projectName, err))
 				}
@@ -457,9 +473,10 @@ func internalRecoverScan(d *Daemon, userPools []api.StoragePoolsPost, validateOn
 }
 
 // internalRecoverImportInstance recreates the database records for an instance and returns the new instance.
-func internalRecoverImportInstance(s *state.State, pool storagePools.Pool, projectName string, poolVol *backup.Config, profiles []api.Profile, revert *revert.Reverter) (instance.Instance, error) {
+// Returns a revert fail function that can be used to undo this function if a subsequent step fails.
+func internalRecoverImportInstance(s *state.State, pool storagePools.Pool, projectName string, poolVol *backupConfig.Config, profiles []api.Profile) (instance.Instance, revert.Hook, error) {
 	if poolVol.Container == nil {
-		return nil, fmt.Errorf("Pool volume is not an instance volume")
+		return nil, nil, fmt.Errorf("Pool volume is not an instance volume")
 	}
 
 	// Add root device if needed.
@@ -473,31 +490,29 @@ func internalRecoverImportInstance(s *state.State, pool storagePools.Pool, proje
 
 	internalImportRootDevicePopulate(pool.Name(), poolVol.Container.Devices, poolVol.Container.ExpandedDevices, profiles)
 
-	// Extract volume config from backup file if present.
-	var volConfig map[string]string
-	if poolVol.Volume != nil {
-		volConfig = poolVol.Volume.Config
+	dbInst, err := backup.ConfigToInstanceDBArgs(s, poolVol, projectName, true)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	dbInst := poolVol.ToInstanceDBArgs(projectName)
 
 	if dbInst.Type < 0 {
-		return nil, fmt.Errorf("Invalid instance type")
+		return nil, nil, fmt.Errorf("Invalid instance type")
 	}
 
-	inst, instOp, err := instance.CreateInternal(s, *dbInst, false, volConfig, revert)
+	inst, instOp, cleanup, err := instance.CreateInternal(s, *dbInst, false)
 	if err != nil {
-		return nil, fmt.Errorf("Failed creating instance record: %w", err)
+		return nil, nil, fmt.Errorf("Failed creating instance record: %w", err)
 	}
+
 	defer instOp.Done(err)
 
-	return inst, err
+	return inst, cleanup, err
 }
 
 // internalRecoverImportInstance recreates the database records for an instance snapshot.
-func internalRecoverImportInstanceSnapshot(s *state.State, pool storagePools.Pool, projectName string, poolVol *backup.Config, snap *api.InstanceSnapshot, profiles []api.Profile, revert *revert.Reverter) error {
+func internalRecoverImportInstanceSnapshot(s *state.State, pool storagePools.Pool, projectName string, poolVol *backupConfig.Config, snap *api.InstanceSnapshot, profiles []api.Profile) (revert.Hook, error) {
 	if poolVol.Container == nil || snap == nil {
-		return fmt.Errorf("Pool volume is not an instance volume")
+		return nil, fmt.Errorf("Pool volume is not an instance volume")
 	}
 
 	// Add root device if needed.
@@ -513,15 +528,15 @@ func internalRecoverImportInstanceSnapshot(s *state.State, pool storagePools.Poo
 
 	arch, err := osarch.ArchitectureId(snap.Architecture)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	instanceType, err := instancetype.New(poolVol.Container.Type)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	_, snapInstOp, err := instance.CreateInternal(s, db.InstanceArgs{
+	_, snapInstOp, cleanup, err := instance.CreateInternal(s, db.InstanceArgs{
 		Project:      projectName,
 		Architecture: arch,
 		BaseImage:    snap.Config["volatile.base_image"],
@@ -533,15 +548,16 @@ func internalRecoverImportInstanceSnapshot(s *state.State, pool storagePools.Poo
 		Ephemeral:    snap.Ephemeral,
 		LastUsedDate: snap.LastUsedAt,
 		Name:         poolVol.Container.Name + shared.SnapshotDelimiter + snap.Name,
-		Profiles:     snap.Profiles,
+		Profiles:     profiles,
 		Stateful:     snap.Stateful,
-	}, false, nil, revert)
+	}, false)
 	if err != nil {
-		return fmt.Errorf("Failed creating instance snapshot record %q: %w", snap.Name, err)
+		return nil, fmt.Errorf("Failed creating instance snapshot record %q: %w", snap.Name, err)
 	}
+
 	defer snapInstOp.Done(err)
 
-	return nil
+	return cleanup, err
 }
 
 // internalRecoverValidate validates the requested pools to be recovered.

@@ -1,14 +1,16 @@
 package device
 
 import (
+	"bytes"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
+	"strings"
 
 	"github.com/mdlayher/netx/eui64"
-	log "gopkg.in/inconshreveable/log15.v2"
 
-	"github.com/lxc/lxd/lxd/cluster"
+	"github.com/lxc/lxd/lxd/db"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	pcidev "github.com/lxc/lxd/lxd/device/pci"
 	"github.com/lxc/lxd/lxd/dnsmasq/dhcpalloc"
@@ -24,6 +26,7 @@ import (
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/logger"
 )
 
 // ovnNet defines an interface for accessing instance specific functions on OVN network.
@@ -31,8 +34,10 @@ type ovnNet interface {
 	network.Network
 
 	InstanceDevicePortValidateExternalRoutes(deviceInstance instance.Instance, deviceName string, externalRoutes []*net.IPNet) error
-	InstanceDevicePortSetup(opts *network.OVNInstanceNICSetupOpts, securityACLsRemove []string) (openvswitch.OVNSwitchPort, error)
-	InstanceDevicePortDelete(ovsExternalOVNPort openvswitch.OVNSwitchPort, opts *network.OVNInstanceNICStopOpts) error
+	InstanceDevicePortAdd(instanceUUID string, deviceName string, deviceConfig deviceConfig.Device) error
+	InstanceDevicePortStart(opts *network.OVNInstanceNICSetupOpts, securityACLsRemove []string) (openvswitch.OVNSwitchPort, error)
+	InstanceDevicePortStop(ovsExternalOVNPort openvswitch.OVNSwitchPort, opts *network.OVNInstanceNICStopOpts) error
+	InstanceDevicePortRemove(instanceUUID string, deviceName string, deviceConfig deviceConfig.Device) error
 	InstanceDevicePortDynamicIPs(instanceUUID string, deviceName string) ([]net.IP, error)
 }
 
@@ -56,16 +61,6 @@ func (d *nicOVN) UpdatableFields(oldDevice Type) []string {
 	}
 
 	return []string{"security.acls"}
-}
-
-// getIntegrationBridgeName returns the OVS integration bridge to use.
-func (d *nicOVN) getIntegrationBridgeName() (string, error) {
-	integrationBridge, err := cluster.ConfigGetString(d.state.Cluster, "network.ovn.integration_bridge")
-	if err != nil {
-		return "", fmt.Errorf("Failed to get OVN integration bridge name: %w", err)
-	}
-
-	return integrationBridge, nil
 }
 
 // validateConfig checks the supplied config for correctness.
@@ -99,7 +94,7 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 	}
 
 	// The NIC's network may be a non-default project, so lookup project and get network's project name.
-	networkProjectName, _, err := project.NetworkProject(d.state.Cluster, instConf.Project())
+	networkProjectName, _, err := project.NetworkProject(d.state.DB.Cluster, instConf.Project().Name)
 	if err != nil {
 		return fmt.Errorf("Failed loading network project name: %w", err)
 	}
@@ -180,7 +175,16 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 	}
 
 	// Apply network level config options to device config before validation.
-	d.config["mtu"] = fmt.Sprintf("%s", netConfig["bridge.mtu"])
+	d.config["mtu"] = netConfig["bridge.mtu"]
+
+	// Check there isn't another NIC with any of the same addresses specified on the same network.
+	// Can only validate this when the instance is supplied (and not doing profile validation).
+	if d.inst != nil {
+		err := d.checkAddressConflict()
+		if err != nil {
+			return err
+		}
+	}
 
 	rules := nicValidationRules(requiredFields, optionalFields, instConf)
 
@@ -197,7 +201,7 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 			continue
 		}
 
-		externalRoutes, err = network.SubnetParseAppend(externalRoutes, util.SplitNTrimSpace(d.config[k], ",", -1, false)...)
+		externalRoutes, err = network.SubnetParseAppend(externalRoutes, shared.SplitNTrimSpace(d.config[k], ",", -1, false)...)
 		if err != nil {
 			return err
 		}
@@ -212,10 +216,89 @@ func (d *nicOVN) validateConfig(instConf instance.ConfigReader) error {
 
 	// Check Security ACLs exist.
 	if d.config["security.acls"] != "" {
-		err = acl.Exists(d.state, networkProjectName, util.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)...)
+		err = acl.Exists(d.state, networkProjectName, shared.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)...)
 		if err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// checkAddressConflict checks for conflicting IP/MAC addresses on another NIC connected to same network.
+// Can only validate this when the instance is supplied (and not doing profile validation).
+// Returns api.StatusError with status code set to http.StatusConflict if conflicting address found.
+func (d *nicOVN) checkAddressConflict() error {
+	ourNICIPs := make(map[string]net.IP, 2)
+	ourNICIPs["ipv4.address"] = net.ParseIP(d.config["ipv4.address"])
+	ourNICIPs["ipv6.address"] = net.ParseIP(d.config["ipv6.address"])
+
+	ourNICMAC, _ := net.ParseMAC(d.config["hwaddr"])
+	if ourNICMAC == nil {
+		ourNICMAC, _ = net.ParseMAC(d.volatileGet()["hwaddr"])
+	}
+
+	// Check if any instance devices use this network.
+	return network.UsedByInstanceDevices(d.state, d.network.Project(), d.network.Name(), func(inst db.InstanceArgs, nicName string, nicConfig map[string]string) error {
+		// Skip NICs that specify a NIC type that is not the same as our own.
+		if !shared.StringInSlice(nicConfig["nictype"], []string{"", "ovn"}) {
+			return nil
+		}
+
+		// Skip our own device. This avoids triggering duplicate device errors during
+		// updates or when making temporary copies of our instance during migrations.
+		if instance.IsSameLogicalInstance(d.inst, &inst) && d.Name() == nicName {
+			return nil
+		}
+
+		// Check there isn't another instance with the same DNS name connected to managed network.
+		if d.network != nil && nicCheckDNSNameConflict(d.inst.Name(), inst.Name) {
+			return api.StatusErrorf(http.StatusConflict, "Instance DNS name %q already used on network", strings.ToLower(inst.Name))
+		}
+
+		// Check NIC's MAC address doesn't match this NIC's MAC address.
+		devNICMAC, _ := net.ParseMAC(nicConfig["hwaddr"])
+		if devNICMAC == nil {
+			devNICMAC, _ = net.ParseMAC(inst.Config[fmt.Sprintf("volatile.%s.hwaddr", nicName)])
+		}
+
+		if ourNICMAC != nil && devNICMAC != nil && bytes.Equal(ourNICMAC, devNICMAC) {
+			return api.StatusErrorf(http.StatusConflict, "MAC address %q already defined on another NIC", devNICMAC.String())
+		}
+
+		// Check NIC's static IPs don't match this NIC's static IPs.
+		for _, key := range []string{"ipv4.address", "ipv6.address"} {
+			if d.config[key] == "" {
+				continue // No static IP specified on this NIC.
+			}
+
+			// Parse IPs to avoid being tripped up by presentation differences.
+			devNICIP := net.ParseIP(nicConfig[key])
+
+			if ourNICIPs[key] != nil && devNICIP != nil && ourNICIPs[key].Equal(devNICIP) {
+				return api.StatusErrorf(http.StatusConflict, "IP address %q already defined on another NIC", devNICIP.String())
+			}
+		}
+
+		return nil
+	})
+}
+
+// Add is run when a device is added to a non-snapshot instance whether or not the instance is running.
+func (d *nicOVN) Add() error {
+	return d.network.InstanceDevicePortAdd(d.inst.LocalConfig()["volatile.uuid"], d.name, d.config)
+}
+
+// PreStartCheck checks the managed parent network is available (if relevant).
+func (d *nicOVN) PreStartCheck() error {
+	// Non-managed network NICs are not relevant for checking managed network availability.
+	if d.network == nil {
+		return nil
+	}
+
+	// If managed network is not available, don't try and start instance.
+	if d.network.LocalStatus() == api.StoragePoolStatusUnvailable {
+		return api.StatusErrorf(http.StatusServiceUnavailable, "Network %q unavailable on this server", d.network.Name())
 	}
 
 	return nil
@@ -227,10 +310,7 @@ func (d *nicOVN) validateEnvironment() error {
 		return fmt.Errorf("Requires name property to start")
 	}
 
-	integrationBridge, err := d.getIntegrationBridgeName()
-	if err != nil {
-		return err
-	}
+	integrationBridge := d.state.GlobalConfig.NetworkOVNIntegrationBridge()
 
 	if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", integrationBridge)) {
 		return fmt.Errorf("OVS integration bridge device %q doesn't exist", integrationBridge)
@@ -254,7 +334,7 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 
 	// Load uplink network config.
 	uplinkNetworkName := d.network.Config()["network"]
-	_, uplink, _, err := d.state.Cluster.GetNetworkInAnyState(project.Default, uplinkNetworkName)
+	_, uplink, _, err := d.state.DB.Cluster.GetNetworkInAnyState(project.Default, uplinkNetworkName)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to load uplink network %q: %w", uplinkNetworkName, err)
 	}
@@ -279,10 +359,7 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 			}
 		}
 
-		integrationBridge, err := d.getIntegrationBridgeName()
-		if err != nil {
-			return nil, err
-		}
+		integrationBridge := d.state.GlobalConfig.NetworkOVNIntegrationBridge()
 
 		// Find free VF exclusively.
 		network.SRIOVVirtualFunctionMutex.Lock()
@@ -298,6 +375,7 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 			network.SRIOVVirtualFunctionMutex.Unlock()
 			return nil, err
 		}
+
 		network.SRIOVVirtualFunctionMutex.Unlock()
 
 		// Setup the guest network interface.
@@ -314,7 +392,10 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 		// Create veth pair and configure the peer end with custom hwaddr and mtu if supplied.
 		if d.inst.Type() == instancetype.Container {
 			if saveData["host_name"] == "" {
-				saveData["host_name"] = network.RandomDevName("veth")
+				saveData["host_name"], err = d.generateHostName("veth", d.config["hwaddr"])
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			peerName, mtu, err = networkCreateVethPair(saveData["host_name"], d.config)
@@ -323,7 +404,10 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 			}
 		} else if d.inst.Type() == instancetype.VM {
 			if saveData["host_name"] == "" {
-				saveData["host_name"] = network.RandomDevName("tap")
+				saveData["host_name"], err = d.generateHostName("tap", d.config["hwaddr"])
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			peerName = saveData["host_name"] // VMs use the host_name to link to the TAP FD.
@@ -333,16 +417,18 @@ func (d *nicOVN) Start() (*deviceConfig.RunConfig, error) {
 			}
 		}
 
-		revert.Add(func() { network.InterfaceRemove(saveData["host_name"]) })
+		revert.Add(func() { _ = network.InterfaceRemove(saveData["host_name"]) })
 	}
 
 	// Populate device config with volatile fields if needed.
 	networkVethFillFromVolatile(d.config, saveData)
 
-	err = d.setupHostNIC(revert, saveData["host_name"], uplink)
+	cleanup, err := d.setupHostNIC(saveData["host_name"], uplink)
 	if err != nil {
 		return nil, err
 	}
+
+	revert.Add(cleanup)
 
 	err = d.volatileSet(saveData)
 	if err != nil {
@@ -407,6 +493,7 @@ func (d *nicOVN) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 		if err != nil {
 			return err
 		}
+
 		err = link.SetUp()
 		if err != nil {
 			return err
@@ -416,8 +503,8 @@ func (d *nicOVN) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 	// Apply any changes needed when assigned ACLs change.
 	if d.config["security.acls"] != oldConfig["security.acls"] {
 		// Work out which ACLs have been removed and remove logical port from those groups.
-		oldACLs := util.SplitNTrimSpace(oldConfig["security.acls"], ",", -1, true)
-		newACLs := util.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)
+		oldACLs := shared.SplitNTrimSpace(oldConfig["security.acls"], ",", -1, true)
+		newACLs := shared.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)
 		removedACLs := []string{}
 		for _, oldACL := range oldACLs {
 			if !shared.StringInSlice(oldACL, newACLs) {
@@ -429,13 +516,13 @@ func (d *nicOVN) Update(oldDevices deviceConfig.Devices, isRunning bool) error {
 		if isRunning {
 			// Load uplink network config.
 			uplinkNetworkName := d.network.Config()["network"]
-			_, uplink, _, err := d.state.Cluster.GetNetworkInAnyState(project.Default, uplinkNetworkName)
+			_, uplink, _, err := d.state.DB.Cluster.GetNetworkInAnyState(project.Default, uplinkNetworkName)
 			if err != nil {
 				return fmt.Errorf("Failed to load uplink network %q: %w", uplinkNetworkName, err)
 			}
 
 			// Update OVN logical switch port for instance.
-			_, err = d.network.InstanceDevicePortSetup(&network.OVNInstanceNICSetupOpts{
+			_, err = d.network.InstanceDevicePortStart(&network.OVNInstanceNICSetupOpts{
 				InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
 				DNSName:      d.inst.Name(),
 				DeviceName:   d.name,
@@ -481,14 +568,14 @@ func (d *nicOVN) Stop() (*deviceConfig.RunConfig, error) {
 	}
 
 	// Try and retrieve the last associated OVN switch port for the instance interface in the local OVS DB.
-	// If we cannot get this, don't fail, as InstanceDevicePortDelete will then try and generate the likely
+	// If we cannot get this, don't fail, as InstanceDevicePortStop will then try and generate the likely
 	// port name using the same regime it does for new ports. This part is only here in order to allow
 	// instance ports generated under an older regime to be cleaned up properly.
 	networkVethFillFromVolatile(d.config, d.volatileGet())
 	ovs := openvswitch.NewOVS()
 	ovsExternalOVNPort, err := ovs.InterfaceAssociatedOVNSwitchPort(d.config["host_name"])
 	if err != nil {
-		d.logger.Warn("Could not find OVN Switch port associated to OVS interface", log.Ctx{"interface": d.config["host_name"]})
+		d.logger.Warn("Could not find OVN Switch port associated to OVS interface", logger.Ctx{"interface": d.config["host_name"]})
 	}
 
 	// If there is a host_name specified, then try and remove it from the OVS integration bridge.
@@ -496,29 +583,25 @@ func (d *nicOVN) Stop() (*deviceConfig.RunConfig, error) {
 	// as if the instance is being migrated, this can cause port conflicts in OVN if the instance comes up on
 	// another LXD host later.
 	if d.config["host_name"] != "" {
-		integrationBridge, err := d.getIntegrationBridgeName()
-		if err == nil {
-			// Detach host-side end of veth pair from OVS integration bridge.
-			err = ovs.BridgePortDelete(integrationBridge, d.config["host_name"])
-			if err != nil {
-				// Don't fail here as we want the postStop hook to run to clean up the local veth pair.
-				d.logger.Error("Failed detaching interface from OVS integration bridge", log.Ctx{"interface": d.config["host_name"], "bridge": integrationBridge, "err": err})
-			}
-		} else {
-			// Don't fail here as we still want the postStop hook to run to clean up the local veth pair.
-			d.logger.Error("Failed getting OVS integration bridge name to remove bridge port", log.Ctx{"err": err})
+		integrationBridge := d.state.GlobalConfig.NetworkOVNIntegrationBridge()
+
+		// Detach host-side end of veth pair from OVS integration bridge.
+		err = ovs.BridgePortDelete(integrationBridge, d.config["host_name"])
+		if err != nil {
+			// Don't fail here as we want the postStop hook to run to clean up the local veth pair.
+			d.logger.Error("Failed detaching interface from OVS integration bridge", logger.Ctx{"interface": d.config["host_name"], "bridge": integrationBridge, "err": err})
 		}
 	}
 
 	instanceUUID := d.inst.LocalConfig()["volatile.uuid"]
-	err = d.network.InstanceDevicePortDelete(ovsExternalOVNPort, &network.OVNInstanceNICStopOpts{
+	err = d.network.InstanceDevicePortStop(ovsExternalOVNPort, &network.OVNInstanceNICStopOpts{
 		InstanceUUID: instanceUUID,
 		DeviceName:   d.name,
 		DeviceConfig: d.config,
 	})
 	if err != nil {
 		// Don't fail here as we still want the postStop hook to run to clean up the local veth pair.
-		d.logger.Error("Failed to remove OVN device port", log.Ctx{"err": err})
+		d.logger.Error("Failed to remove OVN device port", logger.Ctx{"err": err})
 	}
 
 	// Remove BGP announcements.
@@ -532,18 +615,20 @@ func (d *nicOVN) Stop() (*deviceConfig.RunConfig, error) {
 
 // postStop is run after the device is removed from the instance.
 func (d *nicOVN) postStop() error {
-	defer d.volatileSet(map[string]string{
-		"host_name":                "",
-		"last_state.hwaddr":        "",
-		"last_state.mtu":           "",
-		"last_state.created":       "",
-		"last_state.vf.parent":     "",
-		"last_state.vf.id":         "",
-		"last_state.vf.hwaddr":     "",
-		"last_state.vf.vlan":       "",
-		"last_state.vf.spoofcheck": "",
-		"last_state.pci.driver":    "",
-	})
+	defer func() {
+		_ = d.volatileSet(map[string]string{
+			"host_name":                "",
+			"last_state.hwaddr":        "",
+			"last_state.mtu":           "",
+			"last_state.created":       "",
+			"last_state.vf.parent":     "",
+			"last_state.vf.id":         "",
+			"last_state.vf.hwaddr":     "",
+			"last_state.vf.vlan":       "",
+			"last_state.vf.spoofcheck": "",
+			"last_state.pci.driver":    "",
+		})
+	}()
 
 	v := d.volatileGet()
 
@@ -558,6 +643,7 @@ func (d *nicOVN) postStop() error {
 				network.SRIOVVirtualFunctionMutex.Unlock()
 				return err
 			}
+
 			network.SRIOVVirtualFunctionMutex.Unlock()
 
 			link := &ip.Link{Name: d.config["host_name"]}
@@ -580,7 +666,7 @@ func (d *nicOVN) postStop() error {
 // Remove is run when the device is removed from the instance or the instance is deleted.
 func (d *nicOVN) Remove() error {
 	// Check for port groups that will become unused (and need deleting) as this NIC is deleted.
-	securityACLs := util.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)
+	securityACLs := shared.SplitNTrimSpace(d.config["security.acls"], ",", -1, true)
 	if len(securityACLs) > 0 {
 		client, err := openvswitch.NewOVN(d.state)
 		if err != nil {
@@ -593,7 +679,7 @@ func (d *nicOVN) Remove() error {
 		}
 	}
 
-	return nil
+	return d.network.InstanceDevicePortRemove(d.inst.LocalConfig()["volatile.uuid"], d.name, d.config)
 }
 
 // State gets the state of an OVN NIC by querying the OVN Northbound logical switch port record.
@@ -642,7 +728,7 @@ func (d *nicOVN) State() (*api.InstanceStateNetwork, error) {
 				})
 			}
 		} else {
-			d.logger.Warn("Failed getting OVN port dynamic IPs", log.Ctx{"err": err})
+			d.logger.Warn("Failed getting OVN port dynamic IPs", logger.Ctx{"err": err})
 		}
 	} else {
 		if d.config["ipv4.address"] != "" {
@@ -684,7 +770,7 @@ func (d *nicOVN) State() (*api.InstanceStateNetwork, error) {
 	// Get MTU of host interface that connects to OVN integration bridge if exists.
 	iface, err := net.InterfaceByName(d.config["host_name"])
 	if err != nil {
-		d.logger.Warn("Failed getting host interface state for MTU", log.Ctx{"host_name": d.config["host_name"], "err": err})
+		d.logger.Warn("Failed getting host interface state for MTU", logger.Ctx{"host_name": d.config["host_name"], "err": err})
 	}
 
 	mtu := -1
@@ -727,22 +813,25 @@ func (d *nicOVN) Register() error {
 	return nil
 }
 
-func (d *nicOVN) setupHostNIC(revert *revert.Reverter, hostName string, uplink *api.Network) error {
+func (d *nicOVN) setupHostNIC(hostName string, uplink *api.Network) (revert.Hook, error) {
+	revert := revert.New()
+	defer revert.Fail()
+
 	// Disable IPv6 on host-side veth interface (prevents host-side interface getting link-local address and
 	// accepting router advertisements) as not needed because the host-side interface is connected to a bridge.
 	err := util.SysctlSet(fmt.Sprintf("net/ipv6/conf/%s/disable_ipv6", hostName), "1")
 	if err != nil && !os.IsNotExist(err) {
-		return err
+		return nil, err
 	}
 
 	// Attempt to disable IPv4 forwarding.
 	err = util.SysctlSet(fmt.Sprintf("net/ipv4/conf/%s/forwarding", hostName), "0")
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Add new OVN logical switch port for instance.
-	logicalPortName, err := d.network.InstanceDevicePortSetup(&network.OVNInstanceNICSetupOpts{
+	logicalPortName, err := d.network.InstanceDevicePortStart(&network.OVNInstanceNICSetupOpts{
 		InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
 		DNSName:      d.inst.Name(),
 		DeviceName:   d.name,
@@ -750,11 +839,11 @@ func (d *nicOVN) setupHostNIC(revert *revert.Reverter, hostName string, uplink *
 		UplinkConfig: uplink.Config,
 	}, nil)
 	if err != nil {
-		return fmt.Errorf("Failed setting up OVN port: %w", err)
+		return nil, fmt.Errorf("Failed setting up OVN port: %w", err)
 	}
 
 	revert.Add(func() {
-		d.network.InstanceDevicePortDelete("", &network.OVNInstanceNICStopOpts{
+		_ = d.network.InstanceDevicePortStop("", &network.OVNInstanceNICStopOpts{
 			InstanceUUID: d.inst.LocalConfig()["volatile.uuid"],
 			DeviceName:   d.name,
 			DeviceConfig: d.config,
@@ -762,31 +851,30 @@ func (d *nicOVN) setupHostNIC(revert *revert.Reverter, hostName string, uplink *
 	})
 
 	// Attach host side veth interface to bridge.
-	integrationBridge, err := d.getIntegrationBridgeName()
-	if err != nil {
-		return err
-	}
+	integrationBridge := d.state.GlobalConfig.NetworkOVNIntegrationBridge()
 
 	ovs := openvswitch.NewOVS()
 	err = ovs.BridgePortAdd(integrationBridge, hostName, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	revert.Add(func() { ovs.BridgePortDelete(integrationBridge, hostName) })
+	revert.Add(func() { _ = ovs.BridgePortDelete(integrationBridge, hostName) })
 
 	// Link OVS port to OVN logical port.
 	err = ovs.InterfaceAssociateOVNSwitchPort(hostName, logicalPortName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Make sure the port is up.
 	link := &ip.Link{Name: hostName}
 	err = link.SetUp()
 	if err != nil {
-		return fmt.Errorf("Failed to bring up the host interface %s: %w", hostName, err)
+		return nil, fmt.Errorf("Failed to bring up the host interface %s: %w", hostName, err)
 	}
 
-	return nil
+	cleanup := revert.Clone().Fail
+	revert.Success()
+	return cleanup, err
 }

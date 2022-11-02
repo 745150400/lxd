@@ -5,7 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,15 +17,13 @@ import (
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/sys/unix"
-	log "gopkg.in/inconshreveable/log15.v2"
 
-	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/operationtype"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 	"github.com/lxc/lxd/shared/netutils"
 )
 
@@ -43,12 +42,13 @@ var execCmd = APIEndpoint{
 func execPost(d *Daemon, r *http.Request) response.Response {
 	post := api.ContainerExecPost{}
 
-	buf, err := ioutil.ReadAll(r.Body)
+	buf, err := io.ReadAll(r.Body)
 	if err != nil {
 		return response.BadRequest(err)
 	}
 
-	if err := json.Unmarshal(buf, &post); err != nil {
+	err = json.Unmarshal(buf, &post)
+	if err != nil {
 		return response.BadRequest(err)
 	}
 
@@ -113,6 +113,7 @@ func execPost(d *Daemon, r *http.Request) response.Response {
 		ws.conns[execWSStdout] = nil
 		ws.conns[execWSStderr] = nil
 	}
+
 	ws.requiredConnectedCtx, ws.requiredConnectedDone = context.WithCancel(context.Background())
 	ws.interactive = post.Interactive
 
@@ -135,7 +136,7 @@ func execPost(d *Daemon, r *http.Request) response.Response {
 
 	resources := map[string][]string{}
 
-	op, err := operations.OperationCreate(nil, "", operations.OperationClassWebsocket, db.OperationCommandExec, resources, ws.Metadata(), ws.Do, nil, ws.Connect, r)
+	op, err := operations.OperationCreate(nil, "", operations.OperationClassWebsocket, operationtype.CommandExec, resources, ws.Metadata(), ws.Do, nil, ws.Connect, r)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -162,7 +163,7 @@ type execWs struct {
 	cwd                   string
 }
 
-func (s *execWs) Metadata() interface{} {
+func (s *execWs) Metadata() any {
 	fds := shared.Jmap{}
 	for fd, secret := range s.fds {
 		if fd == execWSControl {
@@ -227,7 +228,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 		s.connsLock.Lock()
 		for i := range s.conns {
 			if s.conns[i] != nil {
-				s.conns[i].Close()
+				_ = s.conns[i].Close()
 			}
 		}
 		s.connsLock.Unlock()
@@ -264,7 +265,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 		stderr = ttys[0]
 
 		if s.width > 0 && s.height > 0 {
-			shared.SetSize(int(ptys[0].Fd()), s.width, s.height)
+			_ = shared.SetSize(int(ptys[0].Fd()), s.width, s.height)
 		}
 	} else {
 		ttys = make([]*os.File, 3)
@@ -289,7 +290,7 @@ func (s *execWs) Do(op *operations.Operation) error {
 		close(attachedChildIsDead)
 
 		for _, tty := range ttys {
-			tty.Close()
+			_ = tty.Close()
 		}
 
 		s.connsLock.Lock()
@@ -297,13 +298,13 @@ func (s *execWs) Do(op *operations.Operation) error {
 		s.connsLock.Unlock()
 
 		if conn != nil {
-			conn.Close() // Close control connection (will cause control go routine to end).
+			_ = conn.Close() // Close control connection (will cause control go routine to end).
 		}
 
 		wgEOF.Wait()
 
 		for _, pty := range ptys {
-			pty.Close()
+			_ = pty.Close()
 		}
 
 		metadata := shared.Jmap{"return": cmdResult}
@@ -356,23 +357,24 @@ func (s *execWs) Do(op *operations.Operation) error {
 	if err != nil {
 		exitStatus := -1
 
-		if errors.Is(err, exec.ErrNotFound) {
+		if errors.Is(err, exec.ErrNotFound) || os.IsNotExist(err) {
 			exitStatus = 127
-			err = nil // Allow the exit code to be returned.
+		} else if errors.Is(err, fs.ErrPermission) {
+			exitStatus = 126
 		}
 
 		return finisher(exitStatus, err)
 	}
 
-	logger := logging.AddContext(logger.Log, log.Ctx{"PID": cmd.Process.Pid, "interactive": s.interactive})
-	logger.Debug("Instance process started")
+	l := logger.AddContext(logger.Log, logger.Ctx{"PID": cmd.Process.Pid, "interactive": s.interactive})
+	l.Debug("Instance process started")
 
 	wgEOF.Add(1)
 	go func() {
 		defer wgEOF.Done()
 
-		logger.Debug("Exec control handler started")
-		defer logger.Debug("Exec control handler finished")
+		l.Debug("Exec control handler started")
+		defer l.Debug("Exec control handler finished")
 
 		s.connsLock.Lock()
 		conn := s.conns[-1]
@@ -389,22 +391,22 @@ func (s *execWs) Do(op *operations.Operation) error {
 				}
 
 				if mt == websocket.CloseMessage {
-					logger.Warn("Got exec control websocket close message, killing command")
+					l.Warn("Got exec control websocket close message, killing command")
 				} else {
-					logger.Warn("Failed getting exec control websocket reader, killing command", log.Ctx{"err": err})
+					l.Warn("Failed getting exec control websocket reader, killing command", logger.Ctx{"err": err})
 				}
 
 				err := unix.Kill(cmd.Process.Pid, unix.SIGKILL)
 				if err != nil {
-					logger.Error("Failed to send SIGKILL")
+					l.Error("Failed to send SIGKILL")
 				} else {
-					logger.Info("Sent SIGKILL")
+					l.Info("Sent SIGKILL")
 				}
 
 				return
 			}
 
-			buf, err := ioutil.ReadAll(r)
+			buf, err := io.ReadAll(r)
 			if err != nil {
 				// Check if command process has finished normally, if so, no need to kill it.
 				select {
@@ -413,42 +415,44 @@ func (s *execWs) Do(op *operations.Operation) error {
 				default:
 				}
 
-				logger.Warn("Failed reading control websocket message, killing command", log.Ctx{"err": err})
+				l.Warn("Failed reading control websocket message, killing command", logger.Ctx{"err": err})
 
 				return
 			}
 
 			command := api.ContainerExecControl{}
-
-			if err := json.Unmarshal(buf, &command); err != nil {
-				logger.Debug("Failed to unmarshal control socket command", log.Ctx{"err": err})
+			err = json.Unmarshal(buf, &command)
+			if err != nil {
+				l.Debug("Failed to unmarshal control socket command", logger.Ctx{"err": err})
 				continue
 			}
 
 			if command.Command == "window-resize" && s.interactive {
 				winchWidth, err := strconv.Atoi(command.Args["width"])
 				if err != nil {
-					logger.Debug("Unable to extract window width", log.Ctx{"err": err})
+					l.Debug("Unable to extract window width", logger.Ctx{"err": err})
 					continue
 				}
 
 				winchHeight, err := strconv.Atoi(command.Args["height"])
 				if err != nil {
-					logger.Debug("Unable to extract window height", log.Ctx{"err": err})
+					l.Debug("Unable to extract window height", logger.Ctx{"err": err})
 					continue
 				}
 
 				err = shared.SetSize(int(ptys[0].Fd()), winchWidth, winchHeight)
 				if err != nil {
-					logger.Debug("Failed to set window size", log.Ctx{"err": err, "width": winchWidth, "height": winchHeight})
+					l.Debug("Failed to set window size", logger.Ctx{"err": err, "width": winchWidth, "height": winchHeight})
 					continue
 				}
 			} else if command.Command == "signal" {
-				if err := unix.Kill(cmd.Process.Pid, unix.Signal(command.Signal)); err != nil {
-					logger.Debug("Failed forwarding signal", log.Ctx{"err": err, "signal": command.Signal})
+				err := unix.Kill(cmd.Process.Pid, unix.Signal(command.Signal))
+				if err != nil {
+					l.Debug("Failed forwarding signal", logger.Ctx{"err": err, "signal": command.Signal})
 					continue
 				}
-				logger.Info("Forwarded signal", log.Ctx{"signal": command.Signal})
+
+				l.Info("Forwarded signal", logger.Ctx{"signal": command.Signal})
 			}
 		}
 	}()
@@ -458,8 +462,8 @@ func (s *execWs) Do(op *operations.Operation) error {
 		go func() {
 			defer wgEOF.Done()
 
-			logger.Debug("Exec mirror websocket started", log.Ctx{"number": 0})
-			defer logger.Debug("Exec mirror websocket finished", log.Ctx{"number": 0})
+			l.Debug("Exec mirror websocket started", logger.Ctx{"number": 0})
+			defer l.Debug("Exec mirror websocket finished", logger.Ctx{"number": 0})
 
 			s.connsLock.Lock()
 			conn := s.conns[0]
@@ -469,14 +473,14 @@ func (s *execWs) Do(op *operations.Operation) error {
 
 			<-readDone
 			<-writeDone
-			conn.Close()
+			_ = conn.Close()
 		}()
 	} else {
 		wgEOF.Add(len(ttys) - 1)
 		for i := 0; i < len(ttys); i++ {
 			go func(i int) {
-				logger.Debug("Exec mirror websocket started", log.Ctx{"number": i})
-				defer logger.Debug("Exec mirror websocket finished", log.Ctx{"number": i})
+				l.Debug("Exec mirror websocket started", logger.Ctx{"number": i})
+				defer l.Debug("Exec mirror websocket finished", logger.Ctx{"number": i})
 
 				if i == 0 {
 					s.connsLock.Lock()
@@ -484,14 +488,14 @@ func (s *execWs) Do(op *operations.Operation) error {
 					s.connsLock.Unlock()
 
 					<-shared.WebsocketRecvStream(ttys[i], conn)
-					ttys[i].Close()
+					_ = ttys[i].Close()
 				} else {
 					s.connsLock.Lock()
 					conn := s.conns[i]
 					s.connsLock.Unlock()
 
 					<-shared.WebsocketSendStream(conn, ptys[i], -1)
-					ptys[i].Close()
+					_ = ptys[i].Close()
 					wgEOF.Done()
 				}
 			}(i)
@@ -500,6 +504,6 @@ func (s *execWs) Do(op *operations.Operation) error {
 
 	exitStatus, err := shared.ExitStatus(cmd.Wait())
 
-	logger.Debug("Instance process stopped", log.Ctx{"exitStatus": exitStatus})
+	l.Debug("Instance process stopped", logger.Ctx{"err": err, "exitStatus": exitStatus})
 	return finisher(exitStatus, nil)
 }

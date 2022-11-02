@@ -6,8 +6,6 @@ import (
 	"strings"
 	"time"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/cluster/request"
@@ -19,7 +17,6 @@ import (
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 	"github.com/lxc/lxd/shared/validate"
 	"github.com/lxc/lxd/shared/version"
 )
@@ -41,7 +38,7 @@ func (d *zone) init(state *state.State, id int64, projectName string, info *api.
 		d.info = info
 	}
 
-	d.logger = logging.AddContext(logger.Log, log.Ctx{"project": projectName, "networkzone": d.info.Name})
+	d.logger = logger.AddContext(logger.Log, logger.Ctx{"project": projectName, "networkzone": d.info.Name})
 	d.id = id
 	d.projectName = projectName
 	d.state = state
@@ -79,13 +76,13 @@ func (d *zone) usedBy(firstOnly bool) ([]string, error) {
 	usedBy := []string{}
 
 	// Find networks using the zone.
-	networkNames, err := d.state.Cluster.GetCreatedNetworks(d.projectName)
+	networkNames, err := d.state.DB.Cluster.GetCreatedNetworks(d.projectName)
 	if err != nil && !response.IsNotFoundError(err) {
 		return nil, fmt.Errorf("Failed loading networks for project %q: %w", d.projectName, err)
 	}
 
 	for _, networkName := range networkNames {
-		_, network, _, err := d.state.Cluster.GetNetworkInAnyState(d.projectName, networkName)
+		_, network, _, err := d.state.DB.Cluster.GetNetworkInAnyState(d.projectName, networkName)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to get network config for %q: %w", networkName, err)
 		}
@@ -124,14 +121,18 @@ func (d *zone) isUsed() (bool, error) {
 }
 
 // Etag returns the values used for etag generation.
-func (d *zone) Etag() []interface{} {
-	return []interface{}{d.info.Name, d.info.Description, d.info.Config}
+func (d *zone) Etag() []any {
+	return []any{d.info.Name, d.info.Description, d.info.Config}
 }
 
 // validateName checks name is valid.
 func (d *zone) validateName(name string) error {
 	if name == "" {
 		return fmt.Errorf("Name is required")
+	}
+
+	if strings.HasPrefix(name, "/") {
+		return fmt.Errorf(`Name cannot start with "/"`)
 	}
 
 	return nil
@@ -222,7 +223,7 @@ func (d *zone) Update(config *api.NetworkZonePut, clientType request.ClientType)
 		oldConfig := d.info.NetworkZonePut
 
 		// Update database.
-		err = d.state.Cluster.UpdateNetworkZone(d.id, config)
+		err = d.state.DB.Cluster.UpdateNetworkZone(d.id, config)
 		if err != nil {
 			return err
 		}
@@ -232,7 +233,7 @@ func (d *zone) Update(config *api.NetworkZonePut, clientType request.ClientType)
 		d.init(d.state, d.id, d.projectName, d.info)
 
 		revert.Add(func() {
-			d.state.Cluster.UpdateNetworkZone(d.id, &oldConfig)
+			_ = d.state.DB.Cluster.UpdateNetworkZone(d.id, &oldConfig)
 			d.info.NetworkZonePut = oldConfig
 			d.init(d.state, d.id, d.projectName, d.info)
 		})
@@ -273,7 +274,7 @@ func (d *zone) Delete() error {
 	}
 
 	// Delete the database record.
-	err = d.state.Cluster.DeleteNetworkZone(d.id)
+	err = d.state.DB.Cluster.DeleteNetworkZone(d.id)
 	if err != nil {
 		return err
 	}
@@ -295,7 +296,7 @@ func (d *zone) Content() (*strings.Builder, error) {
 	includeNAT := shared.IsTrueOrEmpty(d.info.Config["network.nat"])
 
 	// Load all networks for the zone.
-	networks, err := d.state.Cluster.GetNetworksForZone(d.projectName, d.info.Name)
+	networks, err := d.state.DB.Cluster.GetNetworksForZone(d.projectName, d.info.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -447,12 +448,46 @@ func (d *zone) Content() (*strings.Builder, error) {
 
 	// Template the zone file.
 	sb := &strings.Builder{}
-	err = zoneTemplate.Execute(sb, map[string]interface{}{
+	err = zoneTemplate.Execute(sb, map[string]any{
 		"primary":     primary,
 		"nameservers": nameservers,
 		"zone":        d.info.Name,
 		"serial":      time.Now().Unix(),
 		"records":     records,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return sb, nil
+}
+
+// SOA returns just the DNS zone SOA record.
+func (d *zone) SOA() (*strings.Builder, error) {
+	// Get the nameservers.
+	nameservers := []string{}
+	for _, entry := range strings.Split(d.info.Config["dns.nameservers"], ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+
+		nameservers = append(nameservers, entry)
+	}
+
+	primary := "hostmaster." + d.info.Name
+	if len(nameservers) > 0 {
+		primary = nameservers[0]
+	}
+
+	// Template the zone file.
+	sb := &strings.Builder{}
+	err := zoneTemplate.Execute(sb, map[string]any{
+		"primary":     primary,
+		"nameservers": nameservers,
+		"zone":        d.info.Name,
+		"serial":      time.Now().Unix(),
+		"records":     map[string]string{},
 	})
 	if err != nil {
 		return nil, err

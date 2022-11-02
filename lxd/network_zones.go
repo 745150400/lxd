@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/gorilla/mux"
 
@@ -129,7 +130,7 @@ var networkZoneCmd = APIEndpoint{
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkZonesGet(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -137,7 +138,7 @@ func networkZonesGet(d *Daemon, r *http.Request) response.Response {
 	recursion := util.IsRecursionRequest(r)
 
 	// Get list of Network zones.
-	zoneNames, err := d.cluster.GetNetworkZones(projectName)
+	zoneNames, err := d.db.Cluster.GetNetworkZones(projectName)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -200,7 +201,7 @@ func networkZonesGet(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkZonesPost(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -229,10 +230,10 @@ func networkZonesPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.NetworkZoneCreated.Event(netzone, request.CreateRequestor(r), nil))
+	lc := lifecycle.NetworkZoneCreated.Event(netzone, request.CreateRequestor(r), nil)
+	d.State().Events.SendLifecycle(projectName, lc)
 
-	url := fmt.Sprintf("/%s/network-zones/%s", version.APIVersion, req.Name)
-	return response.SyncResponseLocation(true, nil, url)
+	return response.SyncResponseLocation(true, nil, lc.Source)
 }
 
 // swagger:operation DELETE /1.0/network-zones/{name} network-zones network_zone_delete
@@ -260,12 +261,17 @@ func networkZonesPost(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkZoneDelete(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, mux.Vars(r)["name"])
+	zoneName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, zoneName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -321,12 +327,17 @@ func networkZoneDelete(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkZoneGet(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, mux.Vars(r)["name"])
+	zoneName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, zoneName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -410,13 +421,18 @@ func networkZoneGet(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkZonePut(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	zoneName, err := url.PathUnescape(mux.Vars(r)["name"])
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the existing Network zone.
-	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, mux.Vars(r)["name"])
+	netzone, err := zone.LoadByNameAndProject(d.State(), projectName, zoneName)
 	if err != nil {
 		return response.SmartError(err)
 	}

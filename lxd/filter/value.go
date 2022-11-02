@@ -6,7 +6,7 @@ import (
 )
 
 // ValueOf returns the value of the given field.
-func ValueOf(obj interface{}, field string) interface{} {
+func ValueOf(obj any, field string) any {
 	value := reflect.ValueOf(obj)
 	typ := value.Type()
 	parts := strings.Split(field, ".")
@@ -14,7 +14,7 @@ func ValueOf(obj interface{}, field string) interface{} {
 	key := parts[0]
 	rest := strings.Join(parts[1:], ".")
 
-	var parent interface{}
+	var parent any
 
 	if value.Kind() == reflect.Map {
 		switch reflect.TypeOf(obj).Elem().Kind() {
@@ -26,6 +26,7 @@ func ValueOf(obj interface{}, field string) interface{} {
 				if entry.Interface() != key {
 					continue
 				}
+
 				m := value.MapIndex(entry)
 				return ValueOf(m.Interface(), rest)
 			}
@@ -42,11 +43,13 @@ func ValueOf(obj interface{}, field string) interface{} {
 			parent = fieldValue.Interface()
 		}
 
-		if yaml == key {
+		yamlKey, _, _ := strings.Cut(yaml, ",")
+		if yamlKey == key {
 			v := fieldValue.Interface()
 			if len(parts) == 1 {
 				return v
 			}
+
 			return ValueOf(v, rest)
 		}
 	}

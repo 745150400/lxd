@@ -1,149 +1,126 @@
 package storage
 
 import (
+	"context"
 	"fmt"
-	"os"
-
-	"golang.org/x/sys/unix"
+	"net/http"
+	"time"
 
 	"github.com/lxc/lxd/lxd/db"
-	"github.com/lxc/lxd/lxd/project"
-	"github.com/lxc/lxd/lxd/response"
-	"github.com/lxc/lxd/lxd/revert"
+	"github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/storage/drivers"
-	"github.com/lxc/lxd/lxd/storage/filesystem"
-	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
 )
 
-var lxdEarlyPatches = map[string]func(b *lxdBackend) error{}
-
-var lxdLatePatches = map[string]func(b *lxdBackend) error{
-	"storage_create_vm":                        lxdPatchStorageCreateVM,
-	"storage_create_vm_again":                  lxdPatchStorageCreateVM,
-	"storage_rename_custom_volume_add_project": lxdPatchStorageRenameCustomVolumeAddProject,
+var lxdEarlyPatches = map[string]func(b *lxdBackend) error{
+	"storage_missing_snapshot_records": patchMissingSnapshotRecords,
 }
+
+var lxdLatePatches = map[string]func(b *lxdBackend) error{}
 
 // Patches start here.
-func lxdPatchStorageCreateVM(b *lxdBackend) error {
-	return b.createStorageStructure(drivers.GetPoolMountPath(b.name))
-}
 
-// lxdPatchStorageRenameCustomVolumeAddProject renames all custom volumes in the default project (which is all of
-// the custom volumes right now) to have the project prefix added to the storage device volume name.
-// This is so we can added project support to custom volumes and avoid any name collisions.
-func lxdPatchStorageRenameCustomVolumeAddProject(b *lxdBackend) error {
-	// Get all custom volumes in default project on this node.
-	// At this time, all custom volumes are in the default project.
-	volumes, err := b.state.Cluster.GetLocalStoragePoolVolumes(project.Default, b.ID(), []int{db.StoragePoolVolumeTypeCustom})
-	if err != nil && !response.IsNotFoundError(err) {
-		return fmt.Errorf("Failed getting custom volumes for default project: %w", err)
-	}
+// patchMissingSnapshotRecords creates any missing storage volume records for instance volume snapshots.
+// This is needed because it seems that in 2019 some instance snapshots did not have their associated volume DB
+// records created. This later caused problems when we started validating that the instance snapshot DB record
+// count matched the volume snapshot DB record count.
+func patchMissingSnapshotRecords(b *lxdBackend) error {
+	var err error
+	var localNode string
 
-	revert := revert.New()
-	defer revert.Fail()
-
-	for _, v := range volumes {
-		if shared.IsSnapshot(v.Name) {
-			continue // Snapshots will be renamed as part of the parent volume rename.
+	err = b.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		localNode, err = tx.GetLocalNodeName(ctx)
+		if err != nil {
+			return fmt.Errorf("Failed to get local member name: %w", err)
 		}
 
-		// Run inside temporary function to ensure revert has correct volume scope.
-		err = func(curVol *api.StorageVolume) error {
-			// There's no need to pass the config as it's not needed when renaming a volume.
-			oldVol := b.GetVolume(drivers.VolumeTypeCustom, drivers.ContentTypeFS, curVol.Name, nil)
+		return err
+	})
+	if err != nil {
+		return err
+	}
 
-			// Add default project prefix to current volume name.
-			newVolStorageName := project.StorageVolume(project.Default, curVol.Name)
-			newVol := b.GetVolume(drivers.VolumeTypeCustom, drivers.ContentTypeFS, newVolStorageName, nil)
-
-			// Check if volume has already been renamed.
-			if b.driver.HasVolume(newVol) {
-				logger.Infof("Skipping already renamed custom volume %q in pool %q", newVol.Name(), b.Name())
-				return nil
-			}
-
-			// Check if volume is currently mounted.
-			oldMntPath := drivers.GetVolumeMountPath(b.Name(), drivers.VolumeTypeCustom, curVol.Name)
-
-			// If the volume is mounted we need to be careful how we rename it to avoid interrupting a
-			// running instance's attached volumes.
-			ourUnmount := false
-			if filesystem.IsMountPoint(oldMntPath) {
-				logger.Infof("Lazy unmount custom volume %q in pool %q", curVol.Name, b.Name())
-				err = unix.Unmount(oldMntPath, unix.MNT_DETACH)
-				if err != nil {
-					return err
-				}
-				ourUnmount = true
-			}
-
-			logger.Infof("Renaming custom volume %q in pool %q to %q", curVol.Name, b.Name(), newVolStorageName)
-			err = b.driver.RenameVolume(oldVol, newVolStorageName, nil)
-			if err != nil {
-				return err
-			}
-
-			// Ensure we don't use the wrong volume for revert by using a temporary function.
-			revert.Add(func() {
-				logger.Infof("Reverting rename of custom volume %q in pool %q to %q", newVol.Name(), b.Name(), curVol.Name)
-				b.driver.RenameVolume(newVol, curVol.Name, nil)
-			})
-
-			// Check if volume is being used by daemon storage and needs its symlink updating.
-			used, err := VolumeUsedByDaemon(b.state, b.Name(), curVol.Name)
-			if err != nil {
-				return err
-			}
-
-			if used {
-				logger.Infof("Updating daemon storage symlinks for volume %q in pool %q", curVol.Name, b.Name())
-				for _, storageType := range []string{"images", "backups"} {
-					err = func(storageType string) error {
-						symlinkPath := shared.VarPath(storageType)
-						destPath, err := os.Readlink(symlinkPath)
-
-						// Check if storage type path is a symlink and points to volume.
-						if err == nil && destPath == oldVol.MountPath() {
-							newDestPath := newVol.MountPath()
-							logger.Infof("Updating daemon storage symlink at %q to %q", symlinkPath, newDestPath)
-							os.Remove(symlinkPath)
-							err = os.Symlink(newDestPath, symlinkPath)
-							if err != nil {
-								return fmt.Errorf("Failed to create the new symlink at %q to %q: %w", symlinkPath, newDestPath, err)
-							}
-
-							revert.Add(func() {
-								logger.Infof("Reverting daemon storage symlink at %q to %q", symlinkPath, destPath)
-								os.Remove(symlinkPath)
-								os.Symlink(destPath, symlinkPath)
-							})
-						}
-
-						return nil
-					}(storageType)
-					if err != nil {
-						return err
-					}
-				}
-			}
-
-			if ourUnmount {
-				logger.Infof("Mount custom volume %q in pool %q", newVolStorageName, b.Name())
-				err = b.driver.MountVolume(newVol, nil)
-				if err != nil {
-					return err
-				}
-			}
-
-			return nil
-		}(v)
+	// Get instances on this local server (as the DB helper functions return volumes on local server), also
+	// avoids running the same queries on every cluster member for instances on shared storage.
+	filter := cluster.InstanceFilter{Node: &localNode}
+	err = b.state.DB.Cluster.InstanceList(func(inst db.InstanceArgs, p api.Project) error {
+		// Check we can convert the instance to the volume type needed.
+		volType, err := InstanceTypeToVolumeType(inst.Type)
 		if err != nil {
 			return err
 		}
+
+		contentType := drivers.ContentTypeFS
+		if inst.Type == instancetype.VM {
+			contentType = drivers.ContentTypeBlock
+		}
+
+		// Get all the instance snapshot DB records.
+		var instPoolName string
+		var snapshots []cluster.Instance
+		err = b.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			instPoolName, err = tx.GetInstancePool(ctx, p.Name, inst.Name)
+			if err != nil {
+				if api.StatusErrorCheck(err, http.StatusNotFound) {
+					// If the instance cannot be associated to a pool its got bigger problems
+					// outside the scope of this patch. Will skip due to empty instPoolName.
+					return nil
+				}
+
+				return fmt.Errorf("Failed finding pool for instance %q in project %q: %w", inst.Name, p.Name, err)
+			}
+
+			snapshots, err = tx.GetInstanceSnapshotsWithName(ctx, p.Name, inst.Name)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		if instPoolName != b.Name() {
+			return nil // This instance isn't hosted on this storage pool, skip.
+		}
+
+		dbVol, err := VolumeDBGet(b, p.Name, inst.Name, volType)
+		if err != nil {
+			return fmt.Errorf("Failed loading storage volume record %q: %w", inst.Name, err)
+		}
+
+		// Get all the instance volume snapshot DB records.
+		dbVolSnaps, err := VolumeDBSnapshotsGet(b, p.Name, inst.Name, volType)
+		if err != nil {
+			return fmt.Errorf("Failed loading storage volume snapshot records %q: %w", inst.Name, err)
+		}
+
+		for i := range snapshots {
+			foundVolumeSnapshot := false
+			for _, dbVolSnap := range dbVolSnaps {
+				if dbVolSnap.Name == snapshots[i].Name {
+					foundVolumeSnapshot = true
+					break
+				}
+			}
+
+			if !foundVolumeSnapshot {
+				b.logger.Info("Creating missing volume snapshot record", logger.Ctx{"project": snapshots[i].Project, "instance": snapshots[i].Name})
+				err = VolumeDBCreate(b, snapshots[i].Project, snapshots[i].Name, "Auto repaired", volType, true, dbVol.Config, snapshots[i].CreationDate, time.Time{}, contentType, false)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		return nil
+	}, filter)
+	if err != nil {
+		return err
 	}
 
-	revert.Success()
 	return nil
 }

@@ -16,23 +16,26 @@ import (
 var monitors = map[string]*Monitor{}
 var monitorsLock sync.Mutex
 
-// RingbufSize is the size of the agent serial ringbuffer in bytes
+// RingbufSize is the size of the agent serial ringbuffer in bytes.
 var RingbufSize = 16
+
+// AgentStatusStarted is the event sent once the lxd-agent has started.
+var AgentStatusStarted = "LXD-AGENT-STARTED"
 
 // Monitor represents a QMP monitor.
 type Monitor struct {
 	path string
 	qmp  *qmp.SocketMonitor
 
-	agentReady    bool
-	agentReadyMu  sync.Mutex
-	disconnected  bool
-	chDisconnect  chan struct{}
-	eventHandler  func(name string, data map[string]interface{})
-	serialCharDev string
+	agentStarted   bool
+	agentStartedMu sync.Mutex
+	disconnected   bool
+	chDisconnect   chan struct{}
+	eventHandler   func(name string, data map[string]any)
+	serialCharDev  string
 }
 
-// start handles the background goroutines for event handling and monitoring the ringbuffer
+// start handles the background goroutines for event handling and monitoring the ringbuffer.
 func (m *Monitor) start() error {
 	// Ringbuffer monitoring function.
 	checkBuffer := func() {
@@ -42,7 +45,7 @@ func (m *Monitor) start() error {
 		}
 
 		// Read the ringbuffer.
-		args := map[string]interface{}{
+		args := map[string]any{
 			"device": m.serialCharDev,
 			"size":   RingbufSize,
 			"format": "utf8",
@@ -58,13 +61,18 @@ func (m *Monitor) start() error {
 		if len(entries) > 1 {
 			status := entries[len(entries)-2]
 
-			m.agentReadyMu.Lock()
+			m.agentStartedMu.Lock()
 			if status == "STARTED" {
-				m.agentReady = true
+				if !m.agentStarted && m.eventHandler != nil {
+					go m.eventHandler(AgentStatusStarted, nil)
+				}
+
+				m.agentStarted = true
 			} else if status == "STOPPED" {
-				m.agentReady = false
+				m.agentStarted = false
 			}
-			m.agentReadyMu.Unlock()
+
+			m.agentStartedMu.Unlock()
 		}
 	}
 
@@ -133,7 +141,7 @@ func (m *Monitor) ping() error {
 }
 
 // run executes a command.
-func (m *Monitor) run(cmd string, args interface{}, resp interface{}) error {
+func (m *Monitor) run(cmd string, args any, resp any) error {
 	// Check if disconnected
 	if m.disconnected {
 		return ErrMonitorDisconnect
@@ -141,8 +149,8 @@ func (m *Monitor) run(cmd string, args interface{}, resp interface{}) error {
 
 	// Run the command.
 	requestArgs := struct {
-		Execute   string      `json:"execute"`
-		Arguments interface{} `json:"arguments,omitempty"`
+		Execute   string `json:"execute"`
+		Arguments any    `json:"arguments,omitempty"`
 	}{
 		Execute:   cmd,
 		Arguments: args,
@@ -183,7 +191,7 @@ func (m *Monitor) run(cmd string, args interface{}, resp interface{}) error {
 }
 
 // Connect creates or retrieves an existing QMP monitor for the path.
-func Connect(path string, serialCharDev string, eventHandler func(name string, data map[string]interface{})) (*Monitor, error) {
+func Connect(path string, serialCharDev string, eventHandler func(name string, data map[string]any)) (*Monitor, error) {
 	monitorsLock.Lock()
 	defer monitorsLock.Unlock()
 
@@ -211,8 +219,9 @@ func Connect(path string, serialCharDev string, eventHandler func(name string, d
 		if err != nil {
 			return nil, err
 		}
+
 	case <-time.After(5 * time.Second):
-		qmpConn.Disconnect()
+		_ = qmpConn.Disconnect()
 		return nil, fmt.Errorf("QMP connection timed out")
 	}
 
@@ -236,12 +245,12 @@ func Connect(path string, serialCharDev string, eventHandler func(name string, d
 	return monitor, nil
 }
 
-// AgentReady indicates whether an agent has been detected.
-func (m *Monitor) AgentReady() bool {
-	m.agentReadyMu.Lock()
-	defer m.agentReadyMu.Unlock()
+// AgenStarted indicates whether an agent has been detected.
+func (m *Monitor) AgenStarted() bool {
+	m.agentStartedMu.Lock()
+	defer m.agentStartedMu.Unlock()
 
-	return m.agentReady
+	return m.agentStarted
 }
 
 // Disconnect forces a disconnection from QEMU.
@@ -253,7 +262,7 @@ func (m *Monitor) Disconnect() {
 	if !m.disconnected {
 		close(m.chDisconnect)
 		m.disconnected = true
-		m.qmp.Disconnect()
+		_ = m.qmp.Disconnect()
 	}
 
 	// Remove from the map.

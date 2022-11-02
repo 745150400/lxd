@@ -1,9 +1,9 @@
 package schema
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	"github.com/lxc/lxd/lxd/db/query"
@@ -12,15 +12,16 @@ import (
 
 // DoesSchemaTableExist return whether the schema table is present in the
 // database.
-func DoesSchemaTableExist(tx *sql.Tx) (bool, error) {
+func DoesSchemaTableExist(ctx context.Context, tx *sql.Tx) (bool, error) {
 	statement := `
 SELECT COUNT(name) FROM sqlite_master WHERE type = 'table' AND name = 'schema'
 `
-	rows, err := tx.Query(statement)
+	rows, err := tx.QueryContext(ctx, statement)
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
+
+	defer func() { _ = rows.Close() }()
 
 	if !rows.Next() {
 		return false, fmt.Errorf("schema table query returned no rows")
@@ -37,16 +38,16 @@ SELECT COUNT(name) FROM sqlite_master WHERE type = 'table' AND name = 'schema'
 }
 
 // Return all versions in the schema table, in increasing order.
-func selectSchemaVersions(tx *sql.Tx) ([]int, error) {
+func selectSchemaVersions(ctx context.Context, tx *sql.Tx) ([]int, error) {
 	statement := `
 SELECT version FROM schema ORDER BY version
 `
-	return query.SelectIntegers(tx, statement)
+	return query.SelectIntegers(ctx, tx, statement)
 }
 
 // Return a list of SQL statements that can be used to create all tables in the
 // database.
-func selectTablesSQL(tx *sql.Tx) ([]string, error) {
+func selectTablesSQL(ctx context.Context, tx *sql.Tx) ([]string, error) {
 	statement := `
 SELECT sql FROM sqlite_master WHERE
   type IN ('table', 'index', 'view', 'trigger') AND
@@ -54,7 +55,7 @@ SELECT sql FROM sqlite_master WHERE
   name NOT LIKE 'sqlite_%'
 ORDER BY name
 `
-	return query.SelectStrings(tx, statement)
+	return query.SelectStrings(ctx, tx, statement)
 }
 
 // Create the schema table.
@@ -81,18 +82,18 @@ INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"))
 }
 
 // Read the given file (if it exists) and executes all queries it contains.
-func execFromFile(tx *sql.Tx, path string, hook Hook) error {
+func execFromFile(ctx context.Context, tx *sql.Tx, path string, hook Hook) error {
 	if !shared.PathExists(path) {
 		return nil
 	}
 
-	bytes, err := ioutil.ReadFile(path)
+	bytes, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
 
 	if hook != nil {
-		err := hook(-1, tx)
+		err := hook(ctx, -1, tx)
 		if err != nil {
 			return fmt.Errorf("failed to execute hook: %w", err)
 		}

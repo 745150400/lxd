@@ -1,20 +1,18 @@
 package network
 
 import (
+	"context"
 	"fmt"
 	"net"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/lxd/cluster/request"
 	"github.com/lxc/lxd/lxd/db"
-	dbCluster "github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/ip"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/revert"
-	"github.com/lxc/lxd/lxd/warnings"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/validate"
 )
 
@@ -44,13 +42,13 @@ func (n *physical) Validate(config map[string]string) error {
 		"maas.subnet.ipv6":            validate.IsAny,
 		"ipv4.gateway":                validate.Optional(validate.IsNetworkAddressCIDRV4),
 		"ipv6.gateway":                validate.Optional(validate.IsNetworkAddressCIDRV6),
-		"ipv4.ovn.ranges":             validate.Optional(validate.IsNetworkRangeV4List),
-		"ipv6.ovn.ranges":             validate.Optional(validate.IsNetworkRangeV6List),
-		"ipv4.routes":                 validate.Optional(validate.IsNetworkV4List),
+		"ipv4.ovn.ranges":             validate.Optional(validate.IsListOf(validate.IsNetworkRangeV4)),
+		"ipv6.ovn.ranges":             validate.Optional(validate.IsListOf(validate.IsNetworkRangeV6)),
+		"ipv4.routes":                 validate.Optional(validate.IsListOf(validate.IsNetworkV4)),
 		"ipv4.routes.anycast":         validate.Optional(validate.IsBool),
-		"ipv6.routes":                 validate.Optional(validate.IsNetworkV6List),
+		"ipv6.routes":                 validate.Optional(validate.IsListOf(validate.IsNetworkV6)),
 		"ipv6.routes.anycast":         validate.Optional(validate.IsBool),
-		"dns.nameservers":             validate.Optional(validate.IsNetworkAddressList),
+		"dns.nameservers":             validate.Optional(validate.IsListOf(validate.IsNetworkAddress)),
 		"ovn.ingress_mode":            validate.Optional(validate.IsOneOf("l2proxy", "routed")),
 		"volatile.last_state.created": validate.Optional(validate.IsBool),
 	}
@@ -80,8 +78,8 @@ func (n *physical) checkParentUse(ourConfig map[string]string) (bool, error) {
 	var err error
 	var projectNetworks map[string]map[int64]api.Network
 
-	err = n.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		projectNetworks, err = tx.GetCreatedNetworks()
+	err = n.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		projectNetworks, err = tx.GetCreatedNetworks(ctx)
 		return err
 	})
 	if err != nil {
@@ -115,7 +113,7 @@ func (n *physical) checkParentUse(ourConfig map[string]string) (bool, error) {
 // Create checks whether the referenced parent interface is used by other networks or instance devices, as we
 // need to have exclusive access to the interface.
 func (n *physical) Create(clientType request.ClientType) error {
-	n.logger.Debug("Create", log.Ctx{"clientType": clientType, "config": n.config})
+	n.logger.Debug("Create", logger.Ctx{"clientType": clientType, "config": n.config})
 
 	// We only need to check in the database once, not on every clustered node.
 	if clientType == request.ClientTypeNormal {
@@ -123,6 +121,7 @@ func (n *physical) Create(clientType request.ClientType) error {
 		if err != nil {
 			return err
 		}
+
 		if inUse {
 			return fmt.Errorf("Parent interface %q in use by another network", n.config["parent"])
 		}
@@ -133,7 +132,7 @@ func (n *physical) Create(clientType request.ClientType) error {
 
 // Delete deletes a network.
 func (n *physical) Delete(clientType request.ClientType) error {
-	n.logger.Debug("Delete", log.Ctx{"clientType": clientType})
+	n.logger.Debug("Delete", logger.Ctx{"clientType": clientType})
 
 	err := n.Stop()
 	if err != nil {
@@ -145,7 +144,7 @@ func (n *physical) Delete(clientType request.ClientType) error {
 
 // Rename renames a network.
 func (n *physical) Rename(newName string) error {
-	n.logger.Debug("Rename", log.Ctx{"newName": newName})
+	n.logger.Debug("Rename", logger.Ctx{"newName": newName})
 
 	// Rename common steps.
 	err := n.common.rename(newName)
@@ -158,35 +157,43 @@ func (n *physical) Rename(newName string) error {
 
 // Start sets up some global configuration.
 func (n *physical) Start() error {
-	err := n.setup(nil)
-	if err != nil {
-		err := n.state.Cluster.UpsertWarningLocalNode(n.project, dbCluster.TypeNetwork, int(n.id), db.WarningNetworkStartupFailure, err.Error())
-		if err != nil {
-			n.logger.Warn("Failed to create warning", log.Ctx{"err": err})
-		}
-	} else {
-		err := warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(n.state.Cluster, n.project, db.WarningNetworkStartupFailure, dbCluster.TypeNetwork, int(n.id))
-		if err != nil {
-			n.logger.Warn("Failed to resolve warning", log.Ctx{"err": err})
-		}
-	}
-
-	return err
-}
-
-func (n *physical) setup(oldConfig map[string]string) error {
 	n.logger.Debug("Start")
 
 	revert := revert.New()
 	defer revert.Fail()
 
+	revert.Add(func() { n.setUnavailable() })
+
+	err := n.setup(nil)
+	if err != nil {
+		return err
+	}
+
+	revert.Success()
+
+	// Ensure network is marked as available now its started.
+	n.setAvailable()
+
+	return nil
+}
+
+func (n *physical) setup(oldConfig map[string]string) error {
+	revert := revert.New()
+	defer revert.Fail()
+
+	if !InterfaceExists(n.config["parent"]) {
+		return fmt.Errorf("Parent interface %q not found", n.config["parent"])
+	}
+
 	hostName := GetHostDevice(n.config["parent"], n.config["vlan"])
+
 	created, err := VLANInterfaceCreate(n.config["parent"], hostName, n.config["vlan"], shared.IsTrue(n.config["gvrp"]))
 	if err != nil {
 		return err
 	}
+
 	if created {
-		revert.Add(func() { InterfaceRemove(hostName) })
+		revert.Add(func() { _ = InterfaceRemove(hostName) })
 	}
 
 	// Set the MTU.
@@ -202,7 +209,7 @@ func (n *physical) setup(oldConfig map[string]string) error {
 	// so it can be removed on stop. This way we won't overwrite the setting on LXD restart.
 	if shared.IsFalseOrEmpty(n.config["volatile.last_state.created"]) {
 		n.config["volatile.last_state.created"] = fmt.Sprintf("%t", created)
-		err = n.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+		err = n.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			return tx.UpdateNetwork(n.id, n.description, n.config)
 		})
 		if err != nil {
@@ -252,7 +259,7 @@ func (n *physical) Stop() error {
 
 	// Remove last state config.
 	delete(n.config, "volatile.last_state.created")
-	err = n.state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+	err = n.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		return tx.UpdateNetwork(n.id, n.description, n.config)
 	})
 	if err != nil {
@@ -265,7 +272,7 @@ func (n *physical) Stop() error {
 // Update updates the network. Accepts notification boolean indicating if this update request is coming from a
 // cluster notification, in which case do not update the database, just apply local changes needed.
 func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientType request.ClientType) error {
-	n.logger.Debug("Update", log.Ctx{"clientType": clientType, "newNetwork": newNetwork})
+	n.logger.Debug("Update", logger.Ctx{"clientType": clientType, "newNetwork": newNetwork})
 
 	dbUpdateNeeeded, changedKeys, oldNetwork, err := n.common.configChanged(newNetwork)
 	if err != nil {
@@ -300,6 +307,7 @@ func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientTy
 			if err != nil {
 				return err
 			}
+
 			if inUse {
 				return fmt.Errorf("Parent interface %q in use by another network", newNetwork.Config["parent"])
 			}
@@ -319,7 +327,7 @@ func (n *physical) Update(newNetwork api.NetworkPut, targetNode string, clientTy
 	// Define a function which reverts everything.
 	revert.Add(func() {
 		// Reset changes to all nodes and database.
-		n.common.update(oldNetwork, targetNode, clientType)
+		_ = n.common.update(oldNetwork, targetNode, clientType)
 	})
 
 	// Apply changes to all nodes and databse.

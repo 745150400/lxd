@@ -1,12 +1,10 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -23,10 +21,10 @@ import (
 // NewTestNode creates a new Node for testing purposes, along with a function
 // that can be used to clean it up when done.
 func NewTestNode(t *testing.T) (*Node, func()) {
-	dir, err := ioutil.TempDir("", "lxd-db-test-node-")
+	dir, err := os.MkdirTemp("", "lxd-db-test-node-")
 	require.NoError(t, err)
 
-	db, _, err := OpenNode(dir, nil, nil)
+	db, err := OpenNode(dir, nil)
 	require.NoError(t, err)
 
 	cleanup := func() {
@@ -86,7 +84,7 @@ func NewTestClusterTx(t *testing.T) (*ClusterTx, func()) {
 
 	var err error
 
-	clusterTx := &ClusterTx{nodeID: cluster.nodeID, stmts: cluster.stmts}
+	clusterTx := &ClusterTx{nodeID: cluster.nodeID}
 	clusterTx.tx, err = cluster.db.Begin()
 	require.NoError(t, err)
 
@@ -110,7 +108,7 @@ func NewTestDqliteServer(t *testing.T) (string, driver.NodeStore, func()) {
 	require.NoError(t, err)
 
 	address := listener.Addr().String()
-	listener.Close()
+	require.NoError(t, listener.Close())
 
 	dir, dirCleanup := newDir(t)
 	err = os.Mkdir(filepath.Join(dir, "global"), 0755)
@@ -140,7 +138,7 @@ func NewTestDqliteServer(t *testing.T) (string, driver.NodeStore, func()) {
 func newDir(t *testing.T) (string, func()) {
 	t.Helper()
 
-	dir, err := ioutil.TempDir("", "dqlite-replication-test-")
+	dir, err := os.MkdirTemp("", "dqlite-replication-test-")
 	assert.NoError(t, err)
 
 	cleanup := func() {
@@ -156,9 +154,8 @@ func newDir(t *testing.T) (string, func()) {
 }
 
 func newLogFunc(t *testing.T) client.LogFunc {
-	return func(l client.LogLevel, format string, a ...interface{}) {
+	return func(l client.LogLevel, format string, a ...any) {
 		format = fmt.Sprintf("%s: %s", l.String(), format)
 		t.Logf(format, a...)
 	}
-
 }

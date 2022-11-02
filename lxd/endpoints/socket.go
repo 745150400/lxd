@@ -1,5 +1,4 @@
 //go:build linux && cgo
-// +build linux,cgo
 
 package endpoints
 
@@ -77,16 +76,17 @@ func socketUnixRemoveStale(path string) error {
 	return nil
 }
 
-// Change the file mode of the given unix socket file,
+// Change the file mode of the given unix socket file,.
 func socketUnixSetPermissions(path string, mode os.FileMode) error {
 	err := os.Chmod(path, mode)
 	if err != nil {
 		return fmt.Errorf("cannot set permissions on local socket: %w", err)
 	}
+
 	return nil
 }
 
-// Change the ownership of the given unix socket file,
+// Change the ownership of the given unix socket file,.
 func socketUnixSetOwnership(path string, groupName string) error {
 	var gid int
 	var err error
@@ -108,7 +108,6 @@ func socketUnixSetOwnership(path string, groupName string) error {
 	err = os.Chown(path, os.Getuid(), gid)
 	if err != nil {
 		return fmt.Errorf("cannot change ownership on local socket: %w", err)
-
 	}
 
 	return nil

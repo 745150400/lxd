@@ -17,21 +17,24 @@ import (
 // ListDatabaseNodes returns a list of database node names.
 func ListDatabaseNodes(database *db.Node) ([]string, error) {
 	nodes := []db.RaftNode{}
-	err := database.Transaction(func(tx *db.NodeTx) error {
+	err := database.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		var err error
-		nodes, err = tx.GetRaftNodes()
+		nodes, err = tx.GetRaftNodes(ctx)
 		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("Failed to list database nodes: %w", err)
 	}
+
 	addresses := make([]string, 0)
 	for _, node := range nodes {
 		if node.Role != db.RaftVoter {
 			continue
 		}
+
 		addresses = append(addresses, node.Address)
 	}
+
 	return addresses, nil
 }
 
@@ -39,9 +42,9 @@ func ListDatabaseNodes(database *db.Node) ([]string, error) {
 func Recover(database *db.Node) error {
 	// Figure out if we actually act as dqlite node.
 	var info *db.RaftNode
-	err := database.Transaction(func(tx *db.NodeTx) error {
+	err := database.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		var err error
-		info, err = node.DetermineRaftNode(tx)
+		info, err = node.DetermineRaftNode(ctx, tx)
 		return err
 	})
 	if err != nil {
@@ -79,7 +82,7 @@ func Recover(database *db.Node) error {
 	}
 
 	// Update the list of raft nodes.
-	err = database.Transaction(func(tx *db.NodeTx) error {
+	err = database.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		nodes := []db.RaftNode{
 			{
 				NodeInfo: client.NodeInfo{
@@ -101,14 +104,14 @@ func Recover(database *db.Node) error {
 
 // updateLocalAddress updates the cluster.https_address for this node.
 func updateLocalAddress(database *db.Node, address string) error {
-	err := database.Transaction(func(tx *db.NodeTx) error {
+	err := database.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		var err error
-		config, err := node.ConfigLoad(tx)
+		config, err := node.ConfigLoad(ctx, tx)
 		if err != nil {
 			return err
 		}
 
-		newConfig := map[string]interface{}{"cluster.https_address": address}
+		newConfig := map[string]any{"cluster.https_address": address}
 		_, err = config.Patch(newConfig)
 		if err != nil {
 			return err
@@ -127,9 +130,9 @@ func updateLocalAddress(database *db.Node, address string) error {
 // Addresses and node roles may be updated. Node IDs are read-only.
 func Reconfigure(database *db.Node, raftNodes []db.RaftNode) error {
 	var info *db.RaftNode
-	err := database.Transaction(func(tx *db.NodeTx) error {
+	err := database.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		var err error
-		info, err = node.DetermineRaftNode(tx)
+		info, err = node.DetermineRaftNode(ctx, tx)
 
 		return err
 	})
@@ -169,7 +172,7 @@ func Reconfigure(database *db.Node, raftNodes []db.RaftNode) error {
 	}
 
 	// Replace cluster configuration in local raft_nodes database.
-	err = database.Transaction(func(tx *db.NodeTx) error {
+	err = database.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		return tx.ReplaceRaftNodes(raftNodes)
 	})
 	if err != nil {
@@ -188,9 +191,15 @@ func Reconfigure(database *db.Node, raftNodes []db.RaftNode) error {
 		if err != nil {
 			return err
 		}
-		defer file.Close()
+
+		defer func() { _ = file.Close() }()
 
 		_, err = file.Write([]byte(content))
+		if err != nil {
+			return err
+		}
+
+		err = file.Close()
 		if err != nil {
 			return err
 		}
@@ -205,6 +214,7 @@ func RemoveRaftNode(gateway *Gateway, address string) error {
 	if err != nil {
 		return fmt.Errorf("Failed to get current raft nodes: %w", err)
 	}
+
 	var id uint64
 	for _, node := range nodes {
 		if node.Address == address {
@@ -226,10 +236,12 @@ func RemoveRaftNode(gateway *Gateway, address string) error {
 	if err != nil {
 		return fmt.Errorf("Failed to connect to cluster leader: %w", err)
 	}
-	defer client.Close()
+
+	defer func() { _ = client.Close() }()
 	err = client.Remove(ctx, id)
 	if err != nil {
 		return fmt.Errorf("Failed to remove node: %w", err)
 	}
+
 	return nil
 }

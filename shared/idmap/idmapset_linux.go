@@ -1,5 +1,4 @@
 //go:build linux && cgo
-// +build linux,cgo
 
 package idmap
 
@@ -38,18 +37,6 @@ type IdRange struct {
 
 func (i *IdRange) Contains(id int64) bool {
 	return id >= i.Startid && id <= i.Endid
-}
-
-/*
- * One entry in id mapping set - a single range of either
- * uid or gid mappings.
- */
-type IdmapEntry struct {
-	Isuid    bool
-	Isgid    bool
-	Hostid   int64 // id as seen on the host - i.e. 100000
-	Nsid     int64 // id as seen in the ns - i.e. 0
-	Maprange int64
 }
 
 func (e *IdmapEntry) ToLxcString() []string {
@@ -229,18 +216,21 @@ func (e *IdmapEntry) parse(s string) error {
 	if err != nil {
 		return err
 	}
+
 	e.Nsid = int64(nsid)
 
 	hostid, err := strconv.ParseUint(split[2], 10, 32)
 	if err != nil {
 		return err
 	}
+
 	e.Hostid = int64(hostid)
 
 	maprange, err := strconv.ParseUint(split[3], 10, 32)
 	if err != nil {
 		return err
 	}
+
 	e.Maprange = int64(maprange)
 
 	// wraparound
@@ -253,7 +243,7 @@ func (e *IdmapEntry) parse(s string) error {
 
 /*
  * Shift a uid from the host into the container
- * I.e. 0 -> 1000 -> 101000
+ * I.e. 0 -> 1000 -> 101000.
  */
 func (e *IdmapEntry) shift_into_ns(id int64) (int64, error) {
 	if id < e.Nsid || id >= e.Nsid+e.Maprange {
@@ -266,7 +256,7 @@ func (e *IdmapEntry) shift_into_ns(id int64) (int64, error) {
 
 /*
  * Shift a uid from the container back to the host
- * I.e. 101000 -> 1000
+ * I.e. 101000 -> 1000.
  */
 func (e *IdmapEntry) shift_from_ns(id int64) (int64, error) {
 	if id < e.Hostid || id >= e.Hostid+e.Maprange {
@@ -291,7 +281,7 @@ func (s ByHostid) Less(i, j int) bool {
 	return s[i].Hostid < s[j].Hostid
 }
 
-/* taken from http://blog.golang.org/slices (which is under BSD licence) */
+/* taken from http://blog.golang.org/slices (which is under BSD licence). */
 func Extend(slice []IdmapEntry, element IdmapEntry) []IdmapEntry {
 	n := len(slice)
 	if n == cap(slice) {
@@ -301,13 +291,10 @@ func Extend(slice []IdmapEntry, element IdmapEntry) []IdmapEntry {
 		copy(newSlice, slice)
 		slice = newSlice
 	}
+
 	slice = slice[0 : n+1]
 	slice[n] = element
 	return slice
-}
-
-type IdmapSet struct {
-	Idmap []IdmapEntry
 }
 
 func (m *IdmapSet) Equals(other *IdmapSet) bool {
@@ -348,11 +335,11 @@ func (m IdmapSet) Swap(i, j int) {
 
 func (m IdmapSet) Less(i, j int) bool {
 	if m.Idmap[i].Isuid != m.Idmap[j].Isuid {
-		return m.Idmap[i].Isuid == true
+		return m.Idmap[i].Isuid
 	}
 
 	if m.Idmap[i].Isgid != m.Idmap[j].Isgid {
-		return m.Idmap[i].Isgid == true
+		return m.Idmap[i].Isgid
 	}
 
 	return m.Idmap[i].Nsid < m.Idmap[j].Nsid
@@ -396,6 +383,7 @@ func (m IdmapSet) ValidRanges() ([]*IdRange, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	sort.Sort(idmap)
 
 	for _, mapEntry := range idmap.Idmap {
@@ -466,6 +454,7 @@ func (m *IdmapSet) AddSafe(i IdmapEntry) error {
 		if lower.Maprange > 0 {
 			result = append(result, lower)
 		}
+
 		result = append(result, i)
 		if upper.Maprange > 0 {
 			result = append(result, upper)
@@ -489,6 +478,7 @@ func (m IdmapSet) ToLxcString() []string {
 			}
 		}
 	}
+
 	return lines
 }
 
@@ -534,9 +524,11 @@ func (m IdmapSet) Append(s string) (IdmapSet, error) {
 	if err != nil {
 		return m, err
 	}
+
 	if m.Intersects(e) {
 		return m, fmt.Errorf("Conflicting id mapping")
 	}
+
 	m.Idmap = Extend(m.Idmap, e)
 	return m, nil
 }
@@ -599,8 +591,9 @@ func (set *IdmapSet) doUidshiftIntoContainer(dir string, testmode bool, how stri
 	tmp := filepath.Dir(dir)
 	tmp, err := filepath.EvalSymlinks(tmp)
 	if err != nil {
-		return fmt.Errorf("Expand symlinks: %w", err)
+		return fmt.Errorf("Failed expanding symlinks of %q: %w", tmp, err)
 	}
+
 	dir = filepath.Join(tmp, filepath.Base(dir))
 	dir = strings.TrimRight(dir, "/")
 
@@ -614,7 +607,7 @@ func (set *IdmapSet) doUidshiftIntoContainer(dir string, testmode bool, how stri
 			return filepath.SkipDir
 		}
 
-		intUid, intGid, _, _, inode, nlink, err := shared.GetFileStat(path)
+		intUID, intGID, _, _, inode, nlink, err := shared.GetFileStat(path)
 		if err != nil {
 			return err
 		}
@@ -630,8 +623,8 @@ func (set *IdmapSet) doUidshiftIntoContainer(dir string, testmode bool, how stri
 			hardLinks = append(hardLinks, inode)
 		}
 
-		uid := int64(intUid)
-		gid := int64(intGid)
+		uid := int64(intUID)
+		gid := int64(intGID)
 		caps := []byte{}
 
 		var newuid, newgid int64
@@ -668,15 +661,15 @@ func (set *IdmapSet) doUidshiftIntoContainer(dir string, testmode bool, how stri
 
 				// Shift capabilities
 				if len(caps) != 0 {
-					rootUid := int64(0)
+					rootUID := int64(0)
 					if how == "in" {
-						rootUid, _ = set.ShiftIntoNs(0, 0)
+						rootUID, _ = set.ShiftIntoNs(0, 0)
 					}
 
 					if how != "in" || atomic.LoadInt32(&VFS3Fscaps) == VFS3FscapsSupported {
-						err = SetCaps(path, caps, rootUid)
+						err = SetCaps(path, caps, rootUID)
 						if err != nil {
-							logger.Warnf("Unable to set file capabilities on %s", path)
+							logger.Warnf("Unable to set file capabilities on %q: %v", path, err)
 						}
 					}
 				}
@@ -714,7 +707,7 @@ func (set *IdmapSet) ShiftFile(p string) error {
 }
 
 /*
- * get a uid or gid mapping from /etc/subxid
+ * get a uid or gid mapping from /etc/subxid.
  */
 func getFromShadow(fname string, username string) ([][]int64, error) {
 	entries := [][]int64{}
@@ -723,7 +716,8 @@ func getFromShadow(fname string, username string) ([][]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -764,7 +758,7 @@ func getFromShadow(fname string, username string) ([][]int64, error) {
 }
 
 /*
- * get a uid or gid mapping from /proc/self/{g,u}id_map
+ * get a uid or gid mapping from /proc/self/{g,u}id_map.
  */
 func getFromProc(fname string) ([][]int64, error) {
 	entries := [][]int64{}
@@ -773,7 +767,8 @@ func getFromProc(fname string) ([][]int64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -818,7 +813,7 @@ func getFromProc(fname string) ([][]int64, error) {
 }
 
 /*
- * Create a new default idmap
+ * Create a new default idmap.
  */
 func DefaultIdmapSet(rootfs string, username string) (*IdmapSet, error) {
 	idmapset := new(IdmapSet)
@@ -990,7 +985,7 @@ func kernelDefaultMap() (*IdmapSet, error) {
 }
 
 /*
- * Create an idmap of the current allocation
+ * Create an idmap of the current allocation.
  */
 func CurrentIdmapSet() (*IdmapSet, error) {
 	idmapset := new(IdmapSet)
@@ -1061,7 +1056,7 @@ func JSONMarshal(idmapSet *IdmapSet) (string, error) {
 func GetIdmapSet() *IdmapSet {
 	idmapSet, err := DefaultIdmapSet("", "")
 	if err != nil {
-		logger.Warn("Error reading default uid/gid map", map[string]interface{}{"err": err.Error()})
+		logger.Warn("Error reading default uid/gid map", map[string]any{"err": err.Error()})
 		logger.Warnf("Only privileged containers will be able to run")
 		idmapSet = nil
 	} else {
@@ -1099,5 +1094,6 @@ func GetIdmapSet() *IdmapSet {
 			}
 		}
 	}
+
 	return idmapSet
 }

@@ -1,5 +1,4 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package state
 
@@ -7,6 +6,7 @@ import (
 	"context"
 	"testing"
 
+	clusterConfig "github.com/lxc/lxd/lxd/cluster/config"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/firewall"
 	"github.com/lxc/lxd/lxd/sys"
@@ -29,12 +29,12 @@ func NewTestState(t *testing.T) (*State, func()) {
 	}
 
 	state := &State{
-		Context:                context.TODO(),
-		Node:                   node,
-		Cluster:                cluster,
+		ShutdownCtx:            context.TODO(),
+		DB:                     &db.DB{Node: node, Cluster: cluster},
 		OS:                     os,
 		Firewall:               firewall.New(),
 		UpdateCertificateCache: func() {},
+		GlobalConfig:           &clusterConfig.Config{},
 	}
 
 	return state, cleanup

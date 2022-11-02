@@ -2,6 +2,7 @@ package device
 
 import (
 	"fmt"
+	"net/http"
 
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
@@ -16,6 +17,8 @@ import (
 
 type nicMACVLAN struct {
 	deviceCommon
+
+	network network.Network // Populated in validateConfig().
 }
 
 // CanHotPlug returns whether the device can be managed whilst the instance is running. Returns true.
@@ -61,20 +64,21 @@ func (d *nicMACVLAN) validateConfig(instConf instance.ConfigReader) error {
 
 		// If network property is specified, lookup network settings and apply them to the device's config.
 		// project.Default is used here as macvlan networks don't suppprt projects.
-		n, err := network.LoadByName(d.state, project.Default, d.config["network"])
+		var err error
+		d.network, err = network.LoadByName(d.state, project.Default, d.config["network"])
 		if err != nil {
 			return fmt.Errorf("Error loading network config for %q: %w", d.config["network"], err)
 		}
 
-		if n.Status() != api.NetworkStatusCreated {
+		if d.network.Status() != api.NetworkStatusCreated {
 			return fmt.Errorf("Specified network is not fully created")
 		}
 
-		if n.Type() != "macvlan" {
+		if d.network.Type() != "macvlan" {
 			return fmt.Errorf("Specified network must be of type macvlan")
 		}
 
-		netConfig := n.Config()
+		netConfig := d.network.Config()
 
 		// Get actual parent device from network's parent setting.
 		d.config["parent"] = netConfig["parent"]
@@ -82,7 +86,8 @@ func (d *nicMACVLAN) validateConfig(instConf instance.ConfigReader) error {
 		// Copy certain keys verbatim from the network's settings.
 		inheritKeys := []string{"mtu", "vlan", "maas.subnet.ipv4", "maas.subnet.ipv6", "gvrp"}
 		for _, inheritKey := range inheritKeys {
-			if _, found := netConfig[inheritKey]; found {
+			_, found := netConfig[inheritKey]
+			if found {
 				d.config[inheritKey] = netConfig[inheritKey]
 			}
 		}
@@ -94,6 +99,21 @@ func (d *nicMACVLAN) validateConfig(instConf instance.ConfigReader) error {
 	err := d.config.Validate(nicValidationRules(requiredFields, optionalFields, instConf))
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// PreStartCheck checks the managed parent network is available (if relevant).
+func (d *nicMACVLAN) PreStartCheck() error {
+	// Non-managed network NICs are not relevant for checking managed network availability.
+	if d.network == nil {
+		return nil
+	}
+
+	// If managed network is not available, don't try and start instance.
+	if d.network.LocalStatus() == api.StoragePoolStatusUnvailable {
+		return api.StatusErrorf(http.StatusServiceUnavailable, "Network %q unavailable on this server", d.network.Name())
 	}
 
 	return nil
@@ -132,7 +152,10 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 	actualParentName := network.GetHostDevice(d.config["parent"], d.config["vlan"])
 
 	// Record the temporary device name used for deletion later.
-	saveData["host_name"] = network.RandomDevName("mac")
+	saveData["host_name"], err = d.generateHostName("mac", d.config["hwaddr"])
+	if err != nil {
+		return nil, err
+	}
 
 	// Create VLAN parent device if needed.
 	statusDev, err := networkCreateVlanDeviceIfNeeded(d.state, d.config["parent"], actualParentName, d.config["vlan"], shared.IsTrue(d.config["gvrp"]))
@@ -145,7 +168,7 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 
 	if shared.IsTrue(saveData["last_state.created"]) {
 		revert.Add(func() {
-			networkRemoveInterfaceIfNeeded(d.state, actualParentName, d.inst, d.config["parent"], d.config["vlan"])
+			_ = networkRemoveInterfaceIfNeeded(d.state, actualParentName, d.inst, d.config["parent"], d.config["vlan"])
 		})
 	}
 
@@ -158,6 +181,7 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 			},
 			Mode: "bridge",
 		}
+
 		err = macvlan.Add()
 		if err != nil {
 			return nil, err
@@ -173,13 +197,14 @@ func (d *nicMACVLAN) Start() (*deviceConfig.RunConfig, error) {
 				Mode: "bridge",
 			},
 		}
+
 		err = macvtap.Add()
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	revert.Add(func() { network.InterfaceRemove(saveData["host_name"]) })
+	revert.Add(func() { _ = network.InterfaceRemove(saveData["host_name"]) })
 
 	// Set the MAC address.
 	if d.config["hwaddr"] != "" {
@@ -249,12 +274,14 @@ func (d *nicMACVLAN) Stop() (*deviceConfig.RunConfig, error) {
 
 // postStop is run after the device is removed from the instance.
 func (d *nicMACVLAN) postStop() error {
-	defer d.volatileSet(map[string]string{
-		"host_name":          "",
-		"last_state.hwaddr":  "",
-		"last_state.mtu":     "",
-		"last_state.created": "",
-	})
+	defer func() {
+		_ = d.volatileSet(map[string]string{
+			"host_name":          "",
+			"last_state.hwaddr":  "",
+			"last_state.mtu":     "",
+			"last_state.created": "",
+		})
+	}()
 
 	errs := []error{}
 	v := d.volatileGet()

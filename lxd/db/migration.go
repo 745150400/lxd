@@ -1,9 +1,9 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -20,7 +20,7 @@ import (
 // upgraded from a version without clustering to a version that supports
 // clustering, since in those version all data lives in the cluster database
 // (regardless of whether clustering is actually on or off).
-func LoadPreClusteringData(tx *sql.Tx) (*Dump, error) {
+func LoadPreClusteringData(ctx context.Context, tx *sql.Tx) (*Dump, error) {
 	// Sanitize broken foreign key references that might be around from the
 	// time where we didn't enforce foreign key constraints.
 	_, err := tx.Exec(`
@@ -47,44 +47,50 @@ DELETE FROM storage_volumes_config WHERE storage_volume_id NOT IN (SELECT id FRO
 	// Dump all tables.
 	dump := &Dump{
 		Schema: map[string][]string{},
-		Data:   map[string][][]interface{}{},
+		Data:   map[string][][]any{},
 	}
+
 	for _, table := range preClusteringTables {
 		logger.Debugf("Loading data from table %s", table)
-		data := [][]interface{}{}
+		data := [][]any{}
 		stmt := fmt.Sprintf("SELECT * FROM %s", table)
 
-		rows, err := tx.Query(stmt)
+		rows, err := tx.QueryContext(ctx, stmt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch rows from %s: %w", table, err)
 		}
 
 		columns, err := rows.Columns()
 		if err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, fmt.Errorf("failed to get columns of %s: %w", table, err)
 		}
+
 		dump.Schema[table] = columns
 
 		for rows.Next() {
-			values := make([]interface{}, len(columns))
-			row := make([]interface{}, len(columns))
+			values := make([]any, len(columns))
+			row := make([]any, len(columns))
 			for i := range values {
 				row[i] = &values[i]
 			}
+
 			err := rows.Scan(row...)
 			if err != nil {
-				rows.Close()
+				_ = rows.Close()
 				return nil, fmt.Errorf("failed to scan row from %s: %w", table, err)
 			}
+
 			data = append(data, values)
 		}
+
 		err = rows.Err()
 		if err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, fmt.Errorf("error while fetching rows from %s: %w", table, err)
 		}
-		rows.Close()
+
+		_ = rows.Close()
 
 		dump.Data[table] = data
 	}
@@ -124,6 +130,7 @@ INSERT INTO nodes(id, name, address, schema, api_extensions) VALUES(1, 'none', '
 	stmt = `
 INSERT INTO projects (name, description) VALUES ('default', 'Default LXD project');
 INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.images', 'true');
+INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.networks', 'true');
 INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.profiles', 'true');
 INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.storage.volumes', 'true');
 `
@@ -168,6 +175,7 @@ INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.storag
 					if !ok {
 						continue
 					}
+
 					if column == "key" && shared.StringInSlice(value, keys) {
 						skip = true
 					}
@@ -175,6 +183,7 @@ INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.storag
 				if skip {
 					continue
 				}
+
 			case "containers":
 				appendNodeID()
 			case "networks_config":
@@ -194,9 +203,10 @@ INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.storag
 					nullNodeID = true
 					break
 				}
+
 				appendNodeID()
 			case "storage_pools_config":
-				// The keys listed in StoragePoolNodeConfigKeys
+				// The keys listed in NodeSpecificStorageConfig
 				// are the only ones which are not global to the
 				// cluster, so all other keys will have a NULL
 				// node_id.
@@ -208,10 +218,11 @@ INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.storag
 					}
 				}
 				key := row[index].(string)
-				if !shared.StringInSlice(key, StoragePoolNodeConfigKeys) {
+				if !shared.StringInSlice(key, NodeSpecificStorageConfig) {
 					nullNodeID = true
 					break
 				}
+
 				appendNodeID()
 			case "networks":
 				fallthrough
@@ -234,10 +245,12 @@ INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.storag
 			if err != nil {
 				return fmt.Errorf("failed to insert row %d into %s: %w", i, table, err)
 			}
+
 			n, err := result.RowsAffected()
 			if err != nil {
 				return fmt.Errorf("no result count for row %d of %s: %w", i, table, err)
 			}
+
 			if n != 1 {
 				return fmt.Errorf("could not insert %d int %s", i, table)
 			}
@@ -245,7 +258,10 @@ INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.storag
 			// Also insert the image ID to node ID association.
 			if shared.StringInSlice(table, []string{"images", "networks", "storage_pools"}) {
 				entity := table[:len(table)-1]
-				importNodeAssociation(entity, columns, row, tx)
+				err := importNodeAssociation(entity, columns, row, tx)
+				if err != nil {
+					return fmt.Errorf("Failed to import node associations")
+				}
 			}
 		}
 	}
@@ -255,7 +271,7 @@ INSERT INTO projects_config (project_id, key, value) VALUES (1, 'features.storag
 
 // Insert a row in one of the nodes association tables (storage_pools_nodes,
 // networks_nodes, images_nodes).
-func importNodeAssociation(entity string, columns []string, row []interface{}, tx *sql.Tx) error {
+func importNodeAssociation(entity string, columns []string, row []any, tx *sql.Tx) error {
 	stmt := fmt.Sprintf(
 		"INSERT INTO %ss_nodes(%s_id, node_id) VALUES(?, 1)", entity, entity)
 	var id int64
@@ -268,10 +284,12 @@ func importNodeAssociation(entity string, columns []string, row []interface{}, t
 	if id == 0 {
 		return fmt.Errorf("entity %s has invalid ID", entity)
 	}
+
 	_, err := tx.Exec(stmt, id)
 	if err != nil {
 		return fmt.Errorf("failed to associate %s to node: %w", entity, err)
 	}
+
 	return nil
 }
 
@@ -283,7 +301,7 @@ type Dump struct {
 
 	// Map a table name to all the rows it contains. Each row is a slice
 	// of interfaces.
-	Data map[string][][]interface{}
+	Data map[string][][]any
 }
 
 var preClusteringTables = []string{

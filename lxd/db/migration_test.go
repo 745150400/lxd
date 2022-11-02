@@ -1,11 +1,11 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db_test
 
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/lxd/project"
 )
@@ -22,31 +23,31 @@ import (
 func TestLoadPreClusteringData(t *testing.T) {
 	tx := newPreClusteringTx(t)
 
-	dump, err := db.LoadPreClusteringData(tx)
+	dump, err := db.LoadPreClusteringData(context.Background(), tx)
 	require.NoError(t, err)
 
 	// config
 	assert.Equal(t, []string{"id", "key", "value"}, dump.Schema["config"])
 	assert.Len(t, dump.Data["config"], 3)
 	assert.Equal(t, "1.2.3.4:666", dump.Data["config"][0][2])
-	rows := []interface{}{int64(1), "core.https_address", "1.2.3.4:666"}
+	rows := []any{int64(1), "core.https_address", "1.2.3.4:666"}
 	assert.Equal(t, rows, dump.Data["config"][0])
-	rows = []interface{}{int64(2), "core.trust_password", "sekret"}
+	rows = []any{int64(2), "core.trust_password", "sekret"}
 	assert.Equal(t, rows, dump.Data["config"][1])
-	rows = []interface{}{int64(3), "maas.machine", "mymaas"}
+	rows = []any{int64(3), "maas.machine", "mymaas"}
 	assert.Equal(t, rows, dump.Data["config"][2])
 
 	// networks
 	assert.Equal(t, []string{"id", "name", "description"}, dump.Schema["networks"])
 	assert.Len(t, dump.Data["networks"], 1)
-	rows = []interface{}{int64(1), "lxcbr0", "LXD bridge"}
+	rows = []any{int64(1), "lxcbr0", "LXD bridge"}
 	assert.Equal(t, rows, dump.Data["networks"][0])
 }
 
 func TestImportPreClusteringData(t *testing.T) {
 	tx := newPreClusteringTx(t)
 
-	dump, err := db.LoadPreClusteringData(tx)
+	dump, err := db.LoadPreClusteringData(context.Background(), tx)
 	require.NoError(t, err)
 
 	dir, store, cleanup := db.NewTestDqliteServer(t)
@@ -56,19 +57,19 @@ func TestImportPreClusteringData(t *testing.T) {
 		return net.Dial("unix", address)
 	}
 
-	cluster, err := db.OpenCluster(context.Background(), "test.db", store, "1", dir, 5*time.Second, dump, driver.WithDialFunc(dial))
+	c, err := db.OpenCluster(context.Background(), "test.db", store, "1", dir, 5*time.Second, dump, driver.WithDialFunc(dial))
 	require.NoError(t, err)
-	defer cluster.Close()
+	defer func() { _ = c.Close() }()
 
 	// certificates
-	err = cluster.Transaction(func(tx *db.ClusterTx) error {
-		certs, err := tx.GetCertificates(db.CertificateFilter{})
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		certs, err := cluster.GetCertificates(context.Background(), tx.Tx())
 		require.NoError(t, err)
 		assert.Len(t, certs, 1)
 		cert := certs[0]
 		assert.Equal(t, 1, cert.ID)
 		assert.Equal(t, "abcd:efgh", cert.Fingerprint)
-		assert.Equal(t, db.CertificateTypeClient, cert.Type)
+		assert.Equal(t, cluster.CertificateTypeClient, cert.Type)
 		assert.Equal(t, "foo", cert.Name)
 		assert.Equal(t, "FOO", cert.Certificate)
 		return nil
@@ -76,8 +77,8 @@ func TestImportPreClusteringData(t *testing.T) {
 	require.NoError(t, err)
 
 	// config
-	err = cluster.Transaction(func(tx *db.ClusterTx) error {
-		config, err := tx.Config()
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		config, err := tx.Config(ctx)
 		require.NoError(t, err)
 		values := map[string]string{"core.trust_password": "sekret"}
 		assert.Equal(t, values, config)
@@ -86,10 +87,10 @@ func TestImportPreClusteringData(t *testing.T) {
 	require.NoError(t, err)
 
 	// networks
-	networks, err := cluster.GetNetworks(project.Default)
+	networks, err := c.GetNetworks(project.Default)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"lxcbr0"}, networks)
-	id, network, _, err := cluster.GetNetworkInAnyState(project.Default, "lxcbr0")
+	id, network, _, err := c.GetNetworkInAnyState(project.Default, "lxcbr0")
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), id)
 	assert.Equal(t, "true", network.Config["ipv4.nat"])
@@ -97,10 +98,10 @@ func TestImportPreClusteringData(t *testing.T) {
 	assert.Equal(t, []string{"none"}, network.Locations)
 
 	// storage
-	pools, err := cluster.GetStoragePoolNames()
+	pools, err := c.GetStoragePoolNames()
 	require.NoError(t, err)
 	assert.Equal(t, []string{"default"}, pools)
-	id, pool, _, err := cluster.GetStoragePool("default")
+	id, pool, _, err := c.GetStoragePool("default")
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), id)
 	assert.Equal(t, "/foo/bar", pool.Config["source"])
@@ -110,25 +111,40 @@ func TestImportPreClusteringData(t *testing.T) {
 	assert.Equal(t, "true", pool.Config["zfs.clone_copy"])
 	assert.Equal(t, "Created", pool.Status)
 	assert.Equal(t, []string{"none"}, pool.Locations)
-	volumes, err := cluster.GetLocalStoragePoolVolumes("default", id, []int{1})
-	require.NoError(t, err)
-	assert.Len(t, volumes, 1)
-	assert.Equal(t, "/foo/bar", volumes[0].Config["source"])
 
-	err = cluster.Transaction(func(tx *db.ClusterTx) error {
+	var dbVolumes []*db.StorageVolume
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		volumeType := db.StoragePoolVolumeTypeImage
+		filters := []db.StorageVolumeFilter{{
+			Type: &volumeType,
+		}}
+
+		dbVolumes, err = tx.GetStoragePoolVolumes(context.Background(), id, true, filters...)
+		if err != nil {
+			return fmt.Errorf("Failed loading storage volumes: %w", err)
+		}
+
+		return nil
+	})
+
+	require.NoError(t, err)
+	assert.Len(t, dbVolumes, 1)
+	assert.Equal(t, "/foo/bar", dbVolumes[0].Config["source"])
+
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		// The zfs.clone_copy config got a NULL node_id, since it's cluster global.
-		config, err := query.SelectConfig(tx.Tx(), "storage_pools_config", "node_id IS NULL")
+		config, err := query.SelectConfig(ctx, tx.Tx(), "storage_pools_config", "node_id IS NULL")
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{"zfs.clone_copy": "true"}, config)
 
 		// The other config keys are node-specific.
-		config, err = query.SelectConfig(tx.Tx(), "storage_pools_config", "node_id=?", 1)
+		config, err = query.SelectConfig(ctx, tx.Tx(), "storage_pools_config", "node_id=?", 1)
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{"source": "/foo/bar", "size": "123", "volatile.initial_source": "/foo/bar", "zfs.pool_name": "mypool"}, config)
 
 		// Storage volumes have now a node_id key set to 1 (the ID of
 		// the default node).
-		ids, err := query.SelectIntegers(tx.Tx(), "SELECT node_id FROM storage_volumes")
+		ids, err := query.SelectIntegers(ctx, tx.Tx(), "SELECT node_id FROM storage_volumes")
 		require.NoError(t, err)
 		assert.Equal(t, []int{1}, ids)
 
@@ -137,10 +153,10 @@ func TestImportPreClusteringData(t *testing.T) {
 	require.NoError(t, err)
 
 	// profiles
-	profiles, err := cluster.GetProfileNames("default")
+	profiles, err := c.GetProfileNames("default")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"default", "users"}, profiles)
-	_, profile, err := cluster.GetProfile("default", "default")
+	_, profile, err := c.GetProfile("default", "default")
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{}, profile.Config)
 	assert.Equal(t,
@@ -154,7 +170,7 @@ func TestImportPreClusteringData(t *testing.T) {
 				"nictype": "bridged",
 				"parent":  "lxdbr0"}},
 		profile.Devices)
-	_, profile, err = cluster.GetProfile("default", "users")
+	_, profile, err = c.GetProfile("default", "users")
 	require.NoError(t, err)
 	assert.Equal(t,
 		map[string]string{
@@ -201,10 +217,12 @@ func newPreClusteringTx(t *testing.T) *sql.Tx {
 		"INSERT INTO storage_volumes VALUES (1, 'dev', 1, 1, '')",
 		"INSERT INTO storage_volumes_config VALUES(1, 1, 'source', '/foo/bar')",
 	}
+
 	for _, stmt := range stmts {
 		_, err := tx.Exec(stmt)
 		require.NoError(t, err)
 	}
+
 	return tx
 }
 

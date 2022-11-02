@@ -31,12 +31,8 @@ type btrfs struct {
 func (d *btrfs) load() error {
 	// Register the patches.
 	d.patches = map[string]func() error{
-		"storage_create_vm":                        nil,
-		"storage_zfs_mount":                        nil,
-		"storage_create_vm_again":                  nil,
-		"storage_zfs_volmode":                      nil,
-		"storage_rename_custom_volume_add_project": nil,
-		"storage_lvm_skipactivation":               nil,
+		"storage_lvm_skipactivation":       nil,
+		"storage_missing_snapshot_records": nil,
 	}
 
 	// Done if previously loaded.
@@ -95,11 +91,12 @@ func (d *btrfs) Info() Info {
 		OptimizedBackupHeader: true,
 		PreservesInodes:       !d.state.OS.RunningInUserNS,
 		Remote:                d.isRemote(),
-		VolumeTypes:           []VolumeType{VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
+		VolumeTypes:           []VolumeType{VolumeTypeBucket, VolumeTypeCustom, VolumeTypeImage, VolumeTypeContainer, VolumeTypeVM},
 		BlockBacking:          false,
 		RunningCopyFreeze:     false,
 		DirectIO:              true,
 		MountedRoot:           true,
+		Buckets:               true,
 	}
 }
 
@@ -113,6 +110,16 @@ func (d *btrfs) Create() error {
 	if d.config["source"] == "" || d.config["source"] == loopPath {
 		// Create a loop based pool.
 		d.config["source"] = loopPath
+
+		// Pick a default size of the loop file if not specified.
+		if d.config["size"] == "" {
+			defaultSize, err := loopFileSizeDefault()
+			if err != nil {
+				return err
+			}
+
+			d.config["size"] = fmt.Sprintf("%dGiB", defaultSize)
+		}
 
 		// Create the loop file itself.
 		size, err := units.ParseByteSizeString(d.config["size"])
@@ -275,10 +282,11 @@ func (d *btrfs) Delete(op *operations.Operation) error {
 // Validate checks that all provide keys are supported and that no conflicting or missing configuration is present.
 func (d *btrfs) Validate(config map[string]string) error {
 	rules := map[string]func(value string) error{
+		"size":                validate.Optional(validate.IsSize),
 		"btrfs.mount_options": validate.IsAny,
 	}
 
-	return d.validatePool(config, rules)
+	return d.validatePool(config, rules, nil)
 }
 
 // Update applies any driver changes required from a configuration change.
@@ -314,20 +322,20 @@ func (d *btrfs) Mount() (bool, error) {
 		return false, nil
 	}
 
+	var err error
+
 	// Setup mount options.
 	loopPath := loopFilePath(d.name)
 	mntSrc := ""
 	mntDst := GetPoolMountPath(d.name)
 	mntFilesystem := "btrfs"
 	if d.config["source"] == loopPath {
-		// Bring up the loop device.
-		loopF, err := PrepareLoopDev(d.config["source"], LoFlagsAutoclear|LoFlagsDirectIO)
+		mntSrc, err = loopDeviceSetup(d.config["source"])
 		if err != nil {
 			return false, err
 		}
-		defer loopF.Close()
 
-		mntSrc = loopF.Name()
+		defer func() { _ = loopDeviceAutoDetach(mntSrc) }()
 	} else if filepath.IsAbs(d.config["source"]) {
 		// Bring up an existing device or path.
 		mntSrc = shared.HostPath(d.config["source"])
@@ -372,7 +380,7 @@ func (d *btrfs) Mount() (bool, error) {
 	}
 
 	// Handle traditional mounts.
-	err := TryMount(mntSrc, mntDst, mntFilesystem, mntFlags, mntOptions)
+	err = TryMount(mntSrc, mntDst, mntFilesystem, mntFlags, mntOptions)
 	if err != nil {
 		return false, err
 	}
@@ -388,12 +396,6 @@ func (d *btrfs) Unmount() (bool, error) {
 		return false, err
 	}
 
-	// If loop backed, force release the loop device.
-	loopPath := loopFilePath(d.name)
-	if d.config["source"] == loopPath {
-		releaseLoopDev(loopPath)
-	}
-
 	return ourUnmount, nil
 }
 
@@ -405,7 +407,7 @@ func (d *btrfs) GetResources() (*api.ResourcesStoragePool, error) {
 // MigrationType returns the type of transfer methods to be used when doing migrations between pools in preference order.
 func (d *btrfs) MigrationTypes(contentType ContentType, refresh bool) []migration.Type {
 	var rsyncFeatures []string
-	btrfsFeatures := []string{migration.BTRFSFeatureMigrationHeader, migration.BTRFSFeatureSubvolumes}
+	btrfsFeatures := []string{migration.BTRFSFeatureMigrationHeader, migration.BTRFSFeatureSubvolumes, migration.BTRFSFeatureSubvolumeUUIDs}
 
 	// Do not pass compression argument to rsync if the associated
 	// config key, that is rsync.compression, is set to false.
@@ -415,8 +417,8 @@ func (d *btrfs) MigrationTypes(contentType ContentType, refresh bool) []migratio
 		rsyncFeatures = []string{"xattrs", "delete", "compress", "bidirectional"}
 	}
 
-	// Only offer rsync for refreshes or if running in an unprivileged container.
-	if refresh || d.state.OS.RunningInUserNS {
+	// Only offer rsync if running in an unprivileged container.
+	if d.state.OS.RunningInUserNS {
 		var transportType migration.MigrationFSType
 
 		if contentType == ContentTypeBlock {

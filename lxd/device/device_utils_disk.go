@@ -1,6 +1,8 @@
 package device
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -20,6 +22,47 @@ import (
 	"github.com/lxc/lxd/shared/osarch"
 	"github.com/lxc/lxd/shared/subprocess"
 )
+
+// RBDFormatPrefix is the prefix used in disk paths to identify RBD.
+const RBDFormatPrefix = "rbd"
+
+// RBDFormatSeparator is the field separate used in disk paths for RBD devices.
+const RBDFormatSeparator = " "
+
+// DiskParseRBDFormat parses an rbd formatted string, and returns the pool name, volume name, and list of options.
+func DiskParseRBDFormat(rbd string) (string, string, []string, error) {
+	if !strings.HasPrefix(rbd, fmt.Sprintf("%s%s", RBDFormatPrefix, RBDFormatSeparator)) {
+		return "", "", nil, fmt.Errorf("Invalid rbd format, missing prefix")
+	}
+
+	fields := strings.SplitN(rbd, RBDFormatSeparator, 3)
+	if len(fields) != 3 {
+		return "", "", nil, fmt.Errorf("Invalid rbd format, invalid number of fields")
+	}
+
+	opts := fields[2]
+
+	fields = strings.SplitN(fields[1], "/", 2)
+	if len(fields) != 2 {
+		return "", "", nil, fmt.Errorf("Invalid rbd format, invalid pool or volume")
+	}
+
+	return fields[0], fields[1], strings.Split(opts, ":"), nil
+}
+
+// DiskGetRBDFormat returns a rbd formatted string with the given values.
+func DiskGetRBDFormat(clusterName string, userName string, poolName string, volumeName string) string {
+	// Configuration values containing :, @, or = can be escaped with a leading \ character.
+	// According to https://docs.ceph.com/docs/hammer/rbd/qemu-rbd/#usage
+	optEscaper := strings.NewReplacer(":", `\:`, "@", `\@`, "=", `\=`)
+	opts := []string{
+		fmt.Sprintf("id=%s", optEscaper.Replace(userName)),
+		fmt.Sprintf("pool=%s", optEscaper.Replace(poolName)),
+		fmt.Sprintf("conf=/etc/ceph/%s.conf", optEscaper.Replace(clusterName)),
+	}
+
+	return fmt.Sprintf("%s%s%s/%s%s%s", RBDFormatPrefix, RBDFormatSeparator, optEscaper.Replace(poolName), optEscaper.Replace(volumeName), RBDFormatSeparator, strings.Join(opts, ":"))
+}
 
 // BlockFsDetect detects the type of block device.
 func BlockFsDetect(dev string) (string, error) {
@@ -98,7 +141,7 @@ func DiskMount(srcPath string, dstPath string, readonly bool, recursive bool, pr
 	}
 
 	// Remount bind mounts in readonly mode if requested
-	if readonly == true && flags&unix.MS_BIND == unix.MS_BIND {
+	if readonly && flags&unix.MS_BIND == unix.MS_BIND {
 		flags = unix.MS_RDONLY | unix.MS_BIND | unix.MS_REMOUNT
 		err = unix.Mount("", dstPath, fsName, uintptr(flags), "")
 		if err != nil {
@@ -119,7 +162,7 @@ func DiskMount(srcPath string, dstPath string, readonly bool, recursive bool, pr
 func DiskMountClear(mntPath string) error {
 	if shared.PathExists(mntPath) {
 		if filesystem.IsMountPoint(mntPath) {
-			err := unix.Unmount(mntPath, unix.MNT_DETACH)
+			err := storageDrivers.TryUnmount(mntPath, 0)
 			if err != nil {
 				return fmt.Errorf("Failed unmounting %q: %w", mntPath, err)
 			}
@@ -141,7 +184,7 @@ func diskCephRbdMap(clusterName string, userName string, poolName string, volume
 		"--cluster", clusterName,
 		"--pool", poolName,
 		"map",
-		fmt.Sprintf("%s", volumeName))
+		volumeName)
 	if err != nil {
 		return "", err
 	}
@@ -156,7 +199,7 @@ func diskCephRbdMap(clusterName string, userName string, poolName string, volume
 }
 
 func diskCephRbdUnmap(deviceName string) error {
-	unmapImageName := fmt.Sprintf("%s", deviceName)
+	unmapImageName := deviceName
 	busyCount := 0
 again:
 	_, err := shared.RunCommand(
@@ -166,7 +209,7 @@ again:
 	if err != nil {
 		runError, ok := err.(shared.RunError)
 		if ok {
-			exitError, ok := runError.Err.(*exec.ExitError)
+			exitError, ok := runError.Unwrap().(*exec.ExitError)
 			if ok {
 				if exitError.ExitCode() == 22 {
 					// EINVAL (already unmapped)
@@ -189,52 +232,33 @@ again:
 
 		return err
 	}
+
 	goto again
 }
 
-func cephFsConfig(clusterName string, userName string) ([]string, string, error) {
+// diskCephfsOptions returns the mntSrcPath and fsOptions to use for mounting a cephfs share.
+func diskCephfsOptions(clusterName string, userName string, fsName string, fsPath string) (string, []string, error) {
 	// Get the monitor list.
-	monitors, err := storageDrivers.CephMonitors(clusterName)
+	monAddresses, err := storageDrivers.CephMonitors(clusterName)
 	if err != nil {
-		return nil, "", err
+		return "", nil, err
 	}
 
 	// Get the keyring entry.
 	secret, err := storageDrivers.CephKeyring(clusterName, userName)
 	if err != nil {
-		return nil, "", err
-	}
-
-	return monitors, secret, nil
-}
-
-// diskCephfsOptions returns the mntSrcPath and fsOptions to use for mounting a cephfs share.
-func diskCephfsOptions(clusterName string, userName string, fsName string, fsPath string) (string, []string, error) {
-	// Get the credentials and host
-	monAddresses, secret, err := cephFsConfig(clusterName, userName)
-	if err != nil {
 		return "", nil, err
 	}
 
+	// Prepare mount entry.
 	fsOptions := []string{
 		fmt.Sprintf("name=%v", userName),
 		fmt.Sprintf("secret=%v", secret),
 		fmt.Sprintf("mds_namespace=%v", fsName),
 	}
 
-	srcpath := ""
-	for _, monAddress := range monAddresses {
-		// Add the default port to the mon hosts if not already provided
-		if strings.Contains(monAddress, ":6789") {
-			srcpath += fmt.Sprintf("%s,", monAddress)
-		} else {
-			srcpath += fmt.Sprintf("%s:6789,", monAddress)
-		}
-	}
-	srcpath = srcpath[:len(srcpath)-1]
-	srcpath += fmt.Sprintf(":/%s", fsPath)
-
-	return srcpath, fsOptions, nil
+	srcPath := strings.Join(monAddresses, ",") + ":/" + fsPath
+	return srcPath, fsOptions, nil
 }
 
 // diskAddRootUserNSEntry takes a set of idmap entries, and adds host -> userns root uid/gid mappings if needed.
@@ -274,42 +298,11 @@ func diskAddRootUserNSEntry(idmaps []idmap.IdmapEntry, hostRootID int64) []idmap
 	return idmaps
 }
 
-// forkusernsexecWriteIdmaps writes the idmap entries to the forkusernsexec pipes.
-func forkusernsexecWriteIdmaps(wUIDMapPipe *os.File, wGIDMapPipe *os.File, idmaps []idmap.IdmapEntry) error {
-	for _, idmap := range idmaps {
-		if idmap.Isuid {
-			_, err := wUIDMapPipe.WriteString(fmt.Sprintf("%d %d %d\n", idmap.Nsid, idmap.Hostid, idmap.Maprange))
-			if err != nil {
-				return err
-			}
-		}
-
-		if idmap.Isgid {
-			_, err := wGIDMapPipe.WriteString(fmt.Sprintf("%d %d %d\n", idmap.Nsid, idmap.Hostid, idmap.Maprange))
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	// Make sure the strings are \x00 terminated so they are parseable as C strings.
-	_, err := wUIDMapPipe.WriteString("\x00")
-	if err != nil {
-		return err
-	}
-
-	_, err = wGIDMapPipe.WriteString("\x00")
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // DiskVMVirtfsProxyStart starts a new virtfs-proxy-helper process.
 // If the idmaps slice is supplied then the proxy process is run inside a user namespace using the supplied maps.
-// Returns a revert function, and a file handle to the proxy process.
-func DiskVMVirtfsProxyStart(execPath string, pidPath string, sharePath string, idmaps []idmap.IdmapEntry) (func(), *os.File, error) {
+// Returns a file handle to the proxy process and a revert fail function that can be used to undo this function if
+// a subsequent step fails,.
+func DiskVMVirtfsProxyStart(execPath string, pidPath string, sharePath string, idmaps []idmap.IdmapEntry) (*os.File, revert.Hook, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
@@ -318,6 +311,8 @@ func DiskVMVirtfsProxyStart(execPath string, pidPath string, sharePath string, i
 	if err != nil {
 		if shared.PathExists("/usr/lib/qemu/virtfs-proxy-helper") {
 			cmd = "/usr/lib/qemu/virtfs-proxy-helper"
+		} else if shared.PathExists("/usr/libexec/virtfs-proxy-helper") {
+			cmd = "/usr/libexec/virtfs-proxy-helper"
 		}
 	}
 
@@ -329,98 +324,78 @@ func DiskVMVirtfsProxyStart(execPath string, pidPath string, sharePath string, i
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to create unix listener for virtfs-proxy-helper: %w", err)
 	}
-	defer listener.Close()
+
+	defer func() { _ = listener.Close() }()
 
 	cDial, err := net.Dial("unix", listener.Addr().String())
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to connect to virtfs-proxy-helper unix listener: %w", err)
 	}
-	defer cDial.Close()
+
+	defer func() { _ = cDial.Close() }()
 
 	cDialUnix, ok := cDial.(*net.UnixConn)
 	if !ok {
 		return nil, nil, fmt.Errorf("Dialled virtfs-proxy-helper connection isn't unix socket")
 	}
-	defer cDialUnix.Close()
+
+	defer func() { _ = cDialUnix.Close() }()
 
 	cDialUnixFile, err := cDialUnix.File()
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed getting virtfs-proxy-helper unix dialed file: %w", err)
 	}
-	revert.Add(func() { cDialUnixFile.Close() })
+
+	revert.Add(func() { _ = cDialUnixFile.Close() })
 
 	cAccept, err := listener.Accept()
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to accept connection to virtfs-proxy-helper unix listener: %w", err)
 	}
-	defer cAccept.Close()
+
+	defer func() { _ = cAccept.Close() }()
 
 	cAcceptUnix, ok := cAccept.(*net.UnixConn)
 	if !ok {
 		return nil, nil, fmt.Errorf("Accepted virtfs-proxy-helper connection isn't unix socket")
 	}
-	defer cAcceptUnix.Close()
+
+	defer func() { _ = cAcceptUnix.Close() }()
 
 	acceptFile, err := cAcceptUnix.File()
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed getting virtfs-proxy-helper unix listener file: %w", err)
 	}
-	defer acceptFile.Close()
 
-	var args []string
-	var fdFiles []*os.File
-
-	if len(idmaps) > 0 {
-		rUIDMapPipe, wUIDMapPipe, err := os.Pipe()
-		if err != nil {
-			return nil, nil, err
-		}
-		defer rUIDMapPipe.Close()
-		defer wUIDMapPipe.Close()
-
-		rGIDMapPipe, wGIDMapPipe, err := os.Pipe()
-		if err != nil {
-			return nil, nil, err
-		}
-		defer rGIDMapPipe.Close()
-		defer wGIDMapPipe.Close()
-
-		err = forkusernsexecWriteIdmaps(wUIDMapPipe, wGIDMapPipe, idmaps)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		// Run proxy command via forkusernsexec, passing in the UID/GID map file handles.
-		// Instruct forkusernsexec to not close FD 5 as this will be used for passing the proxy socket FD.
-		fdFiles = append(fdFiles, rUIDMapPipe, rGIDMapPipe)
-		args = append(args, "forkusernsexec", fmt.Sprintf("--keep-fd-up-to=%d", 5), cmd)
-		cmd = execPath
-	}
+	defer func() { _ = acceptFile.Close() }()
 
 	// Start the virtfs-proxy-helper process in non-daemon mode and as root so that when the VM process is
 	// started as an unprivileged user, we can still share directories that process cannot access.
-	fdFiles = append(fdFiles, acceptFile)
-	args = append(args, "--nodaemon", "--fd", fmt.Sprintf("%d", 2+len(fdFiles)), "--path", sharePath)
+	args := []string{"--nodaemon", "--fd", "3", "--path", sharePath}
 	proc, err := subprocess.NewProcess(cmd, args, "", "")
 	if err != nil {
 		return nil, nil, err
 	}
 
-	err = proc.StartWithFiles(fdFiles)
+	if len(idmaps) > 0 {
+		proc.SetUserns(&idmap.IdmapSet{Idmap: idmaps})
+	}
+
+	err = proc.StartWithFiles(context.Background(), []*os.File{acceptFile})
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to start virtfs-proxy-helper: %w", err)
 	}
 
-	revert.Add(func() { proc.Stop() })
+	revert.Add(func() { _ = proc.Stop() })
 
 	err = proc.Save(pidPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to save virtfs-proxy-helper state: %w", err)
 	}
 
-	revertExternal := revert.Clone()
+	cleanup := revert.Clone().Fail
 	revert.Success()
-	return revertExternal.Fail, cDialUnixFile, err
+	return cDialUnixFile, cleanup, err
 }
 
 // DiskVMVirtfsProxyStop stops the virtfs-proxy-helper process.
@@ -437,7 +412,7 @@ func DiskVMVirtfsProxyStop(pidPath string) error {
 		}
 
 		// Remove PID file.
-		os.Remove(pidPath)
+		_ = os.Remove(pidPath)
 	}
 
 	return nil
@@ -457,13 +432,15 @@ func DiskVMVirtiofsdStart(execPath string, inst instance.Instance, socketPath st
 	}
 
 	// Remove old socket if needed.
-	os.Remove(socketPath)
+	_ = os.Remove(socketPath)
 
 	// Locate virtiofsd.
 	cmd, err := exec.LookPath("virtiofsd")
 	if err != nil {
 		if shared.PathExists("/usr/lib/qemu/virtiofsd") {
 			cmd = "/usr/lib/qemu/virtiofsd"
+		} else if shared.PathExists("/usr/libexec/virtiofsd") {
+			cmd = "/usr/libexec/virtiofsd"
 		}
 	}
 
@@ -481,13 +458,24 @@ func DiskVMVirtiofsdStart(execPath string, inst instance.Instance, socketPath st
 		return nil, nil, UnsupportedError{"Stateful migration unsupported"}
 	}
 
-	listener, err := net.Listen("unix", socketPath)
+	// Trickery to handle paths > 107 chars.
+	socketFileDir, err := os.Open(filepath.Dir(socketPath))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	defer func() { _ = socketFileDir.Close() }()
+
+	socketFile := fmt.Sprintf("/proc/self/fd/%d/%s", socketFileDir.Fd(), filepath.Base(socketPath))
+
+	listener, err := net.Listen("unix", socketFile)
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to create unix listener for virtiofsd: %w", err)
 	}
+
 	revert.Add(func() {
-		listener.Close()
-		os.Remove(socketPath)
+		_ = listener.Close()
+		_ = os.Remove(socketPath)
 	})
 
 	unixListener, ok := listener.(*net.UnixListener)
@@ -499,61 +487,35 @@ func DiskVMVirtiofsdStart(execPath string, inst instance.Instance, socketPath st
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to getting unix listener file for virtiofsd: %w", err)
 	}
-	defer unixFile.Close()
 
-	var args []string
-	var fdFiles []*os.File
-
-	if len(idmaps) > 0 {
-		rUIDMapPipe, wUIDMapPipe, err := os.Pipe()
-		if err != nil {
-			return nil, nil, err
-		}
-		defer rUIDMapPipe.Close()
-		defer wUIDMapPipe.Close()
-
-		rGIDMapPipe, wGIDMapPipe, err := os.Pipe()
-		if err != nil {
-			return nil, nil, err
-		}
-		defer rGIDMapPipe.Close()
-		defer wGIDMapPipe.Close()
-
-		err = forkusernsexecWriteIdmaps(wUIDMapPipe, wGIDMapPipe, idmaps)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		// Run proxy command via forkusernsexec, passing in the UID/GID map file handles.
-		// Instruct forkusernsexec to not close FD 5 as this will be used for passing the proxy socket FD.
-		fdFiles = append(fdFiles, rUIDMapPipe, rGIDMapPipe)
-		args = append(args, "forkusernsexec", fmt.Sprintf("--keep-fd-up-to=%d", 5), cmd)
-		cmd = execPath
-	}
+	defer func() { _ = unixFile.Close() }()
 
 	// Start the virtiofsd process in non-daemon mode.
-	fdFiles = append(fdFiles, unixFile)
-	args = append(args, fmt.Sprintf("--fd=%d", 2+len(fdFiles)), "-o", fmt.Sprintf("source=%s", sharePath))
+	args := []string{"--fd=3", "-o", fmt.Sprintf("source=%s", sharePath)}
 	proc, err := subprocess.NewProcess(cmd, args, logPath, logPath)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	err = proc.StartWithFiles(fdFiles)
+	if len(idmaps) > 0 {
+		proc.SetUserns(&idmap.IdmapSet{Idmap: idmaps})
+	}
+
+	err = proc.StartWithFiles(context.Background(), []*os.File{unixFile})
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to start virtiofsd: %w", err)
 	}
 
-	revert.Add(func() { proc.Stop() })
+	revert.Add(func() { _ = proc.Stop() })
 
 	err = proc.Save(pidPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to save virtiofsd state: %w", err)
 	}
 
-	revertExternal := revert.Clone()
+	cleanup := revert.Clone().Fail
 	revert.Success()
-	return revertExternal.Fail, listener, err
+	return cleanup, listener, err
 }
 
 // DiskVMVirtiofsdStop stops an existing virtiofsd process and cleans up.
@@ -572,11 +534,17 @@ func DiskVMVirtiofsdStop(socketPath string, pidPath string) error {
 		}
 
 		// Remove PID file if needed.
-		os.Remove(pidPath)
+		err = os.Remove(pidPath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("Failed to remove PID file: %w", err)
+		}
 	}
 
 	// Remove socket file if needed.
-	os.Remove(socketPath)
+	err := os.Remove(socketPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("Failed to remove socket file: %w", err)
+	}
 
 	return nil
 }

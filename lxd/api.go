@@ -1,25 +1,30 @@
 package main
 
 import (
+	"context"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strings"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/gorilla/mux"
-	"github.com/lxc/lxd/lxd/cluster"
+
+	clusterConfig "github.com/lxc/lxd/lxd/cluster/config"
 	"github.com/lxc/lxd/lxd/cluster/request"
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/project"
 	lxdRequest "github.com/lxc/lxd/lxd/request"
 	"github.com/lxc/lxd/lxd/response"
+	storagePools "github.com/lxc/lxd/lxd/storage"
+	"github.com/lxc/lxd/lxd/storage/s3"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
 )
 
 // swagger:operation GET / server api_get
 //
-// Get the supported API enpoints
+// Get the supported API endpoints
 //
 // Returns a list of supported API versions (URLs).
 //
@@ -57,12 +62,13 @@ import (
 func restServer(d *Daemon) *http.Server {
 	/* Setup the web server */
 	mux := mux.NewRouter()
-	mux.StrictSlash(false)
+	mux.StrictSlash(false) // Don't redirect to URL with trailing slash.
 	mux.SkipClean(true)
+	mux.UseEncodedPath() // Allow encoded values in path segments.
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		response.SyncResponse(true, []string{"/1.0"}).Render(w)
+		_ = response.SyncResponse(true, []string{"/1.0"}).Render(w)
 	})
 
 	for endpoint, f := range d.gateway.HandlerFuncs(d.heartbeatHandler, d.getTrustedCertificates) {
@@ -87,16 +93,42 @@ func restServer(d *Daemon) *http.Server {
 		d.createCmd(mux, "internal", c)
 	}
 
+	for _, c := range apiACME {
+		d.createCmd(mux, "", c)
+	}
+
 	mux.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		logger.Info("Sending top level 404", log.Ctx{"url": r.URL})
+		logger.Info("Sending top level 404", logger.Ctx{"url": r.URL})
 		w.Header().Set("Content-Type", "application/json")
-		response.NotFound(nil).Render(w)
+		_ = response.NotFound(nil).Render(w)
 	})
 
 	return &http.Server{
 		Handler:     &lxdHttpServer{r: mux, d: d},
 		ConnContext: lxdRequest.SaveConnectionInContext,
 	}
+}
+
+func hoistReqVM(f func(*Daemon, instance.Instance, http.ResponseWriter, *http.Request) response.Response, d *Daemon) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		trusted, inst, err := authenticateAgentCert(d, r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if !trusted {
+			http.Error(w, "", http.StatusUnauthorized)
+			return
+		}
+
+		resp := f(d, inst, w, r)
+		_ = resp.Render(w)
+	}
+}
+
+func vSockServer(d *Daemon) *http.Server {
+	return &http.Server{Handler: devLxdAPI(d, hoistReqVM)}
 }
 
 func metricsServer(d *Daemon) *http.Server {
@@ -107,7 +139,7 @@ func metricsServer(d *Daemon) *http.Server {
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		response.SyncResponse(true, []string{"/1.0"}).Render(w)
+		_ = response.SyncResponse(true, []string{"/1.0"}).Render(w)
 	})
 
 	for endpoint, f := range d.gateway.HandlerFuncs(d.heartbeatHandler, d.getTrustedCertificates) {
@@ -118,12 +150,134 @@ func metricsServer(d *Daemon) *http.Server {
 	d.createCmd(mux, "1.0", metricsCmd)
 
 	mux.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		logger.Info("Sending top level 404", log.Ctx{"url": r.URL})
+		logger.Info("Sending top level 404", logger.Ctx{"url": r.URL})
 		w.Header().Set("Content-Type", "application/json")
-		response.NotFound(nil).Render(w)
+		_ = response.NotFound(nil).Render(w)
 	})
 
 	return &http.Server{Handler: &lxdHttpServer{r: mux, d: d}}
+}
+
+func storageBucketsServer(d *Daemon) *http.Server {
+	/* Setup the web server */
+	m := mux.NewRouter()
+	m.StrictSlash(false)
+	m.SkipClean(true)
+
+	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Wait until daemon is fully started.
+		<-d.waitReady.Done()
+
+		// Check if request contains an access key, and if so try and route it to the associated bucket.
+		accessKey := s3.AuthorizationHeaderAccessKey(r.Header.Get("Authorization"))
+		if accessKey != "" {
+			// Lookup access key to ascertain if it maps to a bucket.
+			var err error
+			var bucket *db.StorageBucket
+			err = d.State().DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+				bucket, err = tx.GetStoragePoolLocalBucketByAccessKey(ctx, accessKey)
+				return err
+			})
+			if err != nil {
+				if api.StatusErrorCheck(err, http.StatusNotFound) {
+					errResult := s3.Error{Code: s3.ErrorCodeInvalidAccessKeyID}
+					errResult.Response(w)
+
+					return
+				}
+
+				errResult := s3.Error{Code: s3.ErrorCodeInternalError, Message: err.Error()}
+				errResult.Response(w)
+
+				return
+			}
+
+			pool, err := storagePools.LoadByName(d.State(), bucket.PoolName)
+			if err != nil {
+				errResult := s3.Error{Code: s3.ErrorCodeInternalError, Message: err.Error()}
+				errResult.Response(w)
+
+				return
+			}
+
+			minioProc, err := pool.ActivateBucket(bucket.Name, nil)
+			if err != nil {
+				errResult := s3.Error{Code: s3.ErrorCodeInternalError, Message: err.Error()}
+				errResult.Response(w)
+
+				return
+			}
+
+			u := minioProc.URL()
+
+			rproxy := httputil.NewSingleHostReverseProxy(&u)
+			rproxy.ServeHTTP(w, r)
+
+			return
+		}
+
+		// Otherwise treat request as anonymous.
+		listResult := s3.ListAllMyBucketsResult{Owner: s3.Owner{ID: "anonymous"}}
+		listResult.Response(w)
+	})
+
+	// We use the NotFoundHandler to reverse proxy requests to dynamically started local MinIO processes.
+	m.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Wait until daemon is fully started.
+		<-d.waitReady.Done()
+
+		pathParts := strings.Split(r.RequestURI, "/")
+		bucketName, err := url.PathUnescape(pathParts[1])
+		if err != nil {
+			errResult := s3.Error{Code: s3.ErrorCodeNoSuchBucket, BucketName: pathParts[1]}
+			errResult.Response(w)
+
+			return
+		}
+
+		// Lookup bucket.
+		var bucket *db.StorageBucket
+		err = d.State().DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+			bucket, err = tx.GetStoragePoolLocalBucket(ctx, bucketName)
+			return err
+		})
+		if err != nil {
+			if api.StatusErrorCheck(err, http.StatusNotFound) {
+				errResult := s3.Error{Code: s3.ErrorCodeNoSuchBucket, BucketName: bucketName}
+				errResult.Response(w)
+
+				return
+			}
+
+			errResult := s3.Error{Code: s3.ErrorCodeInternalError, Message: err.Error(), BucketName: bucketName}
+			errResult.Response(w)
+
+			return
+		}
+
+		pool, err := storagePools.LoadByName(d.State(), bucket.PoolName)
+		if err != nil {
+			errResult := s3.Error{Code: s3.ErrorCodeInternalError, Message: err.Error()}
+			errResult.Response(w)
+
+			return
+		}
+
+		minioProc, err := pool.ActivateBucket(bucketName, nil)
+		if err != nil {
+			errResult := s3.Error{Code: s3.ErrorCodeInternalError, Message: err.Error()}
+			errResult.Response(w)
+
+			return
+		}
+
+		u := minioProc.URL()
+
+		rproxy := httputil.NewSingleHostReverseProxy(&u)
+		rproxy.ServeHTTP(w, r)
+	})
+
+	return &http.Server{Handler: &lxdHttpServer{r: m, d: d}}
 }
 
 type lxdHttpServer struct {
@@ -132,22 +286,11 @@ type lxdHttpServer struct {
 }
 
 func (s *lxdHttpServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// Set CORS headers, unless this is an internal request.
 	if !strings.HasPrefix(req.URL.Path, "/internal") {
 		<-s.d.setupChan
-		err := s.d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			config, err := cluster.ConfigLoad(tx)
-			if err != nil {
-				return err
-			}
-			setCORSHeaders(rw, req, config)
-			return nil
-		})
-		if err != nil {
-			resp := response.SmartError(err)
-			resp.Render(rw)
-			return
-		}
+
+		// Set CORS headers, unless this is an internal request.
+		setCORSHeaders(rw, req, s.d.State().GlobalConfig)
 	}
 
 	// OPTIONS request don't need any further processing
@@ -159,7 +302,7 @@ func (s *lxdHttpServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	s.r.ServeHTTP(rw, req)
 }
 
-func setCORSHeaders(rw http.ResponseWriter, req *http.Request, config *cluster.Config) {
+func setCORSHeaders(rw http.ResponseWriter, req *http.Request, config *clusterConfig.Config) {
 	allowedOrigin := config.HTTPSAllowedOrigin()
 	origin := req.Header.Get("Origin")
 	if allowedOrigin != "" && origin != "" {
@@ -195,6 +338,7 @@ func projectParam(request *http.Request) string {
 	if projectParam == "" {
 		projectParam = project.Default
 	}
+
 	return projectParam
 }
 

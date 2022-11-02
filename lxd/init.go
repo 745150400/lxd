@@ -10,33 +10,13 @@ import (
 	"github.com/lxc/lxd/shared/api"
 )
 
-type initDataNode struct {
-	api.ServerPut `yaml:",inline"`
-	Networks      []internalClusterPostNetwork `json:"networks" yaml:"networks"`
-	StoragePools  []api.StoragePoolsPost       `json:"storage_pools" yaml:"storage_pools"`
-	Profiles      []api.ProfilesPost           `json:"profiles" yaml:"profiles"`
-	Projects      []api.ProjectsPost           `json:"projects" yaml:"projects"`
-}
-
-type initDataCluster struct {
-	api.ClusterPut `yaml:",inline"`
-
-	// The path to the cluster certificate
-	// Example: /tmp/cluster.crt
-	ClusterCertificatePath string `json:"cluster_certificate_path" yaml:"cluster_certificate_path"`
-
-	// A cluster join token
-	// Example: BASE64-TOKEN
-	ClusterToken string `json:"cluster_token" yaml:"cluster_token"`
-}
-
 // Helper to initialize node-specific entities on a LXD instance using the
-// definitions from the given initDataNode object.
+// definitions from the given api.InitLocalPreseed object.
 //
 // It's used both by the 'lxd init' command and by the PUT /1.0/cluster API.
 //
 // In case of error, the returned function can be used to revert the changes.
-func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error) {
+func initDataNodeApply(d lxd.InstanceServer, config api.InitLocalPreseed) (func(), error) {
 	revert := revert.New()
 	defer revert.Fail()
 
@@ -49,7 +29,7 @@ func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error
 		}
 
 		// Setup reverter.
-		revert.Add(func() { d.UpdateServer(currentServer.Writable(), "") })
+		revert.Add(func() { _ = d.UpdateServer(currentServer.Writable(), "") })
 
 		// Prepare the update.
 		newServer := api.ServerPut{}
@@ -69,84 +49,6 @@ func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error
 		}
 	}
 
-	// Apply network configuration.
-	if config.Networks != nil && len(config.Networks) > 0 {
-		// Network creator.
-		createNetwork := func(network internalClusterPostNetwork) error {
-			// Create the network if doesn't exist.
-			err := d.UseProject(network.Project).CreateNetwork(network.NetworksPost)
-			if err != nil {
-				return fmt.Errorf("Failed to create network %q in project %q: %w", network.Name, network.Project, err)
-			}
-
-			// Setup reverter.
-			revert.Add(func() { d.UseProject(network.Project).DeleteNetwork(network.Name) })
-			return nil
-		}
-
-		// Network updater.
-		updateNetwork := func(network internalClusterPostNetwork) error {
-			// Get the current network.
-			currentNetwork, etag, err := d.UseProject(network.Project).GetNetwork(network.Name)
-			if err != nil {
-				return fmt.Errorf("Failed to retrieve current network %q in project %q: %w", network.Name, network.Project, err)
-			}
-
-			// Prepare the update.
-			newNetwork := api.NetworkPut{}
-			err = shared.DeepCopy(currentNetwork.Writable(), &newNetwork)
-			if err != nil {
-				return fmt.Errorf("Failed to copy configuration of network %q in project %q: %w", network.Name, network.Project, err)
-			}
-
-			// Description override.
-			if network.Description != "" {
-				newNetwork.Description = network.Description
-			}
-
-			// Config overrides.
-			for k, v := range network.Config {
-				newNetwork.Config[k] = fmt.Sprintf("%v", v)
-			}
-
-			// Apply it.
-			err = d.UseProject(network.Project).UpdateNetwork(currentNetwork.Name, newNetwork, etag)
-			if err != nil {
-				return fmt.Errorf("Failed to update network %q in project %q: %w", network.Name, network.Project, err)
-			}
-
-			// Setup reverter.
-			revert.Add(func() {
-				d.UseProject(network.Project).UpdateNetwork(currentNetwork.Name, currentNetwork.Writable(), "")
-			})
-
-			return nil
-		}
-
-		for _, network := range config.Networks {
-			// Populate default project if not specified for backwards compatbility with earlier
-			// preseed dump files.
-			if network.Project == "" {
-				network.Project = project.Default
-			}
-
-			_, _, err := d.UseProject(network.Project).GetNetwork(network.Name)
-			if err != nil {
-				// New network.
-				err = createNetwork(network)
-				if err != nil {
-					return nil, err
-				}
-			} else {
-				// Existing network.
-				err = updateNetwork(network)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
 	// Apply storage configuration.
 	if config.StoragePools != nil && len(config.StoragePools) > 0 {
 		// Get the list of storagePools.
@@ -160,11 +62,11 @@ func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error
 			// Create the storagePool if doesn't exist.
 			err := d.CreateStoragePool(storagePool)
 			if err != nil {
-				return fmt.Errorf("Failed to create storage pool '%s': %w", storagePool.Name, err)
+				return fmt.Errorf("Failed to create storage pool %q: %w", storagePool.Name, err)
 			}
 
 			// Setup reverter.
-			revert.Add(func() { d.DeleteStoragePool(storagePool.Name) })
+			revert.Add(func() { _ = d.DeleteStoragePool(storagePool.Name) })
 			return nil
 		}
 
@@ -173,22 +75,22 @@ func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error
 			// Get the current storagePool.
 			currentStoragePool, etag, err := d.GetStoragePool(storagePool.Name)
 			if err != nil {
-				return fmt.Errorf("Failed to retrieve current storage pool '%s': %w", storagePool.Name, err)
+				return fmt.Errorf("Failed to retrieve current storage pool %q: %w", storagePool.Name, err)
 			}
 
 			// Quick check.
 			if currentStoragePool.Driver != storagePool.Driver {
-				return fmt.Errorf("Storage pool '%s' is of type '%s' instead of '%s'", currentStoragePool.Name, currentStoragePool.Driver, storagePool.Driver)
+				return fmt.Errorf("Storage pool %q is of type %q instead of %q", currentStoragePool.Name, currentStoragePool.Driver, storagePool.Driver)
 			}
 
 			// Setup reverter.
-			revert.Add(func() { d.UpdateStoragePool(currentStoragePool.Name, currentStoragePool.Writable(), "") })
+			revert.Add(func() { _ = d.UpdateStoragePool(currentStoragePool.Name, currentStoragePool.Writable(), "") })
 
 			// Prepare the update.
 			newStoragePool := api.StoragePoolPut{}
 			err = shared.DeepCopy(currentStoragePool.Writable(), &newStoragePool)
 			if err != nil {
-				return fmt.Errorf("Failed to copy configuration of storage pool '%s': %w", storagePool.Name, err)
+				return fmt.Errorf("Failed to copy configuration of storage pool %q: %w", storagePool.Name, err)
 			}
 
 			// Description override.
@@ -204,7 +106,7 @@ func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error
 			// Apply it.
 			err = d.UpdateStoragePool(currentStoragePool.Name, newStoragePool, etag)
 			if err != nil {
-				return fmt.Errorf("Failed to update storage pool '%s': %w", storagePool.Name, err)
+				return fmt.Errorf("Failed to update storage pool %q: %w", storagePool.Name, err)
 			}
 
 			return nil
@@ -229,6 +131,159 @@ func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error
 		}
 	}
 
+	// Apply network configuration function.
+	applyNetwork := func(network api.InitNetworksProjectPost) error {
+		currentNetwork, etag, err := d.UseProject(network.Project).GetNetwork(network.Name)
+		if err != nil {
+			// Create the network if doesn't exist.
+			err := d.UseProject(network.Project).CreateNetwork(network.NetworksPost)
+			if err != nil {
+				return fmt.Errorf("Failed to create local member network %q in project %q: %w", network.Name, network.Project, err)
+			}
+
+			// Setup reverter.
+			revert.Add(func() { _ = d.UseProject(network.Project).DeleteNetwork(network.Name) })
+		} else {
+			// Prepare the update.
+			newNetwork := api.NetworkPut{}
+			err = shared.DeepCopy(currentNetwork.Writable(), &newNetwork)
+			if err != nil {
+				return fmt.Errorf("Failed to copy configuration of network %q in project %q: %w", network.Name, network.Project, err)
+			}
+
+			// Description override.
+			if network.Description != "" {
+				newNetwork.Description = network.Description
+			}
+
+			// Config overrides.
+			for k, v := range network.Config {
+				newNetwork.Config[k] = fmt.Sprintf("%v", v)
+			}
+
+			// Apply it.
+			err = d.UseProject(network.Project).UpdateNetwork(currentNetwork.Name, newNetwork, etag)
+			if err != nil {
+				return fmt.Errorf("Failed to update local member network %q in project %q: %w", network.Name, network.Project, err)
+			}
+
+			// Setup reverter.
+			revert.Add(func() {
+				_ = d.UseProject(network.Project).UpdateNetwork(currentNetwork.Name, currentNetwork.Writable(), "")
+			})
+		}
+
+		return nil
+	}
+
+	// Apply networks in the default project before other projects config applied (so that if the projects
+	// depend on a network in the default project they can have their config applied successfully).
+	for i := range config.Networks {
+		// Populate default project if not specified for backwards compatbility with earlier
+		// preseed dump files.
+		if config.Networks[i].Project == "" {
+			config.Networks[i].Project = project.Default
+		}
+
+		if config.Networks[i].Project != project.Default {
+			continue
+		}
+
+		err := applyNetwork(config.Networks[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Apply project configuration.
+	if config.Projects != nil && len(config.Projects) > 0 {
+		// Get the list of projects.
+		projectNames, err := d.GetProjectNames()
+		if err != nil {
+			return nil, fmt.Errorf("Failed to retrieve list of projects: %w", err)
+		}
+
+		// Project creator.
+		createProject := func(project api.ProjectsPost) error {
+			// Create the project if doesn't exist.
+			err := d.CreateProject(project)
+			if err != nil {
+				return fmt.Errorf("Failed to create local member project %q: %w", project.Name, err)
+			}
+
+			// Setup reverter.
+			revert.Add(func() { _ = d.DeleteProject(project.Name) })
+			return nil
+		}
+
+		// Project updater.
+		updateProject := func(project api.ProjectsPost) error {
+			// Get the current project.
+			currentProject, etag, err := d.GetProject(project.Name)
+			if err != nil {
+				return fmt.Errorf("Failed to retrieve current project %q: %w", project.Name, err)
+			}
+
+			// Setup reverter.
+			revert.Add(func() { _ = d.UpdateProject(currentProject.Name, currentProject.Writable(), "") })
+
+			// Prepare the update.
+			newProject := api.ProjectPut{}
+			err = shared.DeepCopy(currentProject.Writable(), &newProject)
+			if err != nil {
+				return fmt.Errorf("Failed to copy configuration of project %q: %w", project.Name, err)
+			}
+
+			// Description override.
+			if project.Description != "" {
+				newProject.Description = project.Description
+			}
+
+			// Config overrides.
+			for k, v := range project.Config {
+				newProject.Config[k] = fmt.Sprintf("%v", v)
+			}
+
+			// Apply it.
+			err = d.UpdateProject(currentProject.Name, newProject, etag)
+			if err != nil {
+				return fmt.Errorf("Failed to update local member project %q: %w", project.Name, err)
+			}
+
+			return nil
+		}
+
+		for _, project := range config.Projects {
+			// New project.
+			if !shared.StringInSlice(project.Name, projectNames) {
+				err := createProject(project)
+				if err != nil {
+					return nil, err
+				}
+
+				continue
+			}
+
+			// Existing project.
+			err := updateProject(project)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Apply networks in non-default projects after project config applied (so that their projects exist).
+	for i := range config.Networks {
+		if config.Networks[i].Project == project.Default {
+			continue
+		}
+
+		err := applyNetwork(config.Networks[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Apply profile configuration.
 	if config.Profiles != nil && len(config.Profiles) > 0 {
 		// Get the list of profiles.
@@ -242,11 +297,11 @@ func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error
 			// Create the profile if doesn't exist.
 			err := d.CreateProfile(profile)
 			if err != nil {
-				return fmt.Errorf("Failed to create profile '%s': %w", profile.Name, err)
+				return fmt.Errorf("Failed to create profile %q: %w", profile.Name, err)
 			}
 
 			// Setup reverter.
-			revert.Add(func() { d.DeleteProfile(profile.Name) })
+			revert.Add(func() { _ = d.DeleteProfile(profile.Name) })
 			return nil
 		}
 
@@ -255,17 +310,17 @@ func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error
 			// Get the current profile.
 			currentProfile, etag, err := d.GetProfile(profile.Name)
 			if err != nil {
-				return fmt.Errorf("Failed to retrieve current profile '%s': %w", profile.Name, err)
+				return fmt.Errorf("Failed to retrieve current profile %q: %w", profile.Name, err)
 			}
 
 			// Setup reverter.
-			revert.Add(func() { d.UpdateProfile(currentProfile.Name, currentProfile.Writable(), "") })
+			revert.Add(func() { _ = d.UpdateProfile(currentProfile.Name, currentProfile.Writable(), "") })
 
 			// Prepare the update.
 			newProfile := api.ProfilePut{}
 			err = shared.DeepCopy(currentProfile.Writable(), &newProfile)
 			if err != nil {
-				return fmt.Errorf("Failed to copy configuration of profile '%s': %w", profile.Name, err)
+				return fmt.Errorf("Failed to copy configuration of profile %q: %w", profile.Name, err)
 			}
 
 			// Description override.
@@ -296,7 +351,7 @@ func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error
 			// Apply it.
 			err = d.UpdateProfile(currentProfile.Name, newProfile, etag)
 			if err != nil {
-				return fmt.Errorf("Failed to update profile '%s': %w", profile.Name, err)
+				return fmt.Errorf("Failed to update profile %q: %w", profile.Name, err)
 			}
 
 			return nil
@@ -321,92 +376,15 @@ func initDataNodeApply(d lxd.InstanceServer, config initDataNode) (func(), error
 		}
 	}
 
-	// Apply project configuration.
-	if config.Projects != nil && len(config.Projects) > 0 {
-		// Get the list of projects.
-		projectNames, err := d.GetProjectNames()
-		if err != nil {
-			return nil, fmt.Errorf("Failed to retrieve list of projects: %w", err)
-		}
-
-		// Project creator.
-		createProject := func(project api.ProjectsPost) error {
-			// Create the project if doesn't exist.
-			err := d.CreateProject(project)
-			if err != nil {
-				return fmt.Errorf("Failed to create project '%s': %w", project.Name, err)
-			}
-
-			// Setup reverter.
-			revert.Add(func() { d.DeleteProject(project.Name) })
-			return nil
-		}
-
-		// Project updater.
-		updateProject := func(project api.ProjectsPost) error {
-			// Get the current project.
-			currentProject, etag, err := d.GetProject(project.Name)
-			if err != nil {
-				return fmt.Errorf("Failed to retrieve current project '%s': %w", project.Name, err)
-			}
-
-			// Setup reverter.
-			revert.Add(func() { d.UpdateProject(currentProject.Name, currentProject.Writable(), "") })
-
-			// Prepare the update.
-			newProject := api.ProjectPut{}
-			err = shared.DeepCopy(currentProject.Writable(), &newProject)
-			if err != nil {
-				return fmt.Errorf("Failed to copy configuration of project '%s': %w", project.Name, err)
-			}
-
-			// Description override.
-			if project.Description != "" {
-				newProject.Description = project.Description
-			}
-
-			// Config overrides.
-			for k, v := range project.Config {
-				newProject.Config[k] = fmt.Sprintf("%v", v)
-			}
-
-			// Apply it.
-			err = d.UpdateProject(currentProject.Name, newProject, etag)
-			if err != nil {
-				return fmt.Errorf("Failed to update project '%s': %w", project.Name, err)
-			}
-
-			return nil
-		}
-
-		for _, project := range config.Projects {
-			// New project.
-			if !shared.StringInSlice(project.Name, projectNames) {
-				err := createProject(project)
-				if err != nil {
-					return nil, err
-				}
-
-				continue
-			}
-
-			// Existing project.
-			err := updateProject(project)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	revertExternal := revert.Clone() // Clone before calling revert.Success() so we can return the Fail func.
+	cleanup := revert.Clone().Fail // Clone before calling revert.Success() so we can return the Fail func.
 	revert.Success()
-	return revertExternal.Fail, nil
+	return cleanup, nil
 }
 
 // Helper to initialize LXD clustering.
 //
 // Used by the 'lxd init' command.
-func initDataClusterApply(d lxd.InstanceServer, config *initDataCluster) error {
+func initDataClusterApply(d lxd.InstanceServer, config *api.InitClusterPreseed) error {
 	if config == nil || !config.Enabled {
 		return nil
 	}

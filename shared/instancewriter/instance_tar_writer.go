@@ -1,5 +1,4 @@
 //go:build linux && cgo
-// +build linux,cgo
 
 package instancewriter
 
@@ -92,7 +91,8 @@ func (ctw *InstanceTarWriter) WriteFile(name string, srcPath string, fi os.FileI
 
 	// If it's a hardlink we've already seen use the old name.
 	if fi.Mode().IsRegular() && nlink > 1 {
-		if firstPath, found := ctw.linkMap[ino]; found {
+		firstPath, found := ctw.linkMap[ino]
+		if found {
 			hdr.Typeflag = tar.TypeLink
 			hdr.Linkname = firstPath
 			hdr.Size = 0
@@ -116,6 +116,7 @@ func (ctw *InstanceTarWriter) WriteFile(name string, srcPath string, fi os.FileI
 					logger.Debugf("Failed to unshift ACL access permissions of %q: %v", srcPath, err)
 					continue
 				}
+
 				hdr.PAXRecords["SCHILY.acl.access"] = aclAccess
 			} else if key == "system.posix_acl_default" && ctw.idmapSet != nil {
 				aclDefault, err := idmap.UnshiftACL(val, ctw.idmapSet)
@@ -123,6 +124,7 @@ func (ctw *InstanceTarWriter) WriteFile(name string, srcPath string, fi os.FileI
 					logger.Debugf("Failed to unshift ACL default permissions of %q: %v", srcPath, err)
 					continue
 				}
+
 				hdr.PAXRecords["SCHILY.acl.default"] = aclDefault
 			} else if key == "security.capability" && ctw.idmapSet != nil {
 				vfsCaps, err := idmap.UnshiftCaps(val, ctw.idmapSet)
@@ -130,6 +132,7 @@ func (ctw *InstanceTarWriter) WriteFile(name string, srcPath string, fi os.FileI
 					logger.Debugf("Failed to unshift VFS capabilities of %q: %v", srcPath, err)
 					continue
 				}
+
 				hdr.PAXRecords["SCHILY.xattr."+key] = vfsCaps
 			} else {
 				hdr.PAXRecords["SCHILY.xattr."+key] = val
@@ -147,7 +150,8 @@ func (ctw *InstanceTarWriter) WriteFile(name string, srcPath string, fi os.FileI
 		if err != nil {
 			return fmt.Errorf("Failed to open file %q: %w", srcPath, err)
 		}
-		defer f.Close()
+
+		defer func() { _ = f.Close() }()
 
 		r := io.Reader(f)
 		if ignoreGrowth {
@@ -157,6 +161,11 @@ func (ctw *InstanceTarWriter) WriteFile(name string, srcPath string, fi os.FileI
 		_, err = io.Copy(ctw.tarWriter, r)
 		if err != nil {
 			return fmt.Errorf("Failed to copy file content %q: %w", srcPath, err)
+		}
+
+		err = f.Close()
+		if err != nil {
+			return fmt.Errorf("Failed to close file %q: %w", srcPath, err)
 		}
 	}
 
@@ -186,5 +195,6 @@ func (ctw *InstanceTarWriter) Close() error {
 	if err != nil {
 		return fmt.Errorf("Failed to close tar writer: %w", err)
 	}
+
 	return nil
 }

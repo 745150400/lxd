@@ -1,6 +1,7 @@
 package drivers
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -13,7 +14,6 @@ import (
 	"github.com/pborman/uuid"
 
 	"github.com/lxc/lxd/lxd/project"
-	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/validate"
 	"github.com/lxc/lxd/shared/version"
@@ -141,11 +141,13 @@ func (d Nftables) nftParseRuleset() ([]nftGenericItem, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	err = cmd.Start()
 	if err != nil {
 		return nil, err
 	}
-	defer cmd.Wait()
+
+	defer func() { _ = cmd.Wait() }()
 
 	// This only extracts certain generic parts of the ruleset, see man libnftables-json for more info.
 	v := &struct {
@@ -159,13 +161,16 @@ func (d Nftables) nftParseRuleset() ([]nftGenericItem, error) {
 
 	items := []nftGenericItem{}
 	for _, item := range v.Nftables {
-		if rule, found := item["rule"]; found {
+		rule, foundRule := item["rule"]
+		chain, foundChain := item["chain"]
+		table, foundTable := item["table"]
+		if foundRule {
 			rule.ItemType = "rule"
 			items = append(items, rule)
-		} else if chain, found := item["chain"]; found {
+		} else if foundChain {
 			chain.ItemType = "chain"
 			items = append(items, chain)
-		} else if table, found := item["table"]; found {
+		} else if foundTable {
 			table.ItemType = "table"
 			items = append(items, table)
 		}
@@ -190,9 +195,9 @@ func (d Nftables) hostVersion() (*version.DottedVersion, error) {
 	return version.Parse(strings.TrimPrefix(lines[1], "v"))
 }
 
-// networkSetupForwardingPolicy allows forwarding dependent on boolean argument
+// networkSetupForwardingPolicy allows forwarding dependent on boolean argument.
 func (d Nftables) networkSetupForwardingPolicy(networkName string, ip4Allow *bool, ip6Allow *bool) error {
-	tplFields := map[string]interface{}{
+	tplFields := map[string]any{
 		"namespace":      nftablesNamespace,
 		"chainSeparator": nftablesChainSeparator,
 		"networkName":    networkName,
@@ -233,7 +238,7 @@ func (d Nftables) networkSetupForwardingPolicy(networkName string, ip4Allow *boo
 func (d Nftables) networkSetupOutboundNAT(networkName string, SNATV4 *SNATOpts, SNATV6 *SNATOpts) error {
 	rules := make(map[string]*SNATOpts, 0)
 
-	tplFields := map[string]interface{}{
+	tplFields := map[string]any{
 		"namespace":      nftablesNamespace,
 		"chainSeparator": nftablesChainSeparator,
 		"networkName":    networkName,
@@ -271,7 +276,7 @@ func (d Nftables) networkSetupICMPDHCPDNSAccess(networkName string, ipVersions [
 		}
 	}
 
-	tplFields := map[string]interface{}{
+	tplFields := map[string]any{
 		"namespace":      nftablesNamespace,
 		"chainSeparator": nftablesChainSeparator,
 		"networkName":    networkName,
@@ -288,7 +293,7 @@ func (d Nftables) networkSetupICMPDHCPDNSAccess(networkName string, ipVersions [
 }
 
 func (d Nftables) networkSetupACLChainAndJumpRules(networkName string) error {
-	tplFields := map[string]interface{}{
+	tplFields := map[string]any{
 		"namespace":      nftablesNamespace,
 		"chainSeparator": nftablesChainSeparator,
 		"networkName":    networkName,
@@ -301,7 +306,7 @@ func (d Nftables) networkSetupACLChainAndJumpRules(networkName string) error {
 		return fmt.Errorf("Failed running %q template: %w", nftablesNetACLSetup.Name(), err)
 	}
 
-	_, err = shared.RunCommand("nft", config.String())
+	err = shared.RunCommandWithFds(context.TODO(), strings.NewReader(config.String()), nil, "nft", "-f", "-")
 	if err != nil {
 		return err
 	}
@@ -393,7 +398,7 @@ func (d Nftables) InstanceSetupBridgeFilter(projectName string, instanceName str
 		return err
 	}
 
-	tplFields := map[string]interface{}{
+	tplFields := map[string]any{
 		"namespace":      nftablesNamespace,
 		"chainSeparator": nftablesChainSeparator,
 		"family":         "bridge",
@@ -491,13 +496,13 @@ func (d Nftables) InstanceSetupProxyNAT(projectName string, instanceName string,
 	targetAddressStr := forward.TargetAddress.String()
 
 	// Generate slices of rules to add.
-	var dnatRules []map[string]interface{}
-	var snatRules []map[string]interface{}
+	var dnatRules []map[string]any
+	var snatRules []map[string]any
 
 	targetPortRanges := portRangesFromSlice(forward.TargetPorts)
 	for _, targetPortRange := range targetPortRanges {
 		targetPortRangeStr := portRangeStr(targetPortRange, "-")
-		snatRules = append(snatRules, map[string]interface{}{
+		snatRules = append(snatRules, map[string]any{
 			"ipFamily":    ipFamily,
 			"protocol":    forward.Protocol,
 			"targetHost":  targetAddressStr,
@@ -517,7 +522,7 @@ func (d Nftables) InstanceSetupProxyNAT(projectName string, instanceName string,
 			}
 		}
 
-		dnatRules = append(dnatRules, map[string]interface{}{
+		dnatRules = append(dnatRules, map[string]any{
 			"ipFamily":      ipFamily,
 			"protocol":      forward.Protocol,
 			"listenAddress": listenAddressStr,
@@ -527,7 +532,7 @@ func (d Nftables) InstanceSetupProxyNAT(projectName string, instanceName string,
 	}
 
 	deviceLabel := d.instanceDeviceLabel(projectName, instanceName, deviceName)
-	tplFields := map[string]interface{}{
+	tplFields := map[string]any{
 		"namespace":      nftablesNamespace,
 		"chainSeparator": nftablesChainSeparator,
 		"chainPrefix":    "", // Empty prefix for backwards compatibility with existing device chains.
@@ -543,7 +548,7 @@ func (d Nftables) InstanceSetupProxyNAT(projectName string, instanceName string,
 		return fmt.Errorf("Failed running %q template: %w", nftablesNetProxyNAT.Name(), err)
 	}
 
-	_, err = shared.RunCommand("nft", config.String())
+	err = shared.RunCommandWithFds(context.TODO(), strings.NewReader(config.String()), nil, "nft", "-f", "-")
 	if err != nil {
 		return err
 	}
@@ -566,7 +571,7 @@ func (d Nftables) InstanceClearProxyNAT(projectName string, instanceName string,
 
 // applyNftConfig loads the specified config template and then applies it to the common template before sending to
 // the nft command to be atomically applied to the system.
-func (d Nftables) applyNftConfig(tpl *template.Template, tplFields map[string]interface{}) error {
+func (d Nftables) applyNftConfig(tpl *template.Template, tplFields map[string]any) error {
 	// Load the specified template into the common template's parse tree under the nftableContentTemplate
 	// name so that the nftableContentTemplate template can use it with the generic name.
 	_, err := nftablesCommonTable.AddParseTree(nftablesContentTemplate, tpl.Tree)
@@ -580,7 +585,7 @@ func (d Nftables) applyNftConfig(tpl *template.Template, tplFields map[string]in
 		return fmt.Errorf("Failed running %q template: %w", tpl.Name(), err)
 	}
 
-	_, err = shared.RunCommand("nft", config.String())
+	err = shared.RunCommandWithFds(context.TODO(), strings.NewReader(config.String()), nil, "nft", "-f", "-")
 	if err != nil {
 		return fmt.Errorf("Failed apply nftables config: %w", err)
 	}
@@ -633,7 +638,7 @@ func (d Nftables) removeChains(families []string, chainSuffix string, chains ...
 // InstanceSetupRPFilter activates reverse path filtering for the specified instance device on the host interface.
 func (d Nftables) InstanceSetupRPFilter(projectName string, instanceName string, deviceName string, hostName string) error {
 	deviceLabel := d.instanceDeviceLabel(projectName, instanceName, deviceName)
-	tplFields := map[string]interface{}{
+	tplFields := map[string]any{
 		"namespace":      nftablesNamespace,
 		"chainSeparator": nftablesChainSeparator,
 		"deviceLabel":    deviceLabel,
@@ -694,20 +699,21 @@ func (d Nftables) NetworkApplyACLRules(networkName string, rules []ACLRule) erro
 		}
 	}
 
-	tplFields := map[string]interface{}{
+	tplFields := map[string]any{
 		"namespace":      nftablesNamespace,
 		"chainSeparator": nftablesChainSeparator,
 		"networkName":    networkName,
 		"family":         "inet",
 		"rules":          nftRules,
 	}
+
 	config := &strings.Builder{}
 	err := nftablesNetACLRules.Execute(config, tplFields)
 	if err != nil {
 		return fmt.Errorf("Failed running %q template: %w", nftablesNetACLRules.Name(), err)
 	}
 
-	_, err = shared.RunCommand("nft", config.String())
+	err = shared.RunCommandWithFds(context.TODO(), strings.NewReader(config.String()), nil, "nft", "-f", "-")
 	if err != nil {
 		return err
 	}
@@ -729,7 +735,7 @@ func (d Nftables) aclRuleCriteriaToRules(networkName string, ipVersion uint, rul
 	isPartialRule := false
 
 	if rule.Source != "" {
-		matchArgs, partial, err := d.aclRuleSubjectToACLMatch("saddr", ipVersion, util.SplitNTrimSpace(rule.Source, ",", -1, false)...)
+		matchArgs, partial, err := d.aclRuleSubjectToACLMatch("saddr", ipVersion, shared.SplitNTrimSpace(rule.Source, ",", -1, false)...)
 		if err != nil {
 			return "", false, err
 		}
@@ -738,7 +744,7 @@ func (d Nftables) aclRuleCriteriaToRules(networkName string, ipVersion uint, rul
 			return "", true, nil // Rule is not appropriate for ipVersion.
 		}
 
-		if partial && isPartialRule == false {
+		if partial && !isPartialRule {
 			isPartialRule = true
 		}
 
@@ -746,7 +752,7 @@ func (d Nftables) aclRuleCriteriaToRules(networkName string, ipVersion uint, rul
 	}
 
 	if rule.Destination != "" {
-		matchArgs, partial, err := d.aclRuleSubjectToACLMatch("daddr", ipVersion, util.SplitNTrimSpace(rule.Destination, ",", -1, false)...)
+		matchArgs, partial, err := d.aclRuleSubjectToACLMatch("daddr", ipVersion, shared.SplitNTrimSpace(rule.Destination, ",", -1, false)...)
 		if err != nil {
 			return "", false, err
 		}
@@ -755,7 +761,7 @@ func (d Nftables) aclRuleCriteriaToRules(networkName string, ipVersion uint, rul
 			return "", partial, nil // Rule is not appropriate for ipVersion.
 		}
 
-		if partial && isPartialRule == false {
+		if partial && !isPartialRule {
 			isPartialRule = true
 		}
 
@@ -767,11 +773,11 @@ func (d Nftables) aclRuleCriteriaToRules(networkName string, ipVersion uint, rul
 		args = append(args, "meta", "l4proto", rule.Protocol)
 
 		if rule.SourcePort != "" {
-			args = append(args, d.aclRulePortToACLMatch("sport", util.SplitNTrimSpace(rule.SourcePort, ",", -1, false)...)...)
+			args = append(args, d.aclRulePortToACLMatch("sport", shared.SplitNTrimSpace(rule.SourcePort, ",", -1, false)...)...)
 		}
 
 		if rule.DestinationPort != "" {
-			args = append(args, d.aclRulePortToACLMatch("dport", util.SplitNTrimSpace(rule.DestinationPort, ",", -1, false)...)...)
+			args = append(args, d.aclRulePortToACLMatch("dport", shared.SplitNTrimSpace(rule.DestinationPort, ",", -1, false)...)...)
 		}
 	} else if shared.StringInSlice(rule.Protocol, []string{"icmp4", "icmp6"}) {
 		var icmpIPVersion uint
@@ -907,7 +913,7 @@ func (d Nftables) aclRulePortToACLMatch(direction string, portCriteria ...string
 		if len(criterionParts) > 1 {
 			fieldParts = append(fieldParts, fmt.Sprintf("%s-%s", criterionParts[0], criterionParts[1]))
 		} else {
-			fieldParts = append(fieldParts, fmt.Sprintf("%s", criterionParts[0]))
+			fieldParts = append(fieldParts, criterionParts[0])
 		}
 	}
 
@@ -916,8 +922,8 @@ func (d Nftables) aclRulePortToACLMatch(direction string, portCriteria ...string
 
 // NetworkApplyForwards apply network address forward rules to firewall.
 func (d Nftables) NetworkApplyForwards(networkName string, rules []AddressForward) error {
-	var dnatRules []map[string]interface{}
-	var snatRules []map[string]interface{}
+	var dnatRules []map[string]any
+	var snatRules []map[string]any
 
 	// Build up rules, ordering by port specific listen rules first, followed by default target rules.
 	// This is so the generated firewall rules will apply the port specific rules first.
@@ -977,7 +983,7 @@ func (d Nftables) NetworkApplyForwards(networkName string, rules []AddressForwar
 						targetDest = fmt.Sprintf("[%s]:%d", targetAddressStr, targetPort)
 					}
 
-					dnatRules = append(dnatRules, map[string]interface{}{
+					dnatRules = append(dnatRules, map[string]any{
 						"ipFamily":      ipFamily,
 						"protocol":      rule.Protocol,
 						"listenAddress": listenAddressStr,
@@ -989,13 +995,12 @@ func (d Nftables) NetworkApplyForwards(networkName string, rules []AddressForwar
 
 					// Only add >1 hairpin NAT rules if multiple target ports being used.
 					if i == 0 || targetPortsLen != 1 {
-						snatRules = append(snatRules, map[string]interface{}{
+						snatRules = append(snatRules, map[string]any{
 							"ipFamily":    ipFamily,
 							"protocol":    rule.Protocol,
 							"targetHost":  targetAddressStr,
 							"targetPorts": targetPort,
 						})
-
 					}
 				}
 			} else if rule.Protocol == "" {
@@ -1005,14 +1010,14 @@ func (d Nftables) NetworkApplyForwards(networkName string, rules []AddressForwar
 					targetDest = fmt.Sprintf("[%s]", targetAddressStr)
 				}
 
-				dnatRules = append(dnatRules, map[string]interface{}{
+				dnatRules = append(dnatRules, map[string]any{
 					"ipFamily":      ipFamily,
 					"listenAddress": listenAddressStr,
 					"targetDest":    targetDest,
 					"targetHost":    targetAddressStr,
 				})
 
-				snatRules = append(snatRules, map[string]interface{}{
+				snatRules = append(snatRules, map[string]any{
 					"ipFamily":   ipFamily,
 					"targetHost": targetAddressStr,
 				})
@@ -1022,7 +1027,7 @@ func (d Nftables) NetworkApplyForwards(networkName string, rules []AddressForwar
 		}
 	}
 
-	tplFields := map[string]interface{}{
+	tplFields := map[string]any{
 		"namespace":      nftablesNamespace,
 		"chainSeparator": nftablesChainSeparator,
 		"chainPrefix":    "fwd", // Differentiate from proxy device forwards.
@@ -1040,7 +1045,7 @@ func (d Nftables) NetworkApplyForwards(networkName string, rules []AddressForwar
 			return fmt.Errorf("Failed running %q template: %w", nftablesNetProxyNAT.Name(), err)
 		}
 
-		_, err = shared.RunCommand("nft", config.String())
+		err = shared.RunCommandWithFds(context.TODO(), strings.NewReader(config.String()), nil, "nft", "-f", "-")
 		if err != nil {
 			return err
 		}

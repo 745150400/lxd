@@ -3,15 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
-	log "gopkg.in/inconshreveable/log15.v2"
 	"gopkg.in/yaml.v2"
 
-	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/operationtype"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/task"
 	"github.com/lxc/lxd/lxd/util"
@@ -40,7 +40,7 @@ func instanceSaveCache() error {
 		return err
 	}
 
-	err = ioutil.WriteFile(shared.CachePath("instance_types.yaml"), data, 0600)
+	err = os.WriteFile(shared.CachePath("instance_types.yaml"), data, 0600)
 	if err != nil {
 		return err
 	}
@@ -53,7 +53,7 @@ func instanceLoadCache() error {
 		return nil
 	}
 
-	content, err := ioutil.ReadFile(shared.CachePath("instance_types.yaml"))
+	content, err := os.ReadFile(shared.CachePath("instance_types.yaml"))
 	if err != nil {
 		return err
 	}
@@ -72,7 +72,7 @@ func instanceRefreshTypesTask(d *Daemon) (task.Func, task.Schedule) {
 	// be used internally by instanceRefreshTypes to terminate gracefully,
 	// otherwise we'll wrap instanceRefreshTypes in a goroutine and force
 	// returning in case the context expires.
-	_, hasCancellationSupport := interface{}(&http.Request{}).(util.ContextAwareRequest)
+	_, hasCancellationSupport := any(&http.Request{}).(util.ContextAwareRequest)
 	f := func(ctx context.Context) {
 		opRun := func(op *operations.Operation) error {
 			if hasCancellationSupport {
@@ -91,18 +91,20 @@ func instanceRefreshTypesTask(d *Daemon) (task.Func, task.Schedule) {
 			}
 		}
 
-		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, db.OperationInstanceTypesUpdate, nil, nil, opRun, nil, nil, nil)
+		op, err := operations.OperationCreate(d.State(), "", operations.OperationClassTask, operationtype.InstanceTypesUpdate, nil, nil, opRun, nil, nil, nil)
 		if err != nil {
-			logger.Error("Failed to start instance types update operation", log.Ctx{"err": err})
+			logger.Error("Failed to start instance types update operation", logger.Ctx{"err": err})
 			return
 		}
 
 		logger.Info("Updating instance types")
-		_, err = op.Run()
+		err = op.Start()
 		if err != nil {
-			logger.Error("Failed to update instance types", log.Ctx{"err": err})
+			logger.Error("Failed to update instance types", logger.Ctx{"err": err})
 		}
-		logger.Infof("Done updating instance types")
+
+		_, _ = op.Wait(ctx)
+		logger.Info("Done updating instance types")
 	}
 
 	return f, task.Daily()
@@ -110,7 +112,7 @@ func instanceRefreshTypesTask(d *Daemon) (task.Func, task.Schedule) {
 
 func instanceRefreshTypes(ctx context.Context, d *Daemon) error {
 	// Attempt to download the new definitions
-	downloadParse := func(filename string, target interface{}) error {
+	downloadParse := func(filename string, target any) error {
 		url := fmt.Sprintf("https://images.linuxcontainers.org/meta/instance-types/%s", filename)
 
 		httpClient, err := util.HTTPClient("", d.proxy)
@@ -125,7 +127,7 @@ func instanceRefreshTypes(ctx context.Context, d *Daemon) error {
 
 		httpReq.Header.Set("User-Agent", version.UserAgent)
 
-		cancelableRequest, ok := interface{}(httpReq).(util.ContextAwareRequest)
+		cancelableRequest, ok := any(httpReq).(util.ContextAwareRequest)
 		if ok {
 			httpReq = cancelableRequest.WithContext(ctx)
 		}
@@ -134,16 +136,18 @@ func instanceRefreshTypes(ctx context.Context, d *Daemon) error {
 		if err != nil {
 			return err
 		}
+
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		defer resp.Body.Close()
+
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("Failed to get %s", url)
 		}
 
-		content, err := ioutil.ReadAll(resp.Body)
+		content, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return err
 		}
@@ -158,7 +162,7 @@ func instanceRefreshTypes(ctx context.Context, d *Daemon) error {
 
 	// Set an initial value from the cache
 	if instanceTypes == nil {
-		instanceLoadCache()
+		_ = instanceLoadCache()
 	}
 
 	// Get the list of instance type sources
@@ -168,6 +172,7 @@ func instanceRefreshTypes(ctx context.Context, d *Daemon) error {
 		if err != ctx.Err() {
 			logger.Warnf("Failed to update instance types: %v", err)
 		}
+
 		return err
 	}
 
@@ -263,6 +268,7 @@ func instanceParseType(value string) (map[string]string, error) {
 		if float32(cpuCores) < limits.CPU {
 			cpuCores++
 		}
+
 		cpuTime := int(limits.CPU / float32(cpuCores) * 100.0)
 
 		out["limits.cpu"] = fmt.Sprintf("%d", cpuCores)

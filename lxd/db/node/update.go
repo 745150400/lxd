@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -97,6 +98,7 @@ var updates = map[int]schema.Update{
 	40: updateFromV39,
 	41: updateFromV40,
 	42: updateFromV41,
+	43: updateFromV42,
 }
 
 // UpdateFromPreClustering is the last schema version where clustering support
@@ -105,7 +107,24 @@ const UpdateFromPreClustering = 36
 
 // Schema updates begin here
 
-func updateFromV41(tx *sql.Tx) error {
+// updateFromV42 ensures key and value fields in config table are TEXT NOT NULL.
+func updateFromV42(ctx context.Context, tx *sql.Tx) error {
+	stmt := `
+CREATE TABLE "config_new" (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    UNIQUE (key)
+);
+INSERT INTO "config_new" SELECT * FROM "config";
+DROP TABLE "config";
+ALTER TABLE "config_new" RENAME TO "config";
+`
+	_, err := tx.Exec(stmt)
+	return err
+}
+
+func updateFromV41(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 	ALTER TABLE raft_nodes ADD COLUMN name TEXT NOT NULL default "";
 	`
@@ -113,7 +132,7 @@ func updateFromV41(tx *sql.Tx) error {
 	return err
 }
 
-func updateFromV40(tx *sql.Tx) error {
+func updateFromV40(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE certificates (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -130,26 +149,26 @@ CREATE TABLE certificates (
 
 // Fix the address of the bootstrap node being set to "0" in the raft_nodes
 // table.
-func updateFromV39(tx *sql.Tx) error {
-	nodes := []struct {
+func updateFromV39(ctx context.Context, tx *sql.Tx) error {
+	type node struct {
 		ID      uint64
 		Address string
-	}{}
-	dest := func(i int) []interface{} {
-		nodes = append(nodes, struct {
-			ID      uint64
-			Address string
-		}{})
-		return []interface{}{&nodes[i].ID, &nodes[i].Address}
-	}
-	stmt, err := tx.Prepare("SELECT id, address FROM raft_nodes")
-	if err != nil {
-		return err
 	}
 
-	defer stmt.Close()
+	sql := "SELECT id, address FROM raft_nodes"
+	nodes := []node{}
+	err := query.Scan(ctx, tx, sql, func(scan func(dest ...any) error) error {
+		n := node{}
 
-	err = query.SelectObjects(stmt, dest)
+		err := scan(&n.ID, &n.Address)
+		if err != nil {
+			return err
+		}
+
+		nodes = append(nodes, n)
+
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("Failed to fetch raft nodes: %w", err)
 	}
@@ -163,10 +182,11 @@ func updateFromV39(tx *sql.Tx) error {
 		return nil
 	}
 
-	config, err := query.SelectConfig(tx, "config", "")
+	config, err := query.SelectConfig(ctx, tx, "config", "")
 	if err != nil {
 		return err
 	}
+
 	address := config["cluster.https_address"]
 	if address != "" {
 		_, err := tx.Exec("UPDATE raft_nodes SET address=? WHERE id=1", address)
@@ -180,7 +200,7 @@ func updateFromV39(tx *sql.Tx) error {
 
 // Add role column to raft_nodes table. All existing entries will have role "0"
 // which means voter.
-func updateFromV38(tx *sql.Tx) error {
+func updateFromV38(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 ALTER TABLE raft_nodes ADD COLUMN role INTEGER NOT NULL DEFAULT 0;
 `
@@ -190,8 +210,8 @@ ALTER TABLE raft_nodes ADD COLUMN role INTEGER NOT NULL DEFAULT 0;
 
 // Copy core.https_address to cluster.https_address in case this node is
 // clustered.
-func updateFromV37(tx *sql.Tx) error {
-	count, err := query.Count(tx, "raft_nodes", "")
+func updateFromV37(ctx context.Context, tx *sql.Tx) error {
+	count, err := query.Count(ctx, tx, "raft_nodes", "")
 	if err != nil {
 		return fmt.Errorf("Fetch count of Raft nodes: %w", err)
 	}
@@ -230,7 +250,7 @@ INSERT INTO config (key, value)
 // cluster, regardless of whether they are part of the raft cluster or not, and
 // all nodes will consult this table when they need to find out a leader to
 // send SQL queries to.
-func updateFromV36(tx *sql.Tx) error {
+func updateFromV36(ctx context.Context, tx *sql.Tx) error {
 	stmts := `
 CREATE TABLE raft_nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -263,7 +283,7 @@ DROP TABLE storage_pools;
 	return err
 }
 
-func updateFromV35(tx *sql.Tx) error {
+func updateFromV35(ctx context.Context, tx *sql.Tx) error {
 	stmts := `
 CREATE TABLE tmp (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -288,7 +308,7 @@ ALTER TABLE containers ADD COLUMN description TEXT;
 	return err
 }
 
-func updateFromV34(tx *sql.Tx) error {
+func updateFromV34(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE IF NOT EXISTS storage_pools (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -324,7 +344,7 @@ CREATE TABLE IF NOT EXISTS storage_volumes_config (
 	return err
 }
 
-func updateFromV33(tx *sql.Tx) error {
+func updateFromV33(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE IF NOT EXISTS networks (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -343,12 +363,12 @@ CREATE TABLE IF NOT EXISTS networks_config (
 	return err
 }
 
-func updateFromV32(tx *sql.Tx) error {
+func updateFromV32(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("ALTER TABLE containers ADD COLUMN last_use_date DATETIME;")
 	return err
 }
 
-func updateFromV31(tx *sql.Tx) error {
+func updateFromV31(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE IF NOT EXISTS patches (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -360,13 +380,13 @@ CREATE TABLE IF NOT EXISTS patches (
 	return err
 }
 
-func updateFromV30(tx *sql.Tx) error {
+func updateFromV30(ctx context.Context, tx *sql.Tx) error {
 	// NOTE: this database update contained daemon-level logic which
 	//       was been moved to patchUpdateFromV15 in patches.go.
 	return nil
 }
 
-func updateFromV29(tx *sql.Tx) error {
+func updateFromV29(ctx context.Context, tx *sql.Tx) error {
 	if shared.PathExists(shared.VarPath("zfs.img")) {
 		err := os.Chmod(shared.VarPath("zfs.img"), 0600)
 		if err != nil {
@@ -377,22 +397,22 @@ func updateFromV29(tx *sql.Tx) error {
 	return nil
 }
 
-func updateFromV28(tx *sql.Tx) error {
+func updateFromV28(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 INSERT INTO profiles_devices (profile_id, name, type) SELECT id, "aadisable", 2 FROM profiles WHERE name="docker";
 INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, "source", "/dev/null" FROM profiles_devices LEFT JOIN profiles WHERE profiles_devices.profile_id = profiles.id AND profiles.name = "docker" AND profiles_devices.name = "aadisable";
 INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, "path", "/sys/module/apparmor/parameters/enabled" FROM profiles_devices LEFT JOIN profiles WHERE profiles_devices.profile_id = profiles.id AND profiles.name = "docker" AND profiles_devices.name = "aadisable";`
-	tx.Exec(stmt)
+	_, _ = tx.Exec(stmt)
 
 	return nil
 }
 
-func updateFromV27(tx *sql.Tx) error {
+func updateFromV27(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("UPDATE profiles_devices SET type=3 WHERE type='unix-char';")
 	return err
 }
 
-func updateFromV26(tx *sql.Tx) error {
+func updateFromV26(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 ALTER TABLE images ADD COLUMN auto_update INTEGER NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS images_source (
@@ -408,29 +428,29 @@ CREATE TABLE IF NOT EXISTS images_source (
 	return err
 }
 
-func updateFromV25(tx *sql.Tx) error {
+func updateFromV25(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 INSERT INTO profiles (name, description) VALUES ("docker", "Profile supporting docker in containers");
 INSERT INTO profiles_config (profile_id, key, value) SELECT id, "security.nesting", "true" FROM profiles WHERE name="docker";
 INSERT INTO profiles_config (profile_id, key, value) SELECT id, "linux.kernel_modules", "overlay, nf_nat" FROM profiles WHERE name="docker";
 INSERT INTO profiles_devices (profile_id, name, type) SELECT id, "fuse", "unix-char" FROM profiles WHERE name="docker";
 INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, "path", "/dev/fuse" FROM profiles_devices LEFT JOIN profiles WHERE profiles_devices.profile_id = profiles.id AND profiles.name = "docker";`
-	tx.Exec(stmt)
+	_, _ = tx.Exec(stmt)
 
 	return nil
 }
 
-func updateFromV24(tx *sql.Tx) error {
+func updateFromV24(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("ALTER TABLE containers ADD COLUMN stateful INTEGER NOT NULL DEFAULT 0;")
 	return err
 }
 
-func updateFromV23(tx *sql.Tx) error {
+func updateFromV23(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("ALTER TABLE profiles ADD COLUMN description TEXT;")
 	return err
 }
 
-func updateFromV22(tx *sql.Tx) error {
+func updateFromV22(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 DELETE FROM containers_devices_config WHERE key='type';
 DELETE FROM profiles_devices_config WHERE key='type';`
@@ -438,12 +458,12 @@ DELETE FROM profiles_devices_config WHERE key='type';`
 	return err
 }
 
-func updateFromV21(tx *sql.Tx) error {
+func updateFromV21(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.Exec("ALTER TABLE containers ADD COLUMN creation_date DATETIME NOT NULL DEFAULT 0;")
 	return err
 }
 
-func updateFromV20(tx *sql.Tx) error {
+func updateFromV20(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 UPDATE containers_devices SET name='__lxd_upgrade_root' WHERE name='root';
 UPDATE profiles_devices SET name='__lxd_upgrade_root' WHERE name='root';
@@ -455,7 +475,7 @@ INSERT INTO containers_devices_config (container_device_id, key, value) SELECT i
 	return err
 }
 
-func updateFromV19(tx *sql.Tx) error {
+func updateFromV19(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 DELETE FROM containers_config WHERE container_id NOT IN (SELECT id FROM containers);
 DELETE FROM containers_devices_config WHERE container_device_id NOT IN (SELECT id FROM containers_devices WHERE container_id IN (SELECT id FROM containers));
@@ -467,16 +487,17 @@ DELETE FROM images_properties WHERE image_id NOT IN (SELECT id FROM images);`
 	return err
 }
 
-func updateFromV18(tx *sql.Tx) error {
+func updateFromV18(ctx context.Context, tx *sql.Tx) error {
 	var id int
 	var value string
 
 	// Update container config
-	rows, err := tx.Query("SELECT id, value FROM containers_config WHERE key='limits.memory'")
+	rows, err := tx.QueryContext(ctx, "SELECT id, value FROM containers_config WHERE key='limits.memory'")
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		err := rows.Scan(&id, &value)
@@ -517,11 +538,12 @@ func updateFromV18(tx *sql.Tx) error {
 	}
 
 	// Update profiles config
-	rows, err = tx.Query("SELECT id, value FROM profiles_config WHERE key='limits.memory'")
+	rows, err = tx.QueryContext(ctx, "SELECT id, value FROM profiles_config WHERE key='limits.memory'")
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		err := rows.Scan(&id, &value)
@@ -564,7 +586,7 @@ func updateFromV18(tx *sql.Tx) error {
 	return nil
 }
 
-func updateFromV17(tx *sql.Tx) error {
+func updateFromV17(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 DELETE FROM profiles_config WHERE key LIKE 'volatile.%';
 UPDATE containers_config SET key='limits.cpu' WHERE key='limits.cpus';
@@ -573,7 +595,7 @@ UPDATE profiles_config SET key='limits.cpu' WHERE key='limits.cpus';`
 	return err
 }
 
-func updateFromV16(tx *sql.Tx) error {
+func updateFromV16(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 UPDATE config SET key='storage.lvm_vg_name' WHERE key = 'core.lvm_vg_name';
 UPDATE config SET key='storage.lvm_thinpool_name' WHERE key = 'core.lvm_thinpool_name';`
@@ -581,13 +603,13 @@ UPDATE config SET key='storage.lvm_thinpool_name' WHERE key = 'core.lvm_thinpool
 	return err
 }
 
-func updateFromV15(tx *sql.Tx) error {
+func updateFromV15(ctx context.Context, tx *sql.Tx) error {
 	// NOTE: this database update contained daemon-level logic which
 	//       was been moved to patchUpdateFromV15 in patches.go.
 	return nil
 }
 
-func updateFromV14(tx *sql.Tx) error {
+func updateFromV14(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 PRAGMA foreign_keys=OFF; -- So that integrity doesn't get in the way for now
 
@@ -620,14 +642,14 @@ PRAGMA foreign_keys=ON; -- Make sure we turn integrity checks back on.`
 	return err
 }
 
-func updateFromV13(tx *sql.Tx) error {
+func updateFromV13(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 UPDATE containers_config SET key='volatile.base_image' WHERE key = 'volatile.baseImage';`
 	_, err := tx.Exec(stmt)
 	return err
 }
 
-func updateFromV12(tx *sql.Tx) error {
+func updateFromV12(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 ALTER TABLE images ADD COLUMN cached INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE images ADD COLUMN last_use_date DATETIME;`
@@ -635,19 +657,19 @@ ALTER TABLE images ADD COLUMN last_use_date DATETIME;`
 	return err
 }
 
-func updateFromV11(tx *sql.Tx) error {
+func updateFromV11(ctx context.Context, tx *sql.Tx) error {
 	// NOTE: this database update contained daemon-level logic which
 	//       was been moved to patchUpdateFromV15 in patches.go.
 	return nil
 }
 
-func updateFromV10(tx *sql.Tx) error {
+func updateFromV10(ctx context.Context, tx *sql.Tx) error {
 	// NOTE: this database update contained daemon-level logic which
 	//       was been moved to patchUpdateFromV10 in patches.go.
 	return nil
 }
 
-func updateFromV9(tx *sql.Tx) error {
+func updateFromV9(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE tmp (
     id INTEGER primary key AUTOINCREMENT NOT NULL,
@@ -690,14 +712,14 @@ DROP TABLE tmp;`
 	return err
 }
 
-func updateFromV8(tx *sql.Tx) error {
+func updateFromV8(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 UPDATE certificates SET fingerprint = replace(fingerprint, " ", "");`
 	_, err := tx.Exec(stmt)
 	return err
 }
 
-func updateFromV7(tx *sql.Tx) error {
+func updateFromV7(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 UPDATE config SET key='core.trust_password' WHERE key IN ('password', 'trust_password', 'trust-password', 'core.trust-password');
 DELETE FROM config WHERE key != 'core.trust_password';`
@@ -705,7 +727,7 @@ DELETE FROM config WHERE key != 'core.trust_password';`
 	return err
 }
 
-func updateFromV6(tx *sql.Tx) error {
+func updateFromV6(ctx context.Context, tx *sql.Tx) error {
 	// This update recreates the schemas that need an ON DELETE CASCADE foreign
 	// key.
 	stmt := `
@@ -836,11 +858,12 @@ PRAGMA foreign_keys=ON; -- Make sure we turn integrity checks back on.`
 	}
 
 	// Get the rows with broken foreign keys an nuke them
-	rows, err := tx.Query("PRAGMA foreign_key_check;")
+	rows, err := tx.QueryContext(ctx, "PRAGMA foreign_key_check;")
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+
+	defer func() { _ = rows.Close() }()
 
 	var tablestodelete []string
 	var rowidtodelete []int
@@ -851,11 +874,14 @@ PRAGMA foreign_keys=ON; -- Make sure we turn integrity checks back on.`
 		var targetname string
 		var keynumber int
 
-		rows.Scan(&tablename, &rowid, &targetname, &keynumber)
+		err := rows.Scan(&tablename, &rowid, &targetname, &keynumber)
+		if err != nil {
+			return err
+		}
+
 		tablestodelete = append(tablestodelete, tablename)
 		rowidtodelete = append(rowidtodelete, rowid)
 	}
-	rows.Close()
 
 	for i := range tablestodelete {
 		_, err = tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE rowid = %d;", tablestodelete[i], rowidtodelete[i]))
@@ -864,10 +890,10 @@ PRAGMA foreign_keys=ON; -- Make sure we turn integrity checks back on.`
 		}
 	}
 
-	return err
+	return nil
 }
 
-func updateFromV5(tx *sql.Tx) error {
+func updateFromV5(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 ALTER TABLE containers ADD COLUMN power_state INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE containers ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0;`
@@ -875,7 +901,7 @@ ALTER TABLE containers ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0;`
 	return err
 }
 
-func updateFromV4(tx *sql.Tx) error {
+func updateFromV4(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE IF NOT EXISTS config (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -893,7 +919,7 @@ CREATE TABLE IF NOT EXISTS config (
 	passOut, err := os.Open(passfname)
 	oldPassword := ""
 	if err == nil {
-		defer passOut.Close()
+		defer func() { _ = passOut.Close() }()
 		buff := make([]byte, 96)
 		_, err = passOut.Read(buff)
 		if err != nil {
@@ -914,14 +940,14 @@ CREATE TABLE IF NOT EXISTS config (
 	return nil
 }
 
-func updateFromV3(tx *sql.Tx) error {
+func updateFromV3(ctx context.Context, tx *sql.Tx) error {
 	// Attempt to create a default profile (but don't fail if already there)
-	tx.Exec("INSERT INTO profiles (name) VALUES (\"default\");")
+	_, _ = tx.Exec("INSERT INTO profiles (name) VALUES (\"default\");")
 
 	return nil
 }
 
-func updateFromV2(tx *sql.Tx) error {
+func updateFromV2(ctx context.Context, tx *sql.Tx) error {
 	stmt := `
 CREATE TABLE IF NOT EXISTS containers_devices (
     id INTEGER primary key AUTOINCREMENT NOT NULL,
@@ -981,7 +1007,7 @@ CREATE TABLE IF NOT EXISTS profiles_devices_config (
 	return err
 }
 
-func updateFromV1(tx *sql.Tx) error {
+func updateFromV1(ctx context.Context, tx *sql.Tx) error {
 	// v1..v2 adds images aliases
 	stmt := `
 CREATE TABLE IF NOT EXISTS images_aliases (
@@ -996,7 +1022,7 @@ CREATE TABLE IF NOT EXISTS images_aliases (
 	return err
 }
 
-func updateFromV0(tx *sql.Tx) error {
+func updateFromV0(ctx context.Context, tx *sql.Tx) error {
 	// v0..v1 the dawn of containers
 	stmt := `
 CREATE TABLE certificates (

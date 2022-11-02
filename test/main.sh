@@ -7,10 +7,6 @@ export LC_ALL="C"
 # Force UTC for consistency
 export TZ="UTC"
 
-if [ -n "${LXD_VERBOSE:-}" ] || [ -n "${LXD_DEBUG:-}" ]; then
-  set -x
-fi
-
 export DEBUG=""
 if [ -n "${LXD_VERBOSE:-}" ]; then
   DEBUG="--verbose"
@@ -18,6 +14,10 @@ fi
 
 if [ -n "${LXD_DEBUG:-}" ]; then
   DEBUG="--debug"
+fi
+
+if [ -n "${DEBUG:-}" ]; then
+  set -x
 fi
 
 if [ -z "${LXD_BACKEND:-}" ]; then
@@ -29,7 +29,7 @@ LXD_NETNS=""
 
 import_subdir_files() {
     test "$1"
-    # shellcheck disable=SC2039
+    # shellcheck disable=SC2039,3043
     local file
     for file in "$1"/*.sh; do
         # shellcheck disable=SC1090
@@ -40,7 +40,7 @@ import_subdir_files() {
 import_subdir_files includes
 
 echo "==> Checking for dependencies"
-check_dependencies lxd lxc curl dnsmasq jq git xgettext sqlite3 msgmerge msgfmt shuf setfacl uuidgen socat dig
+check_dependencies lxd lxc curl dnsmasq jq git xgettext sqlite3 msgmerge msgfmt shuf setfacl socat dig
 
 if [ "${USER:-'root'}" != "root" ]; then
   echo "The testsuite must be run as root." >&2
@@ -80,9 +80,7 @@ cleanup() {
     # shellcheck disable=SC2086
     printf "To poke around, use:\\n LXD_DIR=%s LXD_CONF=%s sudo -E %s/bin/lxc COMMAND\\n" "${LXD_DIR}" "${LXD_CONF}" ${GOPATH:-}
     echo "Tests Completed (${TEST_RESULT}): hit enter to continue"
-
-    # shellcheck disable=SC2034
-    read -r nothing
+    read -r _
   fi
 
   echo "==> Cleaning up"
@@ -101,6 +99,7 @@ cleanup() {
 
 # Must be set before cleanup()
 TEST_CURRENT=setup
+TEST_CURRENT_DESCRIPTION=setup
 # shellcheck disable=SC2034
 TEST_RESULT=failure
 
@@ -136,10 +135,46 @@ start_external_auth_daemon "${LXD_DIR}"
 run_test() {
   TEST_CURRENT=${1}
   TEST_CURRENT_DESCRIPTION=${2:-${1}}
+  TEST_UNMET_REQUIREMENT=""
 
   echo "==> TEST BEGIN: ${TEST_CURRENT_DESCRIPTION}"
   START_TIME=$(date +%s)
-  ${TEST_CURRENT}
+
+  # shellcheck disable=SC2039,3043
+  local skip=false
+
+  # Skip test if requested.
+  if [ -n "${LXD_SKIP_TESTS:-}" ]; then
+    for testName in ${LXD_SKIP_TESTS}; do
+      if [ "test_${testName}" = "${TEST_CURRENT}" ]; then
+          echo "==> SKIP: ${TEST_CURRENT} as specified in LXD_SKIP_TESTS"
+          skip=true
+          break
+      fi
+    done
+  fi
+
+  if [ "${skip}" = false ]; then
+    # Run test.
+    ${TEST_CURRENT}
+
+    # Check whether test was skipped due to unmet requirements, and if so check if the test is required and fail.
+    if [ -n "${TEST_UNMET_REQUIREMENT}" ]; then
+      if [ -n "${LXD_REQUIRED_TESTS:-}" ]; then
+        for testName in ${LXD_REQUIRED_TESTS}; do
+          if [ "test_${testName}" = "${TEST_CURRENT}" ]; then
+              echo "==> REQUIRED: ${TEST_CURRENT} ${TEST_UNMET_REQUIREMENT}"
+              false
+              return
+          fi
+        done
+      else
+        # Skip test if its requirements are not met and is not specified in required tests.
+        echo "==> SKIP: ${TEST_CURRENT} ${TEST_UNMET_REQUIREMENT}"
+      fi
+    fi
+  fi
+
   END_TIME=$(date +%s)
 
   echo "==> TEST DONE: ${TEST_CURRENT_DESCRIPTION} ($((END_TIME-START_TIME))s)"
@@ -155,8 +190,6 @@ fi
 
 if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_check_deps "checking dependencies"
-    run_test test_static_analysis "static analysis"
-    run_test test_database_update "database schema updates"
     run_test test_database_restore "database restore"
     run_test test_database_no_disk_space "database out of disk space"
     run_test test_sql "lxd sql"
@@ -181,6 +214,7 @@ if [ "${1:-"all"}" != "standalone" ]; then
     run_test test_clustering_shutdown_nodes "clustering shutdown"
     run_test test_clustering_projects "clustering projects"
     run_test test_clustering_update_cert "clustering update cert"
+    run_test test_clustering_update_cert_reversion "clustering update cert reversion"
     run_test test_clustering_address "clustering address"
     run_test test_clustering_image_replication "clustering image replication"
     run_test test_clustering_dns "clustering DNS"
@@ -233,6 +267,7 @@ if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_container_devices_unix_char "container devices - unix-char"
     run_test test_container_devices_unix_block "container devices - unix-block"
     run_test test_container_devices_tpm "container devices - tpm"
+    run_test test_container_syscall_interception "container syscall interception"
     run_test test_security "security features"
     run_test test_security_protection "container protection"
     run_test test_image_expiry "image expiry"
@@ -240,6 +275,7 @@ if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_image_auto_update "image auto-update"
     run_test test_image_prefer_cached "image prefer cached"
     run_test test_image_import_dir "import image from directory"
+    run_test test_image_refresh "image refresh"
     run_test test_cloud_init "cloud-init"
     run_test test_exec "exec"
     run_test test_concurrent_exec "concurrent exec"
@@ -248,6 +284,7 @@ if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_snap_restore "snapshot restores"
     run_test test_snap_expiry "snapshot expiry"
     run_test test_snap_schedule "snapshot scheduling"
+    run_test test_snap_volume_db_recovery "snapshot volume database record recovery"
     run_test test_config_profiles "profiles and configuration"
     run_test test_config_edit "container configuration edit"
     run_test test_config_edit_container_snapshot_pool_config "container and snapshot volume configuration edit"
@@ -277,6 +314,7 @@ if [ "${1:-"all"}" != "cluster" ]; then
     run_test test_storage_driver_btrfs "btrfs storage driver"
     run_test test_storage_driver_ceph "ceph storage driver"
     run_test test_storage_driver_cephfs "cephfs storage driver"
+    run_test test_storage_buckets "storage buckets"
     run_test test_resources "resources"
     run_test test_kernel_limits "kernel limits"
     run_test test_macaroon_auth "macaroon authentication"

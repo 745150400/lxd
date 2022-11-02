@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"strings"
 
@@ -75,11 +75,11 @@ func (c *cmdConfig) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Edit
+// Edit.
 type cmdConfigEdit struct {
 	global *cmdGlobal
 	config *cmdConfig
@@ -154,7 +154,7 @@ func (c *cmdConfigEdit) Run(cmd *cobra.Command, args []string) error {
 
 		// If stdin isn't a terminal, read text from it
 		if !termios.IsTerminal(getStdinFd()) {
-			contents, err := ioutil.ReadAll(os.Stdin)
+			contents, err := io.ReadAll(os.Stdin)
 			if err != nil {
 				return err
 			}
@@ -201,8 +201,11 @@ func (c *cmdConfigEdit) Run(cmd *cobra.Command, args []string) error {
 				return err
 			}
 
-			brief := inst.Writable()
-			data, err = yaml.Marshal(&brief)
+			// Empty expanded config so it isn't shown in edit screen (relies on omitempty tag).
+			inst.ExpandedConfig = nil
+			inst.ExpandedDevices = nil
+
+			data, err = yaml.Marshal(&inst)
 			if err != nil {
 				return err
 			}
@@ -214,8 +217,11 @@ func (c *cmdConfigEdit) Run(cmd *cobra.Command, args []string) error {
 				return err
 			}
 
-			brief := inst.Writable()
-			data, err = yaml.Marshal(&brief)
+			// Empty expanded config so it isn't shown in edit screen (relies on omitempty tag).
+			inst.ExpandedConfig = nil
+			inst.ExpandedDevices = nil
+
+			data, err = yaml.Marshal(&inst)
 			if err != nil {
 				return err
 			}
@@ -231,7 +237,6 @@ func (c *cmdConfigEdit) Run(cmd *cobra.Command, args []string) error {
 			// Parse the text received from the editor
 			if isSnapshot {
 				newdata := api.InstanceSnapshotPut{}
-
 				err = yaml.Unmarshal(content, &newdata)
 				if err == nil {
 					var op lxd.Operation
@@ -267,8 +272,10 @@ func (c *cmdConfigEdit) Run(cmd *cobra.Command, args []string) error {
 				if err != nil {
 					return err
 				}
+
 				continue
 			}
+
 			break
 		}
 
@@ -286,7 +293,7 @@ func (c *cmdConfigEdit) Run(cmd *cobra.Command, args []string) error {
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -340,15 +347,17 @@ func (c *cmdConfigEdit) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			continue
 		}
+
 		break
 	}
 
 	return nil
 }
 
-// Get
+// Get.
 type cmdConfigGet struct {
 	global *cmdGlobal
 	config *cmdConfig
@@ -442,7 +451,7 @@ func (c *cmdConfigGet) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Set
+// Set.
 type cmdConfigSet struct {
 	global *cmdGlobal
 	config *cmdConfig
@@ -598,7 +607,7 @@ func (c *cmdConfigSet) Run(cmd *cobra.Command, args []string) error {
 	return resource.server.UpdateServer(server.Writable(), etag)
 }
 
-// Show
+// Show.
 type cmdConfigShow struct {
 	global *cmdGlobal
 	config *cmdConfig
@@ -676,7 +685,7 @@ func (c *cmdConfigShow) Run(cmd *cobra.Command, args []string) error {
 		}
 
 		// Instance or snapshot config
-		var brief interface{}
+		var brief any
 
 		if shared.IsSnapshot(resource.name) {
 			// Snapshot
@@ -687,7 +696,7 @@ func (c *cmdConfigShow) Run(cmd *cobra.Command, args []string) error {
 				return err
 			}
 
-			brief = &snap
+			brief = snap
 			if c.flagExpanded {
 				brief.(*api.InstanceSnapshot).Config = snap.ExpandedConfig
 				brief.(*api.InstanceSnapshot).Devices = snap.ExpandedDevices
@@ -719,7 +728,7 @@ func (c *cmdConfigShow) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Unset
+// Unset.
 type cmdConfigUnset struct {
 	global    *cmdGlobal
 	config    *cmdConfig

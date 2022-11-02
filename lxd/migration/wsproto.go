@@ -2,7 +2,7 @@ package migration
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 
 	"github.com/gorilla/websocket"
 	"google.golang.org/protobuf/proto"
@@ -10,8 +10,12 @@ import (
 	"github.com/lxc/lxd/shared"
 )
 
-// ProtoRecv gets a protobuf message from a websocket
+// ProtoRecv gets a protobuf message from a websocket.
 func ProtoRecv(ws *websocket.Conn, msg proto.Message) error {
+	if ws == nil {
+		return fmt.Errorf("Empty websocket connection")
+	}
+
 	mt, r, err := ws.NextReader()
 	if err != nil {
 		return err
@@ -21,7 +25,7 @@ func ProtoRecv(ws *websocket.Conn, msg proto.Message) error {
 		return fmt.Errorf("Only binary messages allowed")
 	}
 
-	buf, err := ioutil.ReadAll(r)
+	buf, err := io.ReadAll(r)
 	if err != nil {
 		return err
 	}
@@ -34,13 +38,18 @@ func ProtoRecv(ws *websocket.Conn, msg proto.Message) error {
 	return nil
 }
 
-// ProtoSend sends a protobuf message over a websocket
+// ProtoSend sends a protobuf message over a websocket.
 func ProtoSend(ws *websocket.Conn, msg proto.Message) error {
+	if ws == nil {
+		return fmt.Errorf("Empty websocket connection")
+	}
+
 	w, err := ws.NextWriter(websocket.BinaryMessage)
 	if err != nil {
 		return err
 	}
-	defer w.Close()
+
+	defer func() { _ = w.Close() }()
 
 	data, err := proto.Marshal(msg)
 	if err != nil {
@@ -52,10 +61,10 @@ func ProtoSend(ws *websocket.Conn, msg proto.Message) error {
 		return err
 	}
 
-	return nil
+	return w.Close()
 }
 
-// ProtoSendControl sends a migration control message over a websocket
+// ProtoSendControl sends a migration control message over a websocket.
 func ProtoSendControl(ws *websocket.Conn, err error) {
 	message := ""
 	if err != nil {
@@ -67,5 +76,5 @@ func ProtoSendControl(ws *websocket.Conn, err error) {
 		Message: proto.String(message),
 	}
 
-	ProtoSend(ws, &msg)
+	_ = ProtoSend(ws, &msg)
 }

@@ -6,10 +6,11 @@ import (
 	"net"
 	"testing"
 
-	"github.com/lxc/lxd/lxd/util"
-	"github.com/lxc/lxd/shared"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lxc/lxd/lxd/util"
+	"github.com/lxc/lxd/shared"
 )
 
 // The connection returned by the dialer is paired with the one returned by the
@@ -20,7 +21,11 @@ func TestInMemoryNetwork(t *testing.T) {
 	server, err := listener.Accept()
 	require.NoError(t, err)
 
-	go client.Write([]byte("hello"))
+	go func() {
+		_, err := client.Write([]byte("hello"))
+		require.NoError(t, err)
+	}()
+
 	buffer := make([]byte, 5)
 	n, err := server.Read(buffer)
 	require.NoError(t, err)
@@ -30,7 +35,8 @@ func TestInMemoryNetwork(t *testing.T) {
 
 	// Closing the server makes all further client reads and
 	// writes fail.
-	server.Close()
+	err = server.Close()
+	assert.NoError(t, err)
 	_, err = client.Read(buffer)
 	assert.Equal(t, io.EOF, err)
 	_, err = client.Write([]byte("hello"))
@@ -40,16 +46,22 @@ func TestInMemoryNetwork(t *testing.T) {
 func TestCanonicalNetworkAddress(t *testing.T) {
 	cases := map[string]string{
 		"127.0.0.1":                             "127.0.0.1:8443",
+		"127.0.0.1:":                            "127.0.0.1:8443",
 		"foo.bar":                               "foo.bar:8443",
+		"foo.bar:":                              "foo.bar:8443",
+		"foo.bar:8444":                          "foo.bar:8444",
 		"192.168.1.1:443":                       "192.168.1.1:443",
 		"f921:7358:4510:3fce:ac2e:844:2a35:54e": "[f921:7358:4510:3fce:ac2e:844:2a35:54e]:8443",
+		"[f921:7358:4510:3fce:ac2e:844:2a35:54e]":      "[f921:7358:4510:3fce:ac2e:844:2a35:54e]:8443",
+		"[f921:7358:4510:3fce:ac2e:844:2a35:54e]:":     "[f921:7358:4510:3fce:ac2e:844:2a35:54e]:8443",
+		"[f921:7358:4510:3fce:ac2e:844:2a35:54e]:8444": "[f921:7358:4510:3fce:ac2e:844:2a35:54e]:8444",
 	}
+
 	for in, out := range cases {
 		t.Run(in, func(t *testing.T) {
 			assert.Equal(t, out, util.CanonicalNetworkAddress(in, shared.HTTPSDefaultPort))
 		})
 	}
-
 }
 
 func TestIsAddressCovered(t *testing.T) {
@@ -104,7 +116,7 @@ func TestIsAddressCovered(t *testing.T) {
 func TestListenImplicitIPv6Wildcard(t *testing.T) {
 	listener, err := net.Listen("tcp", ":9999")
 	require.NoError(t, err)
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	assert.Equal(t, "[::]:9999", listener.Addr().String())
 }

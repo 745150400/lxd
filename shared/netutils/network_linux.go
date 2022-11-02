@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package netutils
 
@@ -13,7 +12,7 @@ import (
 )
 
 // WebsocketExecMirror mirrors a websocket connection with a set of Writer/Reader.
-func WebsocketExecMirror(conn *websocket.Conn, w io.WriteCloser, r io.ReadCloser, exited chan struct{}, fd int) (chan bool, chan bool) {
+func WebsocketExecMirror(conn *websocket.Conn, w io.WriteCloser, r io.ReadCloser, exited <-chan struct{}, fd int) (chan bool, chan bool) {
 	readDone := make(chan bool, 1)
 	writeDone := make(chan bool, 1)
 
@@ -24,12 +23,13 @@ func WebsocketExecMirror(conn *websocket.Conn, w io.WriteCloser, r io.ReadCloser
 		for {
 			buf, ok := <-in
 			if !ok {
-				r.Close()
+				_ = r.Close()
 				logger.Debugf("Sending write barrier")
 				err := conn.WriteMessage(websocket.TextMessage, []byte{})
 				if err != nil {
 					logger.Debugf("Got err writing barrier %s", err)
 				}
+
 				readDone <- true
 				return
 			}
@@ -42,9 +42,9 @@ func WebsocketExecMirror(conn *websocket.Conn, w io.WriteCloser, r io.ReadCloser
 		}
 
 		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-		conn.WriteMessage(websocket.CloseMessage, closeMsg)
+		_ = conn.WriteMessage(websocket.CloseMessage, closeMsg)
 		readDone <- true
-		r.Close()
+		_ = r.Close()
 	}(conn, r)
 
 	return readDone, writeDone

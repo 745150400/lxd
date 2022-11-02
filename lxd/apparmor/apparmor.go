@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,7 +84,7 @@ func hasProfile(sysOS *sys.OS, name string) (bool, error) {
 
 	profilesPath := "/sys/kernel/security/apparmor/policy/profiles"
 	if shared.PathExists(profilesPath) {
-		entries, err := ioutil.ReadDir(profilesPath)
+		entries, err := os.ReadDir(profilesPath)
 		if err != nil {
 			return false, err
 		}
@@ -245,7 +244,7 @@ func profileName(prefix string, name string) string {
 	// Max length in AppArmor is 253 chars.
 	if len(name)+len(prefix)+3+separators >= 253 {
 		hash := sha256.New()
-		io.WriteString(hash, name)
+		_, _ = io.WriteString(hash, name)
 		name = fmt.Sprintf("%x", hash.Sum(nil))
 	}
 

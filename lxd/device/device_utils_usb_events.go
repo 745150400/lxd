@@ -7,8 +7,6 @@ import (
 	"strings"
 	"sync"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/state"
@@ -44,7 +42,7 @@ func usbRegisterHandler(inst instance.Instance, deviceName string, handler func(
 	defer usbMutex.Unlock()
 
 	// Null delimited string of project name, instance name and device name.
-	key := fmt.Sprintf("%s\000%s\000%s", inst.Project(), inst.Name(), deviceName)
+	key := fmt.Sprintf("%s\000%s\000%s", inst.Project().Name, inst.Name(), deviceName)
 	usbHandlers[key] = handler
 }
 
@@ -54,7 +52,7 @@ func usbUnregisterHandler(inst instance.Instance, deviceName string) {
 	defer usbMutex.Unlock()
 
 	// Null delimited string of project name, instance name and device name.
-	key := fmt.Sprintf("%s\000%s\000%s", inst.Project(), inst.Name(), deviceName)
+	key := fmt.Sprintf("%s\000%s\000%s", inst.Project().Name, inst.Name(), deviceName)
 	delete(usbHandlers, key)
 }
 
@@ -76,7 +74,7 @@ func USBRunHandlers(state *state.State, event *USBEvent) {
 
 		runConf, err := hook(*event)
 		if err != nil {
-			logger.Error("USB event hook failed", log.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
+			logger.Error("USB event hook failed", logger.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
 			continue
 		}
 
@@ -85,13 +83,13 @@ func USBRunHandlers(state *state.State, event *USBEvent) {
 		if runConf != nil {
 			instance, err := instance.LoadByProjectAndName(state, projectName, instanceName)
 			if err != nil {
-				logger.Error("USB event loading instance failed", log.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
+				logger.Error("USB event loading instance failed", logger.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
 				continue
 			}
 
 			err = instance.DeviceEventHandler(runConf)
 			if err != nil {
-				logger.Error("USB event instance handler failed", log.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
+				logger.Error("USB event instance handler failed", logger.Ctx{"err": err, "project": projectName, "instance": instanceName, "device": deviceName})
 				continue
 			}
 		}
@@ -110,19 +108,18 @@ func USBNewEvent(action string, vendor string, product string, major string, min
 		return USBEvent{}, err
 	}
 
-	busnumInt := 0
-	devnumInt := 0
+	busnumInt, err := strconv.Atoi(busnum)
+	if err != nil {
+		return USBEvent{}, err
+	}
+
+	devnumInt, err := strconv.Atoi(devnum)
+	if err != nil {
+		return USBEvent{}, err
+	}
+
 	path := devname
 	if devname == "" {
-		busnumInt, err = strconv.Atoi(busnum)
-		if err != nil {
-			return USBEvent{}, err
-		}
-
-		devnumInt, err = strconv.Atoi(devnum)
-		if err != nil {
-			return USBEvent{}, err
-		}
 		path = fmt.Sprintf("/dev/bus/usb/%03d/%03d", busnumInt, devnumInt)
 	} else {
 		if !filepath.IsAbs(devname) {

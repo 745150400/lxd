@@ -1,20 +1,16 @@
 //go:build linux && cgo
-// +build linux,cgo
 
 package idmap
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 
-	// Used by cgo
-	_ "github.com/lxc/lxd/lxd/include"
-
+	_ "github.com/lxc/lxd/lxd/include" // Used by cgo
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
 )
@@ -321,7 +317,7 @@ static int create_detached_idmapped_mount(const char *path)
 	};
 	int ret;
 
-	fd_tree = open_tree(-EBADF, path, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+	fd_tree = lxd_open_tree(-EBADF, path, OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
 	if (fd_tree < 0)
 		return -errno;
 
@@ -331,7 +327,7 @@ static int create_detached_idmapped_mount(const char *path)
 
 	attr.userns_fd = fd_userns;
 
-	ret = mount_setattr(fd_tree, "", AT_EMPTY_PATH, &attr, sizeof(attr));
+	ret = lxd_mount_setattr(fd_tree, "", AT_EMPTY_PATH, &attr, sizeof(attr));
 	if (ret < 0)
 		return -errno;
 
@@ -412,6 +408,7 @@ func shiftAclType(path string, aclType int, shiftIds func(uid int64, gid int64) 
 	if acl == nil {
 		return nil
 	}
+
 	defer C.acl_free(unsafe.Pointer(acl))
 
 	// Iterate through all ACL entries
@@ -474,12 +471,13 @@ func shiftAclType(path string, aclType int, shiftIds func(uid int64, gid int64) 
 }
 
 func SupportsVFS3Fscaps(prefix string) bool {
-	tmpfile, err := ioutil.TempFile(prefix, ".lxd_fcaps_v3_")
+	tmpfile, err := os.CreateTemp(prefix, ".lxd_fcaps_v3_")
 	if err != nil {
 		return false
 	}
-	tmpfile.Close()
-	defer os.Remove(tmpfile.Name())
+
+	defer func() { _ = tmpfile.Close() }()
+	defer func() { _ = os.Remove(tmpfile.Name()) }()
 
 	err = os.Chmod(tmpfile.Name(), 0001)
 	if err != nil {
@@ -531,6 +529,7 @@ func UnshiftACL(value string, set *IdmapSet) (string, error) {
 	if count < 0 {
 		return "", fmt.Errorf("Invalid ACL count")
 	}
+
 	if count == 0 {
 		return "", fmt.Errorf("No valid ACLs found")
 	}
@@ -547,6 +546,7 @@ func UnshiftACL(value string, set *IdmapSet) (string, error) {
 				entry.e_id = C.native_to_le32(C.int(uid))
 				logger.Debugf("Unshifting ACL_USER from uid %d to uid %d", ouid, uid)
 			}
+
 		case C.ACL_GROUP:
 			ogid := int64(C.le32_to_native(entry.e_id))
 			_, gid := set.ShiftFromNs(-1, ogid)
@@ -554,6 +554,7 @@ func UnshiftACL(value string, set *IdmapSet) (string, error) {
 				entry.e_id = C.native_to_le32(C.int(gid))
 				logger.Debugf("Unshifting ACL_GROUP from gid %d to gid %d", ogid, gid)
 			}
+
 		case C.ACL_USER_OBJ:
 			logger.Debugf("Ignoring ACL type ACL_USER_OBJ")
 		case C.ACL_GROUP_OBJ:

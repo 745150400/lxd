@@ -4,17 +4,14 @@ import (
 	"fmt"
 	"net/http"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 	"github.com/lxc/lxd/shared/version"
 )
 
-// Operation response
+// Operation response.
 type operationResponse struct {
 	op *Operation
 }
@@ -25,7 +22,7 @@ func OperationResponse(op *Operation) response.Response {
 }
 
 func (r *operationResponse) Render(w http.ResponseWriter) error {
-	_, err := r.op.Run()
+	err := r.op.Start()
 	if err != nil {
 		return err
 	}
@@ -50,7 +47,7 @@ func (r *operationResponse) Render(w http.ResponseWriter) error {
 
 	var debugLogger logger.Logger
 	if debug {
-		debugLogger = logging.AddContext(logger.Log, log.Ctx{"http_code": code})
+		debugLogger = logger.AddContext(logger.Log, logger.Ctx{"http_code": code})
 	}
 
 	return util.WriteJSON(w, body, debugLogger)
@@ -67,7 +64,7 @@ func (r *operationResponse) String() string {
 
 // Forwarded operation response.
 //
-// Returned when the operation has been created on another node
+// Returned when the operation has been created on another node.
 type forwardedOperationResponse struct {
 	op      *api.Operation
 	project string
@@ -103,7 +100,7 @@ func (r *forwardedOperationResponse) Render(w http.ResponseWriter) error {
 
 	var debugLogger logger.Logger
 	if debug {
-		debugLogger = logging.AddContext(logger.Log, log.Ctx{"http_code": code})
+		debugLogger = logger.AddContext(logger.Log, logger.Ctx{"http_code": code})
 	}
 
 	return util.WriteJSON(w, body, debugLogger)

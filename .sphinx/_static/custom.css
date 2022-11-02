@@ -26,6 +26,11 @@ table.docutils td, table.docutils th, table.docutils td:last-child, table.docuti
     border-left: none;
 }
 
+/* center align table cells with ":-:" */
+td.text-center {
+    text-align: center;
+}
+
 /** No rounded corners **/
 
 .admonition, code.literal, .sphinx-tabs-tab, .sphinx-tabs-panel, .highlight {
@@ -115,31 +120,51 @@ abbr[title] {
     display: block;
 }
 
-/** Links to YouTube videos **/
-
-p.youtube_link {
-    float: right;
-    border: 1px #cdcdcd solid;
-    margin-left: 5px;
-    margin-bottom: 5px;
-    padding-bottom: 5px;
+/** Version switcher */
+button.version_select {
+  color: var(--color-foreground-primary);
+  background-color: var(--color-toc-background);
+  padding: 5px 10px;
+  border: none;
 }
 
-p.youtube_link a {
-    text-align: center;
+.version_select:hover, .version_select:focus {
+    background-color: var(--color-sidebar-item-background--hover);
 }
 
-p.youtube_link span.play_icon {
-    color: #E95420;
-    font-size: 2em;
+.version_dropdown {
+  position: relative;
+  display: inline-block;
+  text-align: right;
+  font-size: var(--sidebar-item-font-size);
 }
 
-p.youtube_link span.play_icon::after {
-    content: "\a"
+.available_versions {
+  display: none;
+  position: absolute;
+  right: 0px;
+  background-color: var(--color-toc-background);
+  box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+  z-index: 11;
 }
 
-p.youtube_link span {
-    display: block;
-    font-size: small;
-    max-width: 70px;
+.available_versions a {
+  color: var(--color-foreground-primary);
+  padding: 12px 16px;
+  text-decoration: none;
+  display: block;
+}
+
+.available_versions a:hover {background-color: var(--color-sidebar-item-background--current)}
+
+.show {display:block;}
+
+/** Fix for nested numbered list - the nested list is lettered **/
+ol.arabic ol.arabic {
+  list-style: lower-alpha;
+}
+
+/** Make expandable sections look like links **/
+details summary {
+    color: var(--color-link);
 }

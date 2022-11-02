@@ -3,10 +3,9 @@ package drivers
 import (
 	"fmt"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/storage/quota"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/units"
 )
 
@@ -15,14 +14,14 @@ func (d *dir) withoutGetVolID() Driver {
 	newDriver := &dir{}
 	getVolID := func(volType VolumeType, volName string) (int64, error) { return volIDQuotaSkip, nil }
 	newDriver.init(d.state, d.name, d.config, d.logger, getVolID, d.commonRules)
-	newDriver.load()
+	_ = newDriver.load()
 
 	return newDriver
 }
 
 // setupInitialQuota enables quota on a new volume and sets with an initial quota from config.
-// Returns a revert function that can be used to remove the quota if there is a subsequent error.
-func (d *dir) setupInitialQuota(vol Volume) (func(), error) {
+// Returns a revert fail function that can be used to undo this function if a subsequent step fails.
+func (d *dir) setupInitialQuota(vol Volume) (revert.Hook, error) {
 	if vol.IsVMBlock() {
 		return nil, nil
 	}
@@ -39,7 +38,7 @@ func (d *dir) setupInitialQuota(vol Volume) (func(), error) {
 	defer revert.Fail()
 
 	// Define a function to revert the quota being setup.
-	revertFunc := func() { d.deleteQuota(volPath, volID) }
+	revertFunc := func() { _ = d.deleteQuota(volPath, volID) }
 	revert.Add(revertFunc)
 
 	// Initialise the volume's project using the volume ID and set the quota.
@@ -107,7 +106,7 @@ func (d *dir) setQuota(path string, volID int64, sizeBytes int64) error {
 	if err != nil || !ok {
 		if sizeBytes > 0 {
 			// Skipping quota as underlying filesystem doesn't suppport project quotas.
-			d.logger.Warn("The backing filesystem doesn't support quotas, skipping set quota", log.Ctx{"path": path, "size": sizeBytes, "volID": volID})
+			d.logger.Warn("The backing filesystem doesn't support quotas, skipping set quota", logger.Ctx{"path": path, "size": sizeBytes, "volID": volID})
 		}
 
 		return nil

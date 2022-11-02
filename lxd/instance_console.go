@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"sync"
@@ -13,11 +14,11 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
+	liblxc "github.com/lxc/go-lxc"
 	"golang.org/x/sys/unix"
-	liblxc "gopkg.in/lxc/go-lxc.v2"
 
 	"github.com/lxc/lxd/lxd/cluster"
-	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/operationtype"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/operations"
@@ -25,7 +26,6 @@ import (
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/termios"
 )
 
 type consoleWs struct {
@@ -60,7 +60,7 @@ type consoleWs struct {
 	protocol string
 }
 
-func (s *consoleWs) Metadata() interface{} {
+func (s *consoleWs) Metadata() any {
 	fds := shared.Jmap{}
 	for fd, secret := range s.fds {
 		if fd == -1 {
@@ -156,7 +156,7 @@ func (s *consoleWs) connectVGA(op *operations.Operation, r *http.Request, w http
 
 		console, _, err := s.instance.Console("vga")
 		if err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return err
 		}
 
@@ -197,18 +197,12 @@ func (s *consoleWs) doConsole(op *operations.Operation) error {
 	if err != nil {
 		return err
 	}
-	defer console.Close()
 
-	// Switch the console file descriptor into raw mode.
-	oldttystate, err := termios.MakeRaw(int(console.Fd()))
-	if err != nil {
-		return err
-	}
-	defer termios.Restore(int(console.Fd()), oldttystate)
+	defer func() { _ = console.Close() }()
 
 	// Detect size of window and set it into console.
 	if s.width > 0 && s.height > 0 {
-		shared.SetSize(int(console.Fd()), s.width, s.height)
+		_ = shared.SetSize(int(console.Fd()), s.width, s.height)
 	}
 
 	consoleDoneCh := make(chan struct{})
@@ -233,7 +227,7 @@ func (s *consoleWs) doConsole(op *operations.Operation) error {
 				return
 			}
 
-			buf, err := ioutil.ReadAll(r)
+			buf, err := io.ReadAll(r)
 			if err != nil {
 				logger.Debugf("Failed to read message: %v", err)
 				break
@@ -296,24 +290,31 @@ func (s *consoleWs) doConsole(op *operations.Operation) error {
 		close(consoleDisconnectCh)
 	}
 
+	// Get the console and control websockets.
+	s.connsLock.Lock()
+	consoleConn := s.conns[0]
+	ctrlConn := s.conns[-1]
+	s.connsLock.Unlock()
+
+	defer func() {
+		_ = consoleConn.WriteMessage(websocket.BinaryMessage, []byte("\n\r"))
+		_ = consoleConn.Close()
+		_ = ctrlConn.Close()
+	}()
+
 	// Write a reset escape sequence to the console to cancel any ongoing reads to the handle
 	// and then close it. This ordering is important, close the console before closing the
 	// websocket to ensure console doesn't get stuck reading.
-	console.Write([]byte("\x1bc"))
-	console.Close()
+	_, err = console.Write([]byte("\x1bc"))
+	if err != nil {
+		_ = console.Close()
+		return err
+	}
 
-	// Get the console websocket and close it.
-	s.connsLock.Lock()
-	consoleConn := s.conns[0]
-	s.connsLock.Unlock()
-	consoleConn.WriteMessage(websocket.BinaryMessage, []byte("\n\r"))
-	consoleConn.Close()
-
-	// Get the control websocket and close it.
-	s.connsLock.Lock()
-	ctrlConn := s.conns[-1]
-	s.connsLock.Unlock()
-	ctrlConn.Close()
+	err = console.Close()
+	if err != nil {
+		return err
+	}
 
 	// Indicate to the control socket go routine to end if not already.
 	close(s.controlConnected)
@@ -352,18 +353,18 @@ func (s *consoleWs) doVGA(op *operations.Operation) error {
 	s.connsLock.Lock()
 	control := s.conns[-1]
 	s.connsLock.Unlock()
-	control.Close()
+	err := control.Close()
 
 	// Close all dynamic connections.
 	for conn, console := range s.dynamic {
-		conn.Close()
-		console.Close()
+		_ = conn.Close()
+		_ = console.Close()
 	}
 
 	// Indicate to the control socket go routine to end if not already.
 	close(s.controlConnected)
 
-	return nil
+	return err
 }
 
 // swagger:operation POST /1.0/instances/{name}/console instances instance_console_post
@@ -406,10 +407,17 @@ func instanceConsolePost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	post := api.InstanceConsolePost{}
-	buf, err := ioutil.ReadAll(r.Body)
+	buf, err := io.ReadAll(r.Body)
 	if err != nil {
 		return response.BadRequest(err)
 	}
@@ -420,14 +428,14 @@ func instanceConsolePost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Forward the request if the container is remote.
-	client, err := cluster.ConnectIfInstanceIsRemote(d.cluster, projectName, name, d.endpoints.NetworkCert(), d.serverCert(), r, instanceType)
+	client, err := cluster.ConnectIfInstanceIsRemote(d.db.Cluster, projectName, name, d.endpoints.NetworkCert(), d.serverCert(), r, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	if client != nil {
-		url := fmt.Sprintf("/1.0/instances/%s/console?project=%s", name, projectName)
-		resp, _, err := client.RawQuery("POST", url, post, "")
+		url := api.NewURL().Path("1.0", "instances", name, "console").Project(projectName)
+		resp, _, err := client.RawQuery("POST", url.String(), post, "")
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -493,7 +501,7 @@ func instanceConsolePost(d *Daemon, r *http.Request) response.Response {
 		resources["containers"] = resources["instances"]
 	}
 
-	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassWebsocket, db.OperationConsoleShow, resources, ws.Metadata(), ws.Do, nil, ws.Connect, r)
+	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassWebsocket, operationtype.ConsoleShow, resources, ws.Metadata(), ws.Do, nil, ws.Connect, r)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -539,18 +547,26 @@ func instanceConsoleLogGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Forward the request if the container is remote.
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
 
-	if !instance.RuntimeLiblxcVersionAtLeast(liblxc.Version(), 3, 0, 0) {
+	if !liblxc.RuntimeLiblxcVersionAtLeast(liblxc.Version(), 3, 0, 0) {
 		return response.BadRequest(fmt.Errorf("Querying the console buffer requires liblxc >= 3.0"))
 	}
 
@@ -630,11 +646,19 @@ func instanceConsoleLogGet(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func instanceConsoleLogDelete(d *Daemon, r *http.Request) response.Response {
-	if !instance.RuntimeLiblxcVersionAtLeast(liblxc.Version(), 3, 0, 0) {
+	if !liblxc.RuntimeLiblxcVersionAtLeast(liblxc.Version(), 3, 0, 0) {
 		return response.BadRequest(fmt.Errorf("Clearing the console buffer requires liblxc >= 3.0"))
 	}
 
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
+
 	projectName := projectParam(r)
 
 	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)

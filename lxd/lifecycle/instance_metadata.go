@@ -1,11 +1,8 @@
 package lifecycle
 
 import (
-	"fmt"
-	"net/url"
-
-	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/version"
 )
 
 // InstanceMetadataAction represents a lifecycle event action for instance metadata.
@@ -13,22 +10,17 @@ type InstanceMetadataAction string
 
 // All supported lifecycle events for instance metadata.
 const (
-	InstanceMetadataUpdated   = InstanceMetadataAction("updated")
-	InstanceMetadataRetrieved = InstanceMetadataAction("retrieved")
+	InstanceMetadataUpdated   = InstanceMetadataAction(api.EventLifecycleInstanceMetadataUpdated)
+	InstanceMetadataRetrieved = InstanceMetadataAction(api.EventLifecycleInstanceMetadataRetrieved)
 )
 
 // Event creates the lifecycle event for an action on instance metadata.
-func (a InstanceMetadataAction) Event(inst instance, requestor *api.EventLifecycleRequestor, ctx map[string]interface{}) api.EventLifecycle {
-	eventType := fmt.Sprintf("instance-metadata-%s", a)
-	u := fmt.Sprintf("/1.0/instances/%s/metadata", url.PathEscape(inst.Name()))
-
-	if inst.Project() != project.Default {
-		u = fmt.Sprintf("%s?project=%s", u, url.QueryEscape(inst.Project()))
-	}
+func (a InstanceMetadataAction) Event(inst instance, requestor *api.EventLifecycleRequestor, ctx map[string]any) api.EventLifecycle {
+	u := api.NewURL().Path(version.APIVersion, "instances", inst.Name(), "metadata").Project(inst.Project().Name)
 
 	return api.EventLifecycle{
-		Action:    eventType,
-		Source:    u,
+		Action:    string(a),
+		Source:    u.String(),
 		Context:   ctx,
 		Requestor: requestor,
 	}

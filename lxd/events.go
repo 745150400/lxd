@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/events"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/rbac"
@@ -13,10 +15,11 @@ import (
 	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/logger"
 )
 
-var eventTypes = []string{"logging", "operation", "lifecycle"}
-var privilegedEventTypes = []string{"logging"}
+var eventTypes = []string{api.EventTypeLogging, api.EventTypeOperation, api.EventTypeLifecycle}
+var privilegedEventTypes = []string{api.EventTypeLogging}
 
 var eventsCmd = APIEndpoint{
 	Path: "events",
@@ -38,28 +41,20 @@ func (r *eventsServe) String() string {
 }
 
 func eventsSocket(d *Daemon, r *http.Request, w http.ResponseWriter) error {
+	// Detect project mode.
+	projectName := queryParam(r, "project")
 	allProjects := shared.IsTrue(queryParam(r, "all-projects"))
-	projectQueryParam := queryParam(r, "project")
-	if allProjects && projectQueryParam != "" {
-		response.BadRequest(fmt.Errorf("Cannot specify a project when requesting events for all projects"))
-		return nil
+
+	if allProjects && projectName != "" {
+		return api.StatusErrorf(http.StatusBadRequest, "Cannot specify a project when requesting all projects")
+	} else if !allProjects && projectName == "" {
+		projectName = project.Default
 	}
 
-	var projectName string
-	if !allProjects {
-		if projectQueryParam == "" {
-			projectName = project.Default
-		} else {
-			projectName = projectQueryParam
-
-			_, err := d.cluster.GetProject(projectName)
-			if err != nil {
-				if response.IsNotFoundError(err) {
-					response.BadRequest(fmt.Errorf("Project %q not found", projectName)).Render(w)
-				}
-
-				return err
-			}
+	if !allProjects && projectName != project.Default {
+		_, err := d.db.GetProject(context.Background(), projectName)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -78,43 +73,58 @@ func eventsSocket(d *Daemon, r *http.Request, w http.ResponseWriter) error {
 	// Validate event types.
 	for _, entry := range types {
 		if !shared.StringInSlice(entry, eventTypes) {
-			response.BadRequest(fmt.Errorf("'%s' isn't a supported event type", entry)).Render(w)
-			return nil
+			return api.StatusErrorf(http.StatusBadRequest, "%q isn't a supported event type", entry)
 		}
 	}
 
-	if shared.StringInSlice("logging", types) && !rbac.UserIsAdmin(r) {
-		response.Forbidden(nil).Render(w)
+	if shared.StringInSlice(api.EventTypeLogging, types) && !rbac.UserIsAdmin(r) {
+		return api.StatusErrorf(http.StatusForbidden, "Forbidden")
+	}
+
+	l := logger.AddContext(logger.Log, logger.Ctx{"remote": r.RemoteAddr})
+
+	// Upgrade the connection to websocket
+	conn, err := shared.WebsocketUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		l.Warn("Failed upgrading event connection", logger.Ctx{"err": err})
 		return nil
 	}
 
-	// Upgrade the connection to websocket
-	c, err := shared.WebsocketUpgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return err
-	}
-	defer c.Close() // This ensures the go routine below is ended when this function ends.
+	defer func() { _ = conn.Close() }() // Ensure listener below ends when this function ends.
 
+	d.events.SetLocalLocation(d.State().ServerName)
+
+	var excludeLocations []string
 	// Get the current local serverName and store it for the events.
 	// We do that now to avoid issues with changes to the name and to limit
 	// the number of DB access to just one per connection.
-	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
-		serverName, err := tx.GetLocalNodeName()
-		if err != nil {
-			return err
+	err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		if isClusterNotification(r) {
+			ctx := r.Context()
+
+			// Try and match cluster member certificate fingerprint to member name.
+			fingerprint, found := ctx.Value(request.CtxUsername).(string)
+			if found {
+				cert, err := cluster.GetCertificateByFingerprintPrefix(context.Background(), tx.Tx(), fingerprint)
+				if err != nil {
+					return fmt.Errorf("Failed matching client certificate to cluster member: %w", err)
+				}
+
+				// Add the cluster member client's name to the excluded locations so that we can avoid
+				// looping the event back to them when they send us an event via recvFunc.
+				excludeLocations = append(excludeLocations, cert.Name)
+			}
 		}
 
-		d.events.SetLocalLocation(serverName)
 		return nil
 	})
 	if err != nil {
-		return err
+		l.Warn("Failed setting up event connection", logger.Ctx{"err": err})
+		return nil
 	}
 
 	var recvFunc events.EventHandler
 	var excludeSources []events.EventSource
-	var excludeLocations []string
-
 	if isClusterNotification(r) {
 		// If client is another cluster member, it will already be pulling events from other cluster
 		// members so no need to also deliver forwarded events that this member receives.
@@ -125,26 +135,14 @@ func eventsSocket(d *Daemon, r *http.Request, w http.ResponseWriter) error {
 			// other event hub members (if operating in event hub mode).
 			d.events.Inject(event, events.EventSourcePush)
 		}
-
-		ctx := r.Context()
-
-		// Try and match cluster member certificate fingerprint to member name.
-		fingerprint, found := ctx.Value(request.CtxUsername).(string)
-		if found {
-			cert, err := d.State().Cluster.GetCertificate(fingerprint)
-			if err != nil {
-				return fmt.Errorf("Failed matching client certificate to cluster member: %w", err)
-			}
-
-			// Add the cluster member client's name to the excluded locations so that we can avoid
-			// looping the event back to them when they send us an event via recvFunc.
-			excludeLocations = append(excludeLocations, cert.Name)
-		}
 	}
 
-	listener, err := d.events.AddListener(projectName, allProjects, c, types, excludeSources, recvFunc, excludeLocations)
+	listenerConnection := events.NewWebsocketListenerConnection(conn)
+
+	listener, err := d.events.AddListener(projectName, allProjects, listenerConnection, types, excludeSources, recvFunc, excludeLocations)
 	if err != nil {
-		return err
+		l.Warn("Failed to add event listener", logger.Ctx{"err": err})
+		return nil
 	}
 
 	listener.Wait(r.Context())
@@ -172,6 +170,10 @@ func eventsSocket(d *Daemon, r *http.Request, w http.ResponseWriter) error {
 //     description: Event type(s), comma separated (valid types are logging, operation or lifecycle)
 //     type: string
 //     example: logging,lifecycle
+//   - in: query
+//     name: all-projects
+//     description: Retrieve instances from all projects
+//     type: boolean
 // responses:
 //   "200":
 //     description: Websocket message (JSON)

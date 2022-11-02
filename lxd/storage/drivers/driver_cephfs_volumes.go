@@ -7,16 +7,16 @@ import (
 	"path/filepath"
 	"strconv"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/lxd/backup"
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/rsync"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/instancewriter"
 	"github.com/lxc/lxd/shared/ioprogress"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/units"
 )
 
@@ -41,7 +41,7 @@ func (d *cephfs) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.O
 	revertPath := true
 	defer func() {
 		if revertPath {
-			os.RemoveAll(volPath)
+			_ = os.RemoveAll(volPath)
 		}
 	}()
 
@@ -52,7 +52,7 @@ func (d *cephfs) CreateVolume(vol Volume, filler *VolumeFiller, op *operations.O
 	}
 
 	// Fill the volume.
-	err = d.runFiller(vol, "", filler)
+	err = d.runFiller(vol, "", filler, false)
 	if err != nil {
 		return err
 	}
@@ -67,7 +67,7 @@ func (d *cephfs) CreateVolumeFromBackup(vol Volume, srcBackup backup.Info, srcDa
 }
 
 // CreateVolumeFromCopy copies an existing storage volume (with or without snapshots) into a new volume.
-func (d *cephfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, op *operations.Operation) error {
+func (d *cephfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots bool, allowInconsistent bool, op *operations.Operation) error {
 	bwlimit := d.config["rsync.bwlimit"]
 
 	// Create the main volume path.
@@ -89,10 +89,10 @@ func (d *cephfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots b
 			fullSnapName := GetSnapshotVolumeName(vol.name, snapName)
 
 			snapVol := NewVolume(d, d.name, vol.volType, vol.contentType, fullSnapName, vol.config, vol.poolConfig)
-			d.DeleteVolumeSnapshot(snapVol, op)
+			_ = d.DeleteVolumeSnapshot(snapVol, op)
 		}
 
-		os.RemoveAll(volPath)
+		_ = os.RemoveAll(volPath)
 	}()
 
 	// Ensure the volume is mounted.
@@ -106,7 +106,7 @@ func (d *cephfs) CreateVolumeFromCopy(vol Volume, srcVol Volume, copySnapshots b
 			}
 
 			for _, srcSnapshot := range srcSnapshots {
-				_, snapName, _ := shared.InstanceGetParentAndSnapshotName(srcSnapshot.name)
+				_, snapName, _ := api.GetParentAndSnapshotName(srcSnapshot.name)
 
 				// Mount the source snapshot.
 				err = srcSnapshot.MountTask(func(srcMountPath string, op *operations.Operation) error {
@@ -178,10 +178,10 @@ func (d *cephfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, 
 			fullSnapName := GetSnapshotVolumeName(vol.name, snapName)
 			snapVol := NewVolume(d, d.name, vol.volType, vol.contentType, fullSnapName, vol.config, vol.poolConfig)
 
-			d.DeleteVolumeSnapshot(snapVol, op)
+			_ = d.DeleteVolumeSnapshot(snapVol, op)
 		}
 
-		os.RemoveAll(volPath)
+		_ = os.RemoveAll(volPath)
 	}()
 
 	// Ensure the volume is mounted.
@@ -236,11 +236,6 @@ func (d *cephfs) CreateVolumeFromMigration(vol Volume, conn io.ReadWriteCloser, 
 
 	revertSnaps = nil
 	return nil
-}
-
-// RefreshVolume updates an existing volume to match the state of another.
-func (d *cephfs) RefreshVolume(vol Volume, srcVol Volume, srcSnapshots []Volume, op *operations.Operation) error {
-	return ErrNotImplemented
 }
 
 // DeleteVolume destroys the on-disk state of a volume.
@@ -365,7 +360,7 @@ func (d *cephfs) UnmountVolume(vol Volume, keepBlockDev bool, op *operations.Ope
 
 	refCount := vol.MountRefCountDecrement()
 	if refCount > 0 {
-		d.logger.Debug("Skipping unmount as in use", log.Ctx{"volName": vol.name, "refCount": refCount})
+		d.logger.Debug("Skipping unmount as in use", logger.Ctx{"volName": vol.name, "refCount": refCount})
 		return false, ErrInUse
 	}
 
@@ -392,16 +387,16 @@ func (d *cephfs) RenameVolume(vol Volume, newVolName string, op *operations.Oper
 		// Remove any paths rename if we are reverting.
 		for _, vol := range revertPaths {
 			if vol.isSymlink {
-				os.Symlink(vol.oldPath, vol.newPath)
+				_ = os.Symlink(vol.oldPath, vol.newPath)
 			} else {
-				os.Rename(vol.newPath, vol.oldPath)
+				_ = os.Rename(vol.newPath, vol.oldPath)
 			}
 		}
 
 		// Remove the new snapshot directory if we are reverting.
 		if len(revertPaths) > 0 {
 			snapshotDir := GetVolumeSnapshotDir(d.name, vol.volType, newVolName)
-			os.RemoveAll(snapshotDir)
+			_ = os.RemoveAll(snapshotDir)
 		}
 	}()
 
@@ -433,7 +428,7 @@ func (d *cephfs) RenameVolume(vol Volume, newVolName string, op *operations.Oper
 
 	for _, snapshot := range snapshots {
 		// Figure out the snapshot paths.
-		_, snapName, _ := shared.InstanceGetParentAndSnapshotName(snapshot.name)
+		_, snapName, _ := api.GetParentAndSnapshotName(snapshot.name)
 		oldCephSnapPath := filepath.Join(sourcePath, ".snap", snapName)
 		newCephSnapPath := filepath.Join(targetPath, ".snap", snapName)
 		oldPath := GetVolumeMountPath(d.name, vol.volType, GetSnapshotVolumeName(vol.name, snapName))
@@ -468,7 +463,7 @@ func (d *cephfs) RenameVolume(vol Volume, newVolName string, op *operations.Oper
 	return nil
 }
 
-// MigrateVolume streams the volume (with or without snapshots)
+// MigrateVolume streams the volume (with or without snapshots).
 func (d *cephfs) MigrateVolume(vol Volume, conn io.ReadWriteCloser, volSrcArgs *migration.VolumeSourceArgs, op *operations.Operation) error {
 	return genericVFSMigrateVolume(d, d.state, vol, conn, volSrcArgs, op)
 }
@@ -480,7 +475,7 @@ func (d *cephfs) BackupVolume(vol Volume, tarWriter *instancewriter.InstanceTarW
 
 // CreateVolumeSnapshot creates a new snapshot.
 func (d *cephfs) CreateVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
-	parentName, snapName, _ := shared.InstanceGetParentAndSnapshotName(snapVol.name)
+	parentName, snapName, _ := api.GetParentAndSnapshotName(snapVol.name)
 
 	// Create the snapshot.
 	sourcePath := GetVolumeMountPath(d.name, snapVol.volType, parentName)
@@ -509,7 +504,7 @@ func (d *cephfs) CreateVolumeSnapshot(snapVol Volume, op *operations.Operation) 
 
 // DeleteVolumeSnapshot deletes a snapshot.
 func (d *cephfs) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
-	parentName, snapName, _ := shared.InstanceGetParentAndSnapshotName(snapVol.name)
+	parentName, snapName, _ := api.GetParentAndSnapshotName(snapVol.name)
 
 	// Delete the snapshot itself.
 	sourcePath := GetVolumeMountPath(d.name, snapVol.volType, parentName)
@@ -531,17 +526,24 @@ func (d *cephfs) DeleteVolumeSnapshot(snapVol Volume, op *operations.Operation) 
 }
 
 // MountVolumeSnapshot makes the snapshot available for use.
-func (d *cephfs) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
+func (d *cephfs) MountVolumeSnapshot(snapVol Volume, op *operations.Operation) error {
 	unlock := snapVol.MountLock()
 	defer unlock()
 
-	return false, nil
+	snapVol.MountRefCountIncrement() // From here on it is up to caller to call UnmountVolumeSnapshot() when done.
+	return nil
 }
 
 // UnmountVolumeSnapshot clears any runtime state for the snapshot.
 func (d *cephfs) UnmountVolumeSnapshot(snapVol Volume, op *operations.Operation) (bool, error) {
 	unlock := snapVol.MountLock()
 	defer unlock()
+
+	refCount := snapVol.MountRefCountDecrement()
+	if refCount > 0 {
+		d.logger.Debug("Skipping unmount as in use", logger.Ctx{"volName": snapVol.name, "refCount": refCount})
+		return false, ErrInUse
+	}
 
 	return false, nil
 }
@@ -568,7 +570,7 @@ func (d *cephfs) RestoreVolume(vol Volume, snapshotName string, op *operations.O
 
 // RenameVolumeSnapshot renames a snapshot.
 func (d *cephfs) RenameVolumeSnapshot(snapVol Volume, newSnapshotName string, op *operations.Operation) error {
-	parentName, snapName, _ := shared.InstanceGetParentAndSnapshotName(snapVol.name)
+	parentName, snapName, _ := api.GetParentAndSnapshotName(snapVol.name)
 	sourcePath := GetVolumeMountPath(d.name, snapVol.volType, parentName)
 	oldCephSnapPath := filepath.Join(sourcePath, ".snap", snapName)
 	newCephSnapPath := filepath.Join(sourcePath, ".snap", newSnapshotName)

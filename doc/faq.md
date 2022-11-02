@@ -3,10 +3,11 @@
 ## General issues
 
 ### How to enable LXD server for remote access?
+
 By default, the LXD server is not accessible from the network as it only listens
 on a local Unix socket. You can make LXD available from the network by specifying
 additional addresses to listen to. This is done with the `core.https_address`
-config variable.
+configuration variable.
 
 To see the current server configuration, run:
 
@@ -24,7 +25,8 @@ lxc config set core.https_address 192.168.1.15
 
 Also see {ref}`security_remote_access`.
 
-### When I do a `lxc remote add` over https, it asks for a password?
+### When I do a `lxc remote add` over HTTPS, it asks for a password?
+
 By default, LXD has no password for security reasons, so you can't do a remote
 add this way. To set a password, enter the following command on the host LXD is
 running on:
@@ -44,55 +46,8 @@ lxc config trust add client.crt
 
 See {doc}`authentication` for detailed information.
 
-### How do I configure LXD storage?
-LXD supports btrfs, ceph, directory, lvm and zfs based storage.
-
-First make sure you have the relevant tools for your file system of
-choice installed on the machine (btrfs-progs, lvm2 or zfsutils-linux).
-
-By default, LXD comes with no configured network or storage.
-You can get a basic configuration done with:
-
-```bash
-    lxd init
-```
-
-`lxd init` supports both directory-based storage and ZFS.
-If you want something else, you'll need to use the `lxc storage` command:
-
-```bash
-lxc storage create default BACKEND [OPTIONS...]
-lxc profile device add default root disk path=/ pool=default
-```
-
-BACKEND is one of `btrfs`, `ceph`, `dir`, `lvm` or `zfs`.
-
-Unless specified otherwise, LXD will set up loop-based storage with a sane default size.
-
-For production environments, you should be using block-backed storage
-instead, both for performance and reliability reasons.
-
-### How can I live-migrate a container using LXD?
-Live migration requires a tool installed on both hosts called
-[CRIU](https://criu.org), which is available in Ubuntu via:
-
-```bash
-sudo apt install criu
-```
-
-Then, launch your container with the following:
-
-```bash
-lxc launch ubuntu SOME-NAME
-sleep 5s # let the container get to an interesting state
-lxc move host1:SOME-NAME host2:SOME-NAME
-```
-
-This should migrate your container. Be aware though that migration is still in
-experimental stages and might not work for all workloads. Please report bugs on
-lxc-devel, and we can escalate to CRIU lists as necessary.
-
 ### Can I bind-mount my home directory in a container?
+
 Yes. This can be done using a disk device:
 
 ```bash
@@ -101,9 +56,9 @@ lxc config device add container-name home disk source=/home/${USER} path=/home/u
 
 For unprivileged containers, you will also need one of:
 
- - Pass `shift=true` to the `lxc config device add` call. This depends on `shiftfs` being supported (see `lxc info`)
- - raw.idmap entry (see [Idmaps for user namespace](userns-idmap.md))
- - Recursive POSIX ACLs placed on your home directory
+- Pass `shift=true` to the `lxc config device add` call. This depends on shiftfs being supported (see `lxc info`)
+- `raw.idmap` entry (see [Idmaps for user namespace](userns-idmap.md))
+- Recursive POSIX ACLs placed on your home directory
 
 Either of those can be used to allow the user in the container to have working read/write permissions.
 When not setting one of those, everything will show up as the overflow UID/GID (65536:65536)
@@ -113,6 +68,7 @@ Privileged containers do not have this issue because all UID/GID in the containe
 But that's also the cause of most of the security issues with such privileged containers.
 
 ### How can I run Docker inside a LXD container?
+
 To run Docker inside a LXD container, the `security.nesting` property of the container should be set to `true`.
 
 ```bash
@@ -153,17 +109,17 @@ cannot start.
 
 The errors here say that `/sys` and `/proc` cannot be mounted - which is
 correct in an unprivileged container.  However, LXD does mount these
-file systems automatically _if it can_.
+file systems automatically if it can.
 
 The [container requirements](container-environment.md) specify that
 every container must come with an empty `/dev`, `/proc` and `/sys`
 folder, as well as `/sbin/init` existing.  If those folders don't
-exist, LXD will be unable to mount to them, and systemd will then
-try to. As this is an unprivileged container, systemd does not have
+exist, LXD will be unable to mount to them, and `systemd` will then
+try to. As this is an unprivileged container, `systemd` does not have
 the ability to do this, and it then freezes.
 
 So you can see the environment before anything is changed, you can
-explicitly change the init in a container using the `raw.lxc` configuration
+explicitly change the init system in a container using the `raw.lxc` configuration
 parameter.  This is equivalent to setting `init=/bin/bash` on the Linux
 kernel command line.
 
@@ -192,25 +148,25 @@ not running as well as expected.
     sys
     [root@systemd /]# exit
 
-Because LXD tries to auto-heal, it *did* create some of the folders when it was
+Because LXD tries to auto-heal, it did create some of the folders when it was
 starting up. Shutting down and restarting the container will fix the problem, but
 the original cause is still there - the **template does not contain the required
 files**.
 
 ## Networking issues
 
-In a larger [Production Environment](production-setup.md), it is common to have
+In a larger [Production Environment](performance-tuning), it is common to have
 multiple VLANs and have LXD clients attached directly to those VLANs. Be aware that
-if you are using netplan and systemd-networkd, you will encounter some bugs that
+if you are using `netplan` and `systemd-networkd`, you will encounter some bugs that
 could cause catastrophic issues.
 
-### Do not use systemd-networkd with netplan and bridges based on VLANs
+### Do not use `systemd-networkd` with `netplan` and bridges based on VLANs
 
-At time of writing (2019-03-05), netplan cannot assign a random MAC address to
+At time of writing (2019-03-05), `netplan` cannot assign a random MAC address to
 a bridge attached to a VLAN. It always picks the same MAC address, which causes
 layer2 issues when you have more than one machine on the same network segment.
 It also has difficulty creating multiple bridges.  Make sure you use
-`network-manager` instead. An example config is below, with a management
+`network-manager` instead. An example configuration is below, with a management
 address of 10.61.0.25, and VLAN102 being used for client traffic.
 
     network:
@@ -250,9 +206,9 @@ address of 10.61.0.25, and VLAN102 being used for client traffic.
 
 #### Things to note
 
-* eth0 is the Management interface, with the default gateway.
-* vlan102 uses eth1.
-* br102 uses vlan102, and _has a bogus /32 IP address assigned to it_
+- `eth0` is the Management interface, with the default gateway.
+- `vlan102` uses `eth1`.
+- `br102` uses `vlan102`, and has a bogus /32 IP address assigned to it.
 
 The other important thing is to set `stp: false`, otherwise the bridge will sit
 in `learning` state for up to 10 seconds, which is longer than most DHCP requests
@@ -261,11 +217,11 @@ safe to do.
 
 ### Beware of port security
 
-Many switches do *not* allow MAC address changes, and will either drop traffic
+Many switches do not allow MAC address changes, and will either drop traffic
 with an incorrect MAC or disable the port totally. If you can ping a LXD instance
-from the host, but are not able to ping it from a _different_ host, this could be
-the cause.  The way to diagnose this is to run a tcpdump on the uplink (in this case,
-eth1), and you will see either "ARP Who has xx.xx.xx.xx tell yy.yy.yy.yy, with you
+from the host, but are not able to ping it from a different host, this could be
+the cause.  The way to diagnose this is to run a `tcpdump` on the uplink (in this case,
+`eth1`), and you will see either "ARP Who has `xx.xx.xx.xx` tell `yy.yy.yy.yy`", with you
 sending responses but them not getting acknowledged, or ICMP packets going in and
 out successfully, but never being received by the other host.
 

@@ -8,11 +8,10 @@ import (
 
 	"github.com/pborman/uuid"
 
-	"github.com/gorilla/websocket"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/cancel"
 	"github.com/lxc/lxd/shared/logger"
-	log "gopkg.in/inconshreveable/log15.v2"
 )
 
 // EventSource indicates the source of an event.
@@ -66,21 +65,18 @@ func (s *Server) SetLocalLocation(location string) {
 }
 
 // AddListener creates and returns a new event listener.
-func (s *Server) AddListener(projectName string, allProjects bool, connection *websocket.Conn, messageTypes []string, excludeSources []EventSource, recvFunc EventHandler, excludeLocations []string) (*Listener, error) {
+func (s *Server) AddListener(projectName string, allProjects bool, connection EventListenerConnection, messageTypes []string, excludeSources []EventSource, recvFunc EventHandler, excludeLocations []string) (*Listener, error) {
 	if allProjects && projectName != "" {
 		return nil, fmt.Errorf("Cannot specify project name when listening for events on all projects")
 	}
 
-	ctx, ctxCancel := context.WithCancel(context.Background())
-
 	listener := &Listener{
 		listenerCommon: listenerCommon{
-			Conn:         connection,
-			messageTypes: messageTypes,
-			ctx:          ctx,
-			ctxCancel:    ctxCancel,
-			id:           uuid.New(),
-			recvFunc:     recvFunc,
+			EventListenerConnection: connection,
+			messageTypes:            messageTypes,
+			done:                    cancel.New(context.Background()),
+			id:                      uuid.New(),
+			recvFunc:                recvFunc,
 		},
 
 		allProjects:      allProjects,
@@ -98,22 +94,23 @@ func (s *Server) AddListener(projectName string, allProjects bool, connection *w
 
 	s.listeners[listener.id] = listener
 
-	go listener.heartbeat()
+	go listener.start()
 
 	return listener, nil
 }
 
 // SendLifecycle broadcasts a lifecycle event.
 func (s *Server) SendLifecycle(projectName string, event api.EventLifecycle) {
-	s.Send(projectName, "lifecycle", event)
+	_ = s.Send(projectName, api.EventTypeLifecycle, event)
 }
 
 // Send broadcasts a custom event.
-func (s *Server) Send(projectName string, eventType string, eventMessage interface{}) error {
+func (s *Server) Send(projectName string, eventType string, eventMessage any) error {
 	encodedMessage, err := json.Marshal(eventMessage)
 	if err != nil {
 		return err
 	}
+
 	event := api.Event{
 		Type:      eventType,
 		Timestamp: time.Now(),
@@ -127,7 +124,7 @@ func (s *Server) Send(projectName string, eventType string, eventMessage interfa
 // Inject an event from another member into the local events dispatcher.
 // eventSource is used to indicate where this event was received from.
 func (s *Server) Inject(event api.Event, eventSource EventSource) {
-	if event.Type == "logging" {
+	if event.Type == api.EventTypeLogging {
 		// Parse the message
 		logEntry := api.EventLogging{}
 		err := json.Unmarshal(event.Metadata, &logEntry)
@@ -135,7 +132,7 @@ func (s *Server) Inject(event api.Event, eventSource EventSource) {
 			return
 		}
 
-		if !s.debug && logEntry.Level == "dbug" {
+		if !s.debug && logEntry.Level == "debug" {
 			return
 		}
 
@@ -146,7 +143,7 @@ func (s *Server) Inject(event api.Event, eventSource EventSource) {
 
 	err := s.broadcast(event, eventSource)
 	if err != nil {
-		logger.Warn("Failed to forward event from member", log.Ctx{"member": event.Location, "err": err})
+		logger.Warn("Failed to forward event from member", logger.Ctx{"member": event.Location, "err": err})
 	}
 }
 
@@ -203,10 +200,13 @@ func (s *Server) broadcast(event api.Event, eventSource EventSource) error {
 
 			// Make sure we're not done already
 			if listener.IsClosed() {
+				// Remove the listener from the list
+				s.lock.Lock()
+				delete(s.listeners, listener.id)
+				s.lock.Unlock()
 				return
 			}
 
-			listener.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			err := listener.WriteJSON(event)
 			if err != nil {
 				// Remove the listener from the list
@@ -218,6 +218,7 @@ func (s *Server) broadcast(event api.Event, eventSource EventSource) error {
 			}
 		}(listener, event)
 	}
+
 	s.lock.Unlock()
 
 	return nil

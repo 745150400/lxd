@@ -4,8 +4,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net"
+	"os"
 
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
@@ -22,11 +22,13 @@ func InMemoryNetwork() (net.Listener, func() net.Conn) {
 		conns:  make(chan net.Conn, 16),
 		closed: make(chan struct{}),
 	}
+
 	dialer := func() net.Conn {
 		server, client := net.Pipe()
 		listener.conns <- server
 		return client
 	}
+
 	return listener, dialer
 }
 
@@ -72,7 +74,7 @@ func (a *inMemoryAddr) String() string {
 // possibly filling it with the default port if it's missing. It will also wrap a bare IPv6 address with square
 // brackets if needed.
 func CanonicalNetworkAddress(address string, defaultPort int) string {
-	_, _, err := net.SplitHostPort(address)
+	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		ip := net.ParseIP(address)
 		if ip != nil {
@@ -84,6 +86,9 @@ func CanonicalNetworkAddress(address string, defaultPort int) string {
 			// a port number, so append the default port.
 			address = fmt.Sprintf("%s:%d", address, defaultPort)
 		}
+	} else if port == "" && address[len(address)-1] == ':' {
+		// An address that ends with a trailing colon will be parsed as having an empty port.
+		address = net.JoinHostPort(host, fmt.Sprintf("%d", defaultPort))
 	}
 
 	return address
@@ -235,6 +240,7 @@ func IsAddressCovered(address1, address2 string) bool {
 		if ip1 != nil && ip1.To4() != nil {
 			return true
 		}
+
 		return false
 	}
 
@@ -266,7 +272,7 @@ func IsWildCardAddress(address string) bool {
 // SysctlGet retrieves the value of a sysctl file in /proc/sys.
 func SysctlGet(path string) (string, error) {
 	// Read the current content
-	content, err := ioutil.ReadFile(fmt.Sprintf("/proc/sys/%s", path))
+	content, err := os.ReadFile(fmt.Sprintf("/proc/sys/%s", path))
 	if err != nil {
 		return "", err
 	}
@@ -275,7 +281,7 @@ func SysctlGet(path string) (string, error) {
 }
 
 // SysctlSet writes a value to a sysctl file in /proc/sys.
-// Requires an even number of arguments as key/value pairs. E.g. SysctlSet("path1", "value1", "path2", "value2")
+// Requires an even number of arguments as key/value pairs. E.g. SysctlSet("path1", "value1", "path2", "value2").
 func SysctlSet(parts ...string) error {
 	partsLen := len(parts)
 	if partsLen%2 != 0 {
@@ -293,7 +299,7 @@ func SysctlSet(parts ...string) error {
 			return nil
 		}
 
-		err = ioutil.WriteFile(fmt.Sprintf("/proc/sys/%s", path), []byte(newValue), 0)
+		err = os.WriteFile(fmt.Sprintf("/proc/sys/%s", path), []byte(newValue), 0)
 		if err != nil {
 			return err
 		}

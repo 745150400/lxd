@@ -39,14 +39,22 @@ func (c *cmdCopy) Command() *cobra.Command {
 	cmd.Aliases = []string{"cp"}
 	cmd.Short = i18n.G("Copy instances within or in between LXD servers")
 	cmd.Long = cli.FormatSection(i18n.G("Description"), i18n.G(
-		`Copy instances within or in between LXD servers`))
+		`Copy instances within or in between LXD servers
+
+Transfer modes (--mode):
+ - pull: Target server pulls the data from the source server (source must listen on network)
+ - push: Source server pushes the data to the target server (target must listen on network)
+ - relay: The CLI connects to both source and server and proxies the data (both source and target must listen on network)
+
+The pull transfer mode is the default as it is compatible with all LXD versions.
+`))
 
 	cmd.RunE = c.Run
 	cmd.Flags().StringArrayVarP(&c.flagConfig, "config", "c", nil, i18n.G("Config key/value to apply to the new instance")+"``")
 	cmd.Flags().StringArrayVarP(&c.flagDevice, "device", "d", nil, i18n.G("New key/value to apply to a specific device")+"``")
 	cmd.Flags().StringArrayVarP(&c.flagProfile, "profile", "p", nil, i18n.G("Profile to apply to the new instance")+"``")
 	cmd.Flags().BoolVarP(&c.flagEphemeral, "ephemeral", "e", false, i18n.G("Ephemeral instance"))
-	cmd.Flags().StringVar(&c.flagMode, "mode", "pull", i18n.G("Transfer mode. One of pull (default), push or relay")+"``")
+	cmd.Flags().StringVar(&c.flagMode, "mode", "pull", i18n.G("Transfer mode. One of pull, push or relay")+"``")
 	cmd.Flags().BoolVar(&c.flagInstanceOnly, "instance-only", false, i18n.G("Copy the instance without its snapshots"))
 	cmd.Flags().BoolVar(&c.flagStateless, "stateless", false, i18n.G("Copy a stateful instance stateless"))
 	cmd.Flags().StringVarP(&c.flagStorage, "storage", "s", "", i18n.G("Storage pool name")+"``")
@@ -132,21 +140,9 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 		configMap[fields[0]] = fields[1]
 	}
 
-	// Parse the device overrides
-	deviceMap := map[string]map[string]string{}
-	for _, entry := range c.flagDevice {
-		if !strings.Contains(entry, "=") || !strings.Contains(entry, ",") {
-			return fmt.Errorf(i18n.G("Bad syntax, expecting <device>,<key>=<value>: %s"), entry)
-		}
-
-		deviceFields := strings.SplitN(entry, ",", 2)
-		keyFields := strings.SplitN(deviceFields[1], "=", 2)
-
-		if deviceMap[deviceFields[0]] == nil {
-			deviceMap[deviceFields[0]] = map[string]string{}
-		}
-
-		deviceMap[deviceFields[0]][keyFields[0]] = keyFields[1]
+	deviceMap, err := parseDeviceOverrides(c.flagDevice)
+	if err != nil {
+		return err
 	}
 
 	var op lxd.RemoteOperation
@@ -358,6 +354,7 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 		progress.Done("")
 		return err
 	}
+
 	progress.Done("")
 
 	if c.flagRefresh {
@@ -392,6 +389,7 @@ func (c *cmdCopy) copyInstance(conf *config.Config, sourceResource string, destR
 			progress.Done("")
 			return err
 		}
+
 		progress.Done("")
 	}
 

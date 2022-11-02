@@ -1,14 +1,15 @@
 package device
 
 import (
-	log "gopkg.in/inconshreveable/log15.v2"
+	"fmt"
+	"net"
 
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
+	"github.com/lxc/lxd/lxd/network"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 )
 
 // deviceCommon represents the common struct for all devices.
@@ -27,13 +28,13 @@ type deviceCommon struct {
 // persistent data to be accessed. This is implemented as part of deviceCommon so that the majority
 // of devices don't need to implement it and can just embed deviceCommon.
 func (d *deviceCommon) init(inst instance.Instance, state *state.State, name string, conf deviceConfig.Device, volatileGet VolatileGetter, volatileSet VolatileSetter) {
-	logCtx := log.Ctx{"driver": conf["type"], "device": name}
+	logCtx := logger.Ctx{"driver": conf["type"], "device": name}
 	if inst != nil {
-		logCtx["project"] = inst.Project()
+		logCtx["project"] = inst.Project().Name
 		logCtx["instance"] = inst.Name()
 	}
 
-	d.logger = logging.AddContext(logger.Log, logCtx)
+	d.logger = logger.AddContext(logger.Log, logCtx)
 	d.inst = inst
 	d.name = name
 	d.config = conf
@@ -66,11 +67,7 @@ func (d *deviceCommon) Register() error {
 // Returns true if instance type is container, as majority of devices can be started/stopped when
 // instance is running. If instance type is VM then returns false as this is not currently supported.
 func (d *deviceCommon) CanHotPlug() bool {
-	if d.inst.Type() == instancetype.Container {
-		return true
-	}
-
-	return false
+	return d.inst.Type() == instancetype.Container
 }
 
 // CanMigrate returns whether the device can be migrated to any other cluster member.
@@ -96,4 +93,26 @@ func (d *deviceCommon) Update(oldDevices deviceConfig.Devices, isRunning bool) e
 // Remove returns nil error as majority of devices don't need to do any host-side cleanup on delete.
 func (d *deviceCommon) Remove() error {
 	return nil
+}
+
+// generateHostName generates the name to use for the host side NIC interface based on the
+// instances.nic.host_name setting.
+// Accepts prefix argument to use with random interface generation.
+// Accepts optional hwaddr MAC address to use for generating the interface name in mac mode.
+// In mac mode the interface prefix is always "lxd".
+func (d *deviceCommon) generateHostName(prefix string, hwaddr string) (string, error) {
+	hostNameMode := d.state.GlobalConfig.InstancesNICHostname()
+
+	// Handle instances.nic.host_name mac mode if a MAC address has been supplied.
+	if hostNameMode == "mac" && hwaddr != "" {
+		mac, err := net.ParseMAC(hwaddr)
+		if err != nil {
+			return "", fmt.Errorf("Failed parsing MAC address %q: %w", hwaddr, err)
+		}
+
+		return network.MACDevName(mac), nil
+	}
+
+	// Handle instances.nic.host_name random mode or where no MAC address supplied.
+	return network.RandomDevName(prefix), nil
 }

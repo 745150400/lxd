@@ -7,22 +7,22 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"gopkg.in/macaroon-bakery.v2/bakery"
-	"gopkg.in/macaroon-bakery.v2/httpbakery"
+	"gopkg.in/macaroon-bakery.v3/bakery"
+	"gopkg.in/macaroon-bakery.v3/httpbakery"
 
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-
-	neturl "net/url"
+	"github.com/lxc/lxd/shared/tcp"
 )
 
-// ProtocolLXD represents a LXD API server
+// ProtocolLXD represents a LXD API server.
 type ProtocolLXD struct {
 	ctx                context.Context
 	server             *api.Server
@@ -54,23 +54,29 @@ type ProtocolLXD struct {
 	project       string
 }
 
-// Disconnect gets rid of any background goroutines
+// Disconnect gets rid of any background goroutines.
 func (r *ProtocolLXD) Disconnect() {
 	if r.ctxConnected.Err() != nil {
 		r.ctxConnectedCancel()
 	}
 }
 
-// GetConnectionInfo returns the basic connection information used to interact with the server
+// GetConnectionInfo returns the basic connection information used to interact with the server.
 func (r *ProtocolLXD) GetConnectionInfo() (*ConnectionInfo, error) {
 	info := ConnectionInfo{}
 	info.Certificate = r.httpCertificate
 	info.Protocol = "lxd"
 	info.URL = r.httpBaseURL.String()
 	info.SocketPath = r.httpUnixPath
+
 	info.Project = r.project
 	if info.Project == "" {
 		info.Project = "default"
+	}
+
+	info.Target = r.clusterTarget
+	if info.Target == "" && r.server != nil {
+		info.Target = r.server.Environment.ServerName
 	}
 
 	urls := []string{}
@@ -90,9 +96,42 @@ func (r *ProtocolLXD) GetConnectionInfo() (*ConnectionInfo, error) {
 			}
 		}
 	}
+
 	info.Addresses = urls
 
 	return &info, nil
+}
+
+func (r *ProtocolLXD) isSameServer(server Server) bool {
+	// Short path checking if the two structs are identical.
+	if r == server {
+		return true
+	}
+
+	// Short path if either of the structs are nil.
+	if r == nil || server == nil {
+		return false
+	}
+
+	// When dealing with uninitialized servers, we can't safely compare.
+	if r.server == nil {
+		return false
+	}
+
+	// Get the connection info from both servers.
+	srcInfo, err := r.GetConnectionInfo()
+	if err != nil {
+		return false
+	}
+
+	dstInfo, err := server.GetConnectionInfo()
+	if err != nil {
+		return false
+	}
+
+	// Check whether we're dealing with the same server.
+	return srcInfo.Protocol == dstInfo.Protocol && srcInfo.Certificate == dstInfo.Certificate &&
+		srcInfo.Project == dstInfo.Project && srcInfo.Target == dstInfo.Target
 }
 
 // GetHTTPClient returns the http client used for the connection. This can be used to set custom http options.
@@ -138,7 +177,7 @@ func (r *ProtocolLXD) addClientHeaders(req *http.Request) {
 	}
 }
 
-// RequireAuthenticated sets whether we expect to be authenticated with the server
+// RequireAuthenticated sets whether we expect to be authenticated with the server.
 func (r *ProtocolLXD) RequireAuthenticated(authenticated bool) {
 	r.requireAuthenticated = authenticated
 }
@@ -146,7 +185,7 @@ func (r *ProtocolLXD) RequireAuthenticated(authenticated bool) {
 // RawQuery allows directly querying the LXD API
 //
 // This should only be used by internal LXD tools.
-func (r *ProtocolLXD) RawQuery(method string, path string, data interface{}, ETag string) (*api.Response, string, error) {
+func (r *ProtocolLXD) RawQuery(method string, path string, data any, ETag string) (*api.Response, string, error) {
 	// Generate the URL
 	url := fmt.Sprintf("%s%s", r.httpBaseURL.String(), path)
 
@@ -162,11 +201,11 @@ func (r *ProtocolLXD) RawWebsocket(path string) (*websocket.Conn, error) {
 
 // RawOperation allows direct querying of a LXD API endpoint returning
 // background operations.
-func (r *ProtocolLXD) RawOperation(method string, path string, data interface{}, ETag string) (Operation, string, error) {
+func (r *ProtocolLXD) RawOperation(method string, path string, data any, ETag string) (Operation, string, error) {
 	return r.queryOperation(method, path, data, ETag)
 }
 
-// Internal functions
+// Internal functions.
 func lxdParseResponse(resp *http.Response) (*api.Response, string, error) {
 	// Get the ETag
 	etag := resp.Header.Get("ETag")
@@ -193,16 +232,16 @@ func lxdParseResponse(resp *http.Response) (*api.Response, string, error) {
 	return &response, etag, nil
 }
 
-func (r *ProtocolLXD) rawQuery(method string, url string, data interface{}, ETag string) (*api.Response, string, error) {
+func (r *ProtocolLXD) rawQuery(method string, url string, data any, ETag string) (*api.Response, string, error) {
 	var req *http.Request
 	var err error
 
 	// Log the request
-	logger.Debug("Sending request to LXD",
-		"method", method,
-		"url", url,
-		"etag", ETag,
-	)
+	logger.Debug("Sending request to LXD", logger.Ctx{
+		"method": method,
+		"url":    url,
+		"etag":   ETag,
+	})
 
 	// Get a new HTTP request setup
 	if data != nil {
@@ -255,7 +294,8 @@ func (r *ProtocolLXD) rawQuery(method string, url string, data interface{}, ETag
 	if err != nil {
 		return nil, "", err
 	}
-	defer resp.Body.Close()
+
+	defer func() { _ = resp.Body.Close() }()
 
 	return lxdParseResponse(resp)
 }
@@ -291,7 +331,7 @@ func (r *ProtocolLXD) setQueryAttributes(uri string) (string, error) {
 	return fields.String(), nil
 }
 
-func (r *ProtocolLXD) query(method string, path string, data interface{}, ETag string) (*api.Response, string, error) {
+func (r *ProtocolLXD) query(method string, path string, data any, ETag string) (*api.Response, string, error) {
 	// Generate the URL
 	url := fmt.Sprintf("%s/1.0%s", r.httpBaseURL.String(), path)
 
@@ -305,7 +345,7 @@ func (r *ProtocolLXD) query(method string, path string, data interface{}, ETag s
 	return r.rawQuery(method, url, data, ETag)
 }
 
-func (r *ProtocolLXD) queryStruct(method string, path string, data interface{}, ETag string, target interface{}) (string, error) {
+func (r *ProtocolLXD) queryStruct(method string, path string, data any, ETag string, target any) (string, error) {
 	resp, etag, err := r.query(method, path, data, ETag)
 	if err != nil {
 		return "", err
@@ -323,7 +363,7 @@ func (r *ProtocolLXD) queryStruct(method string, path string, data interface{}, 
 	return etag, nil
 }
 
-func (r *ProtocolLXD) queryOperation(method string, path string, data interface{}, ETag string) (Operation, string, error) {
+func (r *ProtocolLXD) queryOperation(method string, path string, data any, ETag string) (Operation, string, error) {
 	// Attempt to setup an early event listener
 	listener, err := r.GetEvents()
 	if err != nil {
@@ -371,8 +411,7 @@ func (r *ProtocolLXD) rawWebsocket(url string) (*websocket.Conn, error) {
 
 	// Setup a new websocket dialer based on it
 	dialer := websocket.Dialer{
-		//lint:ignore SA1019 DialContext doesn't exist in Go 1.13
-		NetDial:          httpTransport.Dial,
+		NetDialContext:   httpTransport.DialContext,
 		TLSClientConfig:  httpTransport.TLSClientConfig,
 		Proxy:            httpTransport.Proxy,
 		HandshakeTimeout: time.Second * 5,
@@ -389,10 +428,19 @@ func (r *ProtocolLXD) rawWebsocket(url string) (*websocket.Conn, error) {
 		return nil, err
 	}
 
+	// Set TCP timeout options.
+	remoteTCP, _ := tcp.ExtractConn(conn.UnderlyingConn())
+	if remoteTCP != nil {
+		err = tcp.SetTimeouts(remoteTCP)
+		if err != nil {
+			logger.Error("Failed setting TCP timeouts on remote connection", logger.Ctx{"err": err})
+		}
+	}
+
 	// Log the data
 	logger.Debugf("Connected to the websocket: %v", url)
 
-	return conn, err
+	return conn, nil
 }
 
 func (r *ProtocolLXD) websocket(path string) (*websocket.Conn, error) {

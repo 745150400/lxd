@@ -9,6 +9,8 @@ test_pki() {
   (
     set -e
     cd "${TEST_DIR}/pki"
+    export EASYRSA_KEY_SIZE=4096
+
     # shellcheck disable=SC1091
     if [ -e pkitool ]; then
         . ./vars
@@ -51,7 +53,7 @@ test_pki() {
   # Confirm that a valid client certificate works.
   (
     set -e
-    export LXD_CONF=${LXC5_DIR}
+    export LXD_CONF="${LXC5_DIR}"
 
     # Try adding remote using an incorrect password.
     # This should fail, as if the certificate is unknown and password is wrong then no access should be allowed.

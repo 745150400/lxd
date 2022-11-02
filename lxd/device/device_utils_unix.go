@@ -2,7 +2,6 @@ package device
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -76,6 +75,7 @@ func unixDeviceSourcePath(m deviceConfig.Device) string {
 	if srcPath == "" {
 		srcPath = m["path"]
 	}
+
 	return shared.HostPath(srcPath)
 }
 
@@ -128,12 +128,14 @@ func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath stri
 		if err != nil {
 			return nil, fmt.Errorf("Bad major %s in device %s", m["major"], srcPath)
 		}
+
 		d.Major = uint32(tmp)
 
 		tmp, err = strconv.ParseUint(m["minor"], 10, 32)
 		if err != nil {
 			return nil, fmt.Errorf("Bad minor %s in device %s", m["minor"], srcPath)
 		}
+
 		d.Minor = uint32(tmp)
 	}
 
@@ -144,6 +146,7 @@ func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath stri
 		if err != nil {
 			return nil, fmt.Errorf("Bad mode %s in device %s", m["mode"], srcPath)
 		}
+
 		d.Mode = os.FileMode(tmp)
 	} else if !defaultMode {
 		// If not specified mode in device config, and default mode is false, then try and
@@ -154,6 +157,7 @@ func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath stri
 			if !isErrno || errno != unix.ENOENT {
 				return nil, fmt.Errorf("Failed to retrieve mode of device %s: %w", srcPath, err)
 			}
+
 			d.Mode = os.FileMode(unixDefaultMode)
 		}
 	}
@@ -183,7 +187,7 @@ func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath stri
 
 	// Create the devices directory if missing.
 	if !shared.PathExists(devicesPath) {
-		os.Mkdir(devicesPath, 0711)
+		err := os.Mkdir(devicesPath, 0711)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to create devices path: %s", err)
 		}
@@ -229,7 +233,8 @@ func UnixDeviceCreate(s *state.State, idmapSet *idmap.IdmapSet, devicesPath stri
 		if err != nil {
 			return nil, err
 		}
-		f.Close()
+
+		_ = f.Close()
 
 		err = DiskMount(srcPath, devPath, false, false, "", nil, "none")
 		if err != nil {
@@ -257,7 +262,7 @@ func unixDeviceSetup(s *state.State, devicesPath string, typePrefix string, devi
 	ourEncRelDestFile := filesystem.PathNameEncode(strings.TrimPrefix(ourDestPath, "/"))
 
 	// Load all existing host devices.
-	dents, err := ioutil.ReadDir(devicesPath)
+	dents, err := os.ReadDir(devicesPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
@@ -375,7 +380,7 @@ func UnixDeviceExists(devicesPath string, prefix string, path string) bool {
 // Accepts an optional file prefix that will be used to narrow the selection of files to remove.
 func unixDeviceRemove(devicesPath string, typePrefix string, deviceName string, optPrefix string, runConf *deviceConfig.RunConfig) error {
 	// Load all devices.
-	dents, err := ioutil.ReadDir(devicesPath)
+	dents, err := os.ReadDir(devicesPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
@@ -481,7 +486,7 @@ func unixDeviceDeleteFiles(s *state.State, devicesPath string, typePrefix string
 	}
 
 	// Load all devices.
-	dents, err := ioutil.ReadDir(devicesPath)
+	dents, err := os.ReadDir(devicesPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
@@ -498,7 +503,7 @@ func unixDeviceDeleteFiles(s *state.State, devicesPath string, typePrefix string
 
 			// Remove the host side mount.
 			if s.OS.RunningInUserNS {
-				unix.Unmount(devPath, unix.MNT_DETACH)
+				_ = unix.Unmount(devPath, unix.MNT_DETACH)
 			}
 
 			// Remove the host side device file.

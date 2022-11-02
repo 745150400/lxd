@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/gorilla/mux"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	clusterRequest "github.com/lxc/lxd/lxd/cluster/request"
 	"github.com/lxc/lxd/lxd/lifecycle"
@@ -18,6 +18,7 @@ import (
 	"github.com/lxc/lxd/lxd/response"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/version"
 )
 
@@ -139,7 +140,7 @@ var networkACLLogCmd = APIEndpoint{
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkACLsGet(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -147,7 +148,7 @@ func networkACLsGet(d *Daemon, r *http.Request) response.Response {
 	recursion := util.IsRecursionRequest(r)
 
 	// Get list of Network ACLs.
-	aclNames, err := d.cluster.GetNetworkACLs(projectName)
+	aclNames, err := d.db.Cluster.GetNetworkACLs(projectName)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -210,7 +211,7 @@ func networkACLsGet(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkACLsPost(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -238,10 +239,10 @@ func networkACLsPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.NetworkACLCreated.Event(netACL, request.CreateRequestor(r), nil))
+	lc := lifecycle.NetworkACLCreated.Event(netACL, request.CreateRequestor(r), nil)
+	d.State().Events.SendLifecycle(projectName, lc)
 
-	url := fmt.Sprintf("/%s/network-acls/%s", version.APIVersion, req.Name)
-	return response.SyncResponseLocation(true, nil, url)
+	return response.SyncResponseLocation(true, nil, lc.Source)
 }
 
 // swagger:operation DELETE /1.0/network-acls/{name} network-acls network_acl_delete
@@ -269,12 +270,17 @@ func networkACLsPost(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkACLDelete(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	netACL, err := acl.LoadByName(d.State(), projectName, mux.Vars(r)["name"])
+	aclName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	netACL, err := acl.LoadByName(d.State(), projectName, aclName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -330,12 +336,17 @@ func networkACLDelete(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkACLGet(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	netACL, err := acl.LoadByName(d.State(), projectName, mux.Vars(r)["name"])
+	aclName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	netACL, err := acl.LoadByName(d.State(), projectName, aclName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -419,13 +430,18 @@ func networkACLGet(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkACLPut(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	aclName, err := url.PathUnescape(mux.Vars(r)["name"])
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get the existing Network ACL.
-	netACL, err := acl.LoadByName(d.State(), projectName, mux.Vars(r)["name"])
+	netACL, err := acl.LoadByName(d.State(), projectName, aclName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -500,9 +516,12 @@ func networkACLPut(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkACLPost(d *Daemon, r *http.Request) response.Response {
-	name := mux.Vars(r)["name"]
+	aclName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -516,7 +535,7 @@ func networkACLPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Get the existing Network ACL.
-	netACL, err := acl.LoadByName(d.State(), projectName, name)
+	netACL, err := acl.LoadByName(d.State(), projectName, aclName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -526,10 +545,10 @@ func networkACLPost(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.NetworkACLRenamed.Event(netACL, request.CreateRequestor(r), log.Ctx{"old_name": name}))
+	lc := lifecycle.NetworkACLRenamed.Event(netACL, request.CreateRequestor(r), logger.Ctx{"old_name": aclName})
+	d.State().Events.SendLifecycle(projectName, lc)
 
-	url := fmt.Sprintf("/%s/network-acls/%s", version.APIVersion, req.Name)
-	return response.SyncResponseLocation(true, nil, url)
+	return response.SyncResponseLocation(true, nil, lc.Source)
 }
 
 // swagger:operation GET /1.0/network-acls/{name}/log network-acls network_acl_log_get
@@ -560,12 +579,17 @@ func networkACLPost(d *Daemon, r *http.Request) response.Response {
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkACLLogGet(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, _, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	netACL, err := acl.LoadByName(d.State(), projectName, mux.Vars(r)["name"])
+	aclName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	netACL, err := acl.LoadByName(d.State(), projectName, aclName)
 	if err != nil {
 		return response.SmartError(err)
 	}

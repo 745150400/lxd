@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,29 +42,34 @@ func TestUrlsJoin(t *testing.T) {
 
 func TestFileCopy(t *testing.T) {
 	helloWorld := []byte("hello world\n")
-	source, err := ioutil.TempFile("", "")
+	source, err := os.CreateTemp("", "")
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	defer os.Remove(source.Name())
 
-	if err := WriteAll(source, helloWorld); err != nil {
-		source.Close()
+	defer func() { _ = os.Remove(source.Name()) }()
+
+	err = WriteAll(source, helloWorld)
+	if err != nil {
+		_ = source.Close()
 		t.Error(err)
 		return
 	}
-	source.Close()
 
-	dest, err := ioutil.TempFile("", "")
-	defer os.Remove(dest.Name())
+	_ = source.Close()
+
+	dest, err := os.CreateTemp("", "")
+	defer func() { _ = os.Remove(dest.Name()) }()
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	dest.Close()
 
-	if err := FileCopy(source.Name(), dest.Name()); err != nil {
+	_ = dest.Close()
+
+	err = FileCopy(source.Name(), dest.Name())
+	if err != nil {
 		t.Error(err)
 		return
 	}
@@ -75,7 +80,7 @@ func TestFileCopy(t *testing.T) {
 		return
 	}
 
-	content, err := ioutil.ReadAll(dest2)
+	content, err := io.ReadAll(dest2)
 	if err != nil {
 		t.Error(err)
 		return
@@ -88,9 +93,9 @@ func TestFileCopy(t *testing.T) {
 }
 
 func TestDirCopy(t *testing.T) {
-	dir, err := ioutil.TempDir("", "lxd-shared-util-")
+	dir, err := os.MkdirTemp("", "lxd-shared-util-")
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	source := filepath.Join(dir, "source")
 	dest := filepath.Join(dir, "dest")
@@ -107,8 +112,8 @@ func TestDirCopy(t *testing.T) {
 	require.NoError(t, os.Mkdir(source, 0755))
 	require.NoError(t, os.Mkdir(filepath.Join(source, dir1), 0755))
 	require.NoError(t, os.Mkdir(filepath.Join(source, dir2), 0755))
-	require.NoError(t, ioutil.WriteFile(filepath.Join(source, file1), content1, 0755))
-	require.NoError(t, ioutil.WriteFile(filepath.Join(source, file2), content2, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, file1), content1, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(source, file2), content2, 0755))
 
 	require.NoError(t, DirCopy(source, dest))
 
@@ -116,18 +121,18 @@ func TestDirCopy(t *testing.T) {
 		assert.True(t, PathExists(filepath.Join(dest, path)))
 	}
 
-	bytes, err := ioutil.ReadFile(filepath.Join(dest, file1))
+	bytes, err := os.ReadFile(filepath.Join(dest, file1))
 	require.NoError(t, err)
 	assert.Equal(t, content1, bytes)
 
-	bytes, err = ioutil.ReadFile(filepath.Join(dest, file2))
+	bytes, err = os.ReadFile(filepath.Join(dest, file2))
 	require.NoError(t, err)
 	assert.Equal(t, content2, bytes)
 }
 
 func TestReaderToChannel(t *testing.T) {
 	buf := make([]byte, 1*1024*1024)
-	rand.Read(buf)
+	_, _ = rand.Read(buf)
 
 	offset := 0
 	finished := false
@@ -138,7 +143,7 @@ func TestReaderToChannel(t *testing.T) {
 		if len(data) > 0 {
 			for i := 0; i < len(data); i++ {
 				if buf[offset+i] != data[i] {
-					t.Error(fmt.Sprintf("byte %d didn't match", offset+i))
+					t.Errorf("byte %d didn't match", offset+i)
 					return
 				}
 			}
@@ -165,28 +170,87 @@ func TestReaderToChannel(t *testing.T) {
 	}
 }
 
-func TestGetSnapshotExpiry(t *testing.T) {
+func TestGetExpiry(t *testing.T) {
 	refDate := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
-	expiryDate, err := GetSnapshotExpiry(refDate, "1M 2H 3d 4w 5m 6y")
+	expiryDate, err := GetExpiry(refDate, "1M 2H 3d 4w 5m 6y")
 	expectedDate := time.Date(2006, time.July, 2, 2, 1, 0, 0, time.UTC)
 	require.NoError(t, err)
 	require.Equal(t, expectedDate, expiryDate)
 
 	refDate = time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
-	expiryDate, err = GetSnapshotExpiry(refDate, "1M 2H 3d 4y")
-	expectedDate = time.Date(2004, time.January, 4, 2, 1, 0, 0, time.UTC)
+	expiryDate, err = GetExpiry(refDate, "5S 1M 2H 3d 4y")
+	expectedDate = time.Date(2004, time.January, 4, 2, 1, 5, 0, time.UTC)
 	require.NoError(t, err)
 	require.Equal(t, expectedDate, expiryDate)
 
-	expiryDate, err = GetSnapshotExpiry(refDate, "0M 0H 0d 0w 0m 0y")
+	expiryDate, err = GetExpiry(refDate, "0M 0H 0d 0w 0m 0y")
 	require.NoError(t, err)
 	require.Equal(t, expiryDate, expiryDate)
 
-	expiryDate, err = GetSnapshotExpiry(refDate, "")
+	expiryDate, err = GetExpiry(refDate, "")
 	require.NoError(t, err)
 	require.Equal(t, time.Time{}, expiryDate)
 
-	expiryDate, err = GetSnapshotExpiry(refDate, "1z")
+	expiryDate, err = GetExpiry(refDate, "1z")
 	require.Error(t, err)
 	require.Equal(t, time.Time{}, expiryDate)
+}
+
+func TestHasKey(t *testing.T) {
+	m1 := map[string]string{
+		"foo":   "bar",
+		"empty": "",
+	}
+
+	m2 := map[int]string{
+		1: "foo",
+	}
+
+	assert.True(t, HasKey("foo", m1))
+	assert.True(t, HasKey("empty", m1))
+	assert.False(t, HasKey("missing", m1))
+
+	assert.True(t, HasKey(1, m2))
+	assert.False(t, HasKey(0, m2))
+}
+
+func TestRemoveElementsFromStringSlice(t *testing.T) {
+	type test struct {
+		elementsToRemove []string
+		list             []string
+		expectedList     []string
+	}
+
+	tests := []test{
+		{
+			elementsToRemove: []string{"one", "two", "three"},
+			list:             []string{"one", "two", "three", "four", "five"},
+			expectedList:     []string{"four", "five"},
+		},
+		{
+			elementsToRemove: []string{"two", "three", "four"},
+			list:             []string{"one", "two", "three", "four", "five"},
+			expectedList:     []string{"one", "five"},
+		},
+		{
+			elementsToRemove: []string{"two", "three", "four"},
+			list:             []string{"two", "three"},
+			expectedList:     []string{},
+		},
+		{
+			elementsToRemove: []string{"two", "two", "two"},
+			list:             []string{"two"},
+			expectedList:     []string{},
+		},
+		{
+			elementsToRemove: []string{"two", "two", "two"},
+			list:             []string{"one", "two", "three", "four", "five"},
+			expectedList:     []string{"one", "three", "four", "five"},
+		},
+	}
+
+	for _, tt := range tests {
+		gotList := RemoveElementsFromStringSlice(tt.list, tt.elementsToRemove...)
+		assert.ElementsMatch(t, tt.expectedList, gotList)
+	}
 }

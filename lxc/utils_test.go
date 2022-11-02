@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"sort"
 	"testing"
 
@@ -45,6 +46,7 @@ func (s *utilsTestSuite) TestGetExistingAliases() {
 		{Name: "bar"},
 		{Name: "baz"},
 	}
+
 	aliases := GetExistingAliases([]string{"bar", "foo", "other"}, images)
 	s.Exactly([]api.ImageAliasesEntry{images[0], images[1]}, aliases)
 }
@@ -55,6 +57,23 @@ func (s *utilsTestSuite) TestGetExistingAliasesEmpty() {
 		{Name: "bar"},
 		{Name: "baz"},
 	}
+
 	aliases := GetExistingAliases([]string{"other1", "other2"}, images)
 	s.Exactly([]api.ImageAliasesEntry{}, aliases)
+}
+
+func (s *utilsTestSuite) TestStructHasFields() {
+	s.Equal(structHasField(reflect.TypeOf(api.Image{}), "type"), true)
+	s.Equal(structHasField(reflect.TypeOf(api.Image{}), "public"), true)
+	s.Equal(structHasField(reflect.TypeOf(api.Image{}), "foo"), false)
+}
+
+func (s *utilsTestSuite) TestGetServerSupportedFilters() {
+	filters := []string{
+		"foo", "type=container", "user.blah=a", "status=running,stopped",
+	}
+
+	supportedFilters, unsupportedFilters := getServerSupportedFilters(filters, api.InstanceFull{})
+	s.Equal([]string{"type=container"}, supportedFilters)
+	s.Equal([]string{"foo", "user.blah=a", "status=running,stopped"}, unsupportedFilters)
 }

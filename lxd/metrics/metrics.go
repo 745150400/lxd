@@ -71,9 +71,9 @@ func (m *MetricSet) String() string {
 		metricTypeName := ""
 
 		// ProcsTotal is a gauge according to the OpenMetrics spec as its value can decrease.
-		if metricType == ProcsTotal {
+		if metricType == ProcsTotal || metricType == CPUs || metricType == GoGoroutines || metricType == GoHeapObjects {
 			metricTypeName = "gauge"
-		} else if strings.HasSuffix(MetricNames[metricType], "_total") {
+		} else if strings.HasSuffix(MetricNames[metricType], "_total") || strings.HasSuffix(MetricNames[metricType], "_seconds") {
 			metricTypeName = "counter"
 		} else if strings.HasSuffix(MetricNames[metricType], "_bytes") {
 			metricTypeName = "gauge"
@@ -113,6 +113,7 @@ func (m *MetricSet) String() string {
 			} else {
 				_, err = out.WriteString(fmt.Sprintf("%s %s\n", MetricNames[metricType], valueStr))
 			}
+
 			if err != nil {
 				return ""
 			}
@@ -138,7 +139,7 @@ func MetricSetFromAPI(metrics *Metrics, labels map[string]string) (*MetricSet, e
 			cpu := ""
 
 			if dev != "cpu" {
-				fmt.Sscanf(dev, "cpu%s", &cpu)
+				_, _ = fmt.Sscanf(dev, "cpu%s", &cpu)
 			}
 
 			if cpu != "" {
@@ -184,6 +185,9 @@ func MetricSetFromAPI(metrics *Metrics, labels map[string]string) (*MetricSet, e
 		)
 	}
 
+	// CPUs
+	set.AddSamples(CPUs, Sample{Value: float64(metrics.CPUs)})
+
 	// Disk stats
 	for dev, stats := range metrics.Disk {
 		labels := map[string]string{"device": dev}
@@ -223,6 +227,7 @@ func MetricSetFromAPI(metrics *Metrics, labels map[string]string) (*MetricSet, e
 	set.AddSamples(MemorySwapBytes, Sample{Value: float64(metrics.Memory.SwapBytes)})
 	set.AddSamples(MemoryUnevictableBytes, Sample{Value: float64(metrics.Memory.UnevictableBytes)})
 	set.AddSamples(MemoryWritebackBytes, Sample{Value: float64(metrics.Memory.WritebackBytes)})
+	set.AddSamples(MemoryOOMKillsTotal, Sample{Value: float64(metrics.Memory.OOMKills)})
 
 	// Network stats
 	for dev, stats := range metrics.Network {

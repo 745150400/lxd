@@ -2,15 +2,18 @@ package storage
 
 import (
 	"io"
+	"net/url"
 	"time"
 
 	"github.com/lxc/lxd/lxd/backup"
+	backupConfig "github.com/lxc/lxd/lxd/backup/config"
 	"github.com/lxc/lxd/lxd/cluster/request"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/migration"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/storage/drivers"
+	"github.com/lxc/lxd/lxd/storage/s3/miniod"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/instancewriter"
 )
@@ -20,8 +23,16 @@ type MountInfo struct {
 	DiskPath string // The location of the block disk (if supported).
 }
 
+// Type represents a LXD storage pool type.
+type Type interface {
+	ValidateName(name string) error
+	Validate(config map[string]string) error
+}
+
 // Pool represents a LXD storage pool.
 type Pool interface {
+	Type
+
 	// Pool.
 	ID() int64
 	Name() string
@@ -45,7 +56,6 @@ type Pool interface {
 	GetVolume(volumeType drivers.VolumeType, contentType drivers.ContentType, name string, config map[string]string) drivers.Volume
 
 	// Instances.
-	FillInstanceConfig(inst instance.Instance, config map[string]string) error
 	CreateInstance(inst instance.Instance, op *operations.Operation) error
 	CreateInstanceFromBackup(srcBackup backup.Info, srcData io.ReadSeeker, op *operations.Operation) (func(instance.Instance) error, revert.Hook, error)
 	CreateInstanceFromCopy(inst instance.Instance, src instance.Instance, snapshots bool, allowInconsistent bool, op *operations.Operation) error
@@ -55,8 +65,9 @@ type Pool interface {
 	DeleteInstance(inst instance.Instance, op *operations.Operation) error
 	UpdateInstance(inst instance.Instance, newDesc string, newConfig map[string]string, op *operations.Operation) error
 	UpdateInstanceBackupFile(inst instance.Instance, op *operations.Operation) error
-	CheckInstanceBackupFileSnapshots(backupConf *backup.Config, projectName string, deleteMissing bool, op *operations.Operation) ([]*api.InstanceSnapshot, error)
-	ImportInstance(inst instance.Instance, op *operations.Operation) error
+	GenerateInstanceBackupConfig(inst instance.Instance, snapshots bool, op *operations.Operation) (*backupConfig.Config, error)
+	CheckInstanceBackupFileSnapshots(backupConf *backupConfig.Config, projectName string, deleteMissing bool, op *operations.Operation) ([]*api.InstanceSnapshot, error)
+	ImportInstance(inst instance.Instance, poolVol *backupConfig.Config, op *operations.Operation) error
 
 	MigrateInstance(inst instance.Instance, conn io.ReadWriteCloser, args *migration.VolumeSourceArgs, op *operations.Operation) error
 	RefreshInstance(inst instance.Instance, src instance.Instance, srcSnapshots []instance.Instance, allowInconsistent bool, op *operations.Operation) error
@@ -66,7 +77,7 @@ type Pool interface {
 	SetInstanceQuota(inst instance.Instance, size string, vmStateSize string, op *operations.Operation) error
 
 	MountInstance(inst instance.Instance, op *operations.Operation) (*MountInfo, error)
-	UnmountInstance(inst instance.Instance, op *operations.Operation) (bool, error)
+	UnmountInstance(inst instance.Instance, op *operations.Operation) error
 
 	// Instance snapshots.
 	CreateInstanceSnapshot(inst instance.Instance, src instance.Instance, op *operations.Operation) error
@@ -74,7 +85,7 @@ type Pool interface {
 	DeleteInstanceSnapshot(inst instance.Instance, op *operations.Operation) error
 	RestoreInstanceSnapshot(inst instance.Instance, src instance.Instance, op *operations.Operation) error
 	MountInstanceSnapshot(inst instance.Instance, op *operations.Operation) (*MountInfo, error)
-	UnmountInstanceSnapshot(inst instance.Instance, op *operations.Operation) (bool, error)
+	UnmountInstanceSnapshot(inst instance.Instance, op *operations.Operation) error
 	UpdateInstanceSnapshot(inst instance.Instance, newDesc string, newConfig map[string]string, op *operations.Operation) error
 
 	// Images.
@@ -82,9 +93,19 @@ type Pool interface {
 	DeleteImage(fingerprint string, op *operations.Operation) error
 	UpdateImage(fingerprint string, newDesc string, newConfig map[string]string, op *operations.Operation) error
 
+	// Buckets.
+	CreateBucket(projectName string, bucket api.StorageBucketsPost, op *operations.Operation) error
+	UpdateBucket(projectName string, bucketName string, bucket api.StorageBucketPut, op *operations.Operation) error
+	DeleteBucket(projectName string, bucketName string, op *operations.Operation) error
+	CreateBucketKey(projectName string, bucketName string, key api.StorageBucketKeysPost, op *operations.Operation) (*api.StorageBucketKey, error)
+	UpdateBucketKey(projectName string, bucketName string, keyName string, key api.StorageBucketKeyPut, op *operations.Operation) error
+	DeleteBucketKey(projectName string, bucketName string, keyName string, op *operations.Operation) error
+	ActivateBucket(bucketName string, op *operations.Operation) (*miniod.Process, error)
+	GetBucketURL(bucketName string) *url.URL
+
 	// Custom volumes.
 	CreateCustomVolume(projectName string, volName string, desc string, config map[string]string, contentType drivers.ContentType, op *operations.Operation) error
-	CreateCustomVolumeFromCopy(projectName string, srcProjectName string, volName, desc string, config map[string]string, srcPoolName, srcVolName string, srcVolOnly bool, op *operations.Operation) error
+	CreateCustomVolumeFromCopy(projectName string, srcProjectName string, volName, desc string, config map[string]string, srcPoolName, srcVolName string, snapshots bool, op *operations.Operation) error
 	UpdateCustomVolume(projectName string, volName string, newDesc string, newConfig map[string]string, op *operations.Operation) error
 	RenameCustomVolume(projectName string, volName string, newVolName string, op *operations.Operation) error
 	DeleteCustomVolume(projectName string, volName string, op *operations.Operation) error
@@ -92,8 +113,9 @@ type Pool interface {
 	GetCustomVolumeUsage(projectName string, volName string) (int64, error)
 	MountCustomVolume(projectName string, volName string, op *operations.Operation) error
 	UnmountCustomVolume(projectName string, volName string, op *operations.Operation) (bool, error)
-	ImportCustomVolume(projectName string, poolVol backup.Config, op *operations.Operation) error
-	RefreshCustomVolume(projectName string, srcProjectName string, volName, desc string, config map[string]string, srcPoolName, srcVolName string, srcVolOnly bool, op *operations.Operation) error
+	ImportCustomVolume(projectName string, poolVol *backupConfig.Config, op *operations.Operation) error
+	RefreshCustomVolume(projectName string, srcProjectName string, volName, desc string, config map[string]string, srcPoolName, srcVolName string, snapshots bool, op *operations.Operation) error
+	GenerateCustomVolumeBackupConfig(projectName string, volName string, snapshots bool, op *operations.Operation) (*backupConfig.Config, error)
 
 	// Custom volume snapshots.
 	CreateCustomVolumeSnapshot(projectName string, volName string, newSnapshotName string, newExpiryDate time.Time, op *operations.Operation) error
@@ -112,5 +134,5 @@ type Pool interface {
 	CreateCustomVolumeFromBackup(srcBackup backup.Info, srcData io.ReadSeeker, op *operations.Operation) error
 
 	// Storage volume recovery.
-	ListUnknownVolumes(op *operations.Operation) (map[string][]*backup.Config, error)
+	ListUnknownVolumes(op *operations.Operation) (map[string][]*backupConfig.Config, error)
 }

@@ -1,14 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 
 	"github.com/gorilla/mux"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
@@ -16,6 +17,7 @@ import (
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/lifecycle"
 	"github.com/lxc/lxd/lxd/project"
+	"github.com/lxc/lxd/lxd/rbac"
 	"github.com/lxc/lxd/lxd/request"
 	"github.com/lxc/lxd/lxd/response"
 	storagePools "github.com/lxc/lxd/lxd/storage"
@@ -26,7 +28,7 @@ import (
 	"github.com/lxc/lxd/shared/version"
 )
 
-// Lock to prevent concurent storage pools creation
+// Lock to prevent concurent storage pools creation.
 var storagePoolCreateLock sync.Mutex
 
 var storagePoolsCmd = APIEndpoint{
@@ -140,12 +142,12 @@ var storagePoolCmd = APIEndpoint{
 func storagePoolsGet(d *Daemon, r *http.Request) response.Response {
 	recursion := util.IsRecursionRequest(r)
 
-	poolNames, err := d.cluster.GetStoragePoolNames()
+	poolNames, err := d.db.Cluster.GetStoragePoolNames()
 	if err != nil && !response.IsNotFoundError(err) {
 		return response.SmartError(err)
 	}
 
-	clustered, err := cluster.Enabled(d.db)
+	clustered, err := cluster.Enabled(d.db.Node)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -156,17 +158,13 @@ func storagePoolsGet(d *Daemon, r *http.Request) response.Response {
 		if !recursion {
 			resultString = append(resultString, fmt.Sprintf("/%s/storage-pools/%s", version.APIVersion, poolName))
 		} else {
-			pool, err := storagePools.GetPoolByName(d.State(), poolName)
+			pool, err := storagePools.LoadByName(d.State(), poolName)
 			if err != nil {
 				return response.SmartError(err)
 			}
 
 			// Get all users of the storage pool.
-			poolUsedBy := []string{}
-			err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
-				poolUsedBy, err = tx.GetStoragePoolUsedBy(poolName, true)
-				return err
-			})
+			poolUsedBy, err := storagePools.UsedBy(r.Context(), d.State(), pool, false, false)
 			if err != nil {
 				return response.SmartError(err)
 			}
@@ -174,9 +172,14 @@ func storagePoolsGet(d *Daemon, r *http.Request) response.Response {
 			poolAPI := pool.ToAPI()
 			poolAPI.UsedBy = project.FilterUsedBy(r, poolUsedBy)
 
+			if !rbac.UserIsAdmin(r) {
+				// Don't allow non-admins to see pool config as sensitive info can be stored there.
+				poolAPI.Config = nil
+			}
+
 			// If no member is specified and the daemon is clustered, we omit the node-specific fields.
 			if clustered {
-				for _, key := range db.StoragePoolNodeConfigKeys {
+				for _, key := range db.NodeSpecificStorageConfig {
 					delete(poolAPI.Config, key)
 				}
 			} else {
@@ -258,8 +261,19 @@ func storagePoolsPost(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(fmt.Errorf("No driver provided"))
 	}
 
-	url := fmt.Sprintf("/%s/storage-pools/%s", version.APIVersion, req.Name)
-	resp := response.SyncResponseLocation(true, nil, url)
+	if req.Config == nil {
+		req.Config = map[string]string{}
+	}
+
+	ctx := logger.Ctx{}
+
+	targetNode := queryParam(r, "target")
+	if targetNode != "" {
+		ctx["target"] = targetNode
+	}
+
+	lc := lifecycle.StoragePoolCreated.Event(req.Name, request.CreateRequestor(r), ctx)
+	resp := response.SyncResponseLocation(true, nil, lc.Source)
 
 	clientType := clusterRequest.UserAgentClientType(r.Header.Get("User-Agent"))
 
@@ -267,14 +281,14 @@ func storagePoolsPost(d *Daemon, r *http.Request) response.Response {
 		// This is an internal request which triggers the actual
 		// creation of the pool across all nodes, after they have been
 		// previously defined.
-		err = storagePoolValidate(req.Name, req.Driver, req.Config)
+		err = storagePoolValidate(d.State(), req.Name, req.Driver, req.Config)
 		if err != nil {
 			return response.BadRequest(err)
 		}
 
-		poolID, err := d.cluster.GetStoragePoolID(req.Name)
+		poolID, err := d.db.Cluster.GetStoragePoolID(req.Name)
 		if err != nil {
-			return response.NotFound(err)
+			return response.SmartError(err)
 		}
 
 		_, err = storagePoolCreateLocal(d.State(), poolID, req, clientType)
@@ -285,27 +299,26 @@ func storagePoolsPost(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	targetNode := queryParam(r, "target")
 	if targetNode != "" {
 		// A targetNode was specified, let's just define the node's storage without actually creating it.
-		// The only legal key values for the storage config are the ones in StoragePoolNodeConfigKeys.
+		// The only legal key values for the storage config are the ones in NodeSpecificStorageConfig.
 		for key := range req.Config {
-			if !shared.StringInSlice(key, db.StoragePoolNodeConfigKeys) {
-				return response.SmartError(fmt.Errorf("Config key %q may not be used as node-specific key", key))
+			if !shared.StringInSlice(key, db.NodeSpecificStorageConfig) {
+				return response.SmartError(fmt.Errorf("Config key %q may not be used as member-specific key", key))
 			}
 		}
 
-		err = storagePoolValidate(req.Name, req.Driver, req.Config)
+		err = storagePoolValidate(d.State(), req.Name, req.Driver, req.Config)
 		if err != nil {
 			return response.BadRequest(err)
 		}
 
-		err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			return tx.CreatePendingStoragePool(targetNode, req.Name, req.Driver, req.Config)
+		err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			return tx.CreatePendingStoragePool(ctx, targetNode, req.Name, req.Driver, req.Config)
 		})
 		if err != nil {
 			if err == db.ErrAlreadyDefined {
-				return response.BadRequest(fmt.Errorf("The storage pool already defined on node %q", targetNode))
+				return response.BadRequest(fmt.Errorf("The storage pool already defined on member %q", targetNode))
 			}
 
 			return response.SmartError(err)
@@ -315,7 +328,7 @@ func storagePoolsPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Load existing pool if exists, if not don't fail.
-	_, pool, _, err := d.cluster.GetStoragePoolInAnyState(req.Name)
+	_, pool, _, err := d.db.Cluster.GetStoragePoolInAnyState(req.Name)
 	if err != nil && !response.IsNotFoundError(err) {
 		return response.InternalError(err)
 	}
@@ -326,34 +339,22 @@ func storagePoolsPost(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	projectName := projectParam(r)
-	requestor := request.CreateRequestor(r)
-
-	ctx := log.Ctx{}
-	if targetNode != "" {
-		ctx["target"] = targetNode
-	}
-
 	// No targetNode was specified and we're clustered or there is an existing partially created single node
-	// pool, either way finalize the config in the db and actually create the pool on all node in the cluster.
+	// pool, either way finalize the config in the db and actually create the pool on all nodes in the cluster.
 	if count > 1 || (pool != nil && pool.Status != api.StoragePoolStatusCreated) {
 		err = storagePoolsPostCluster(d, pool, req, clientType)
 		if err != nil {
 			return response.InternalError(err)
 		}
-
-		d.State().Events.SendLifecycle(projectName, lifecycle.StoragePoolCreated.Event(req.Name, projectName, requestor, ctx))
-
-		return resp
+	} else {
+		// Create new single node storage pool.
+		err = storagePoolCreateGlobal(d.State(), req, clientType)
+		if err != nil {
+			return response.SmartError(err)
+		}
 	}
 
-	// Create new single node storage pool.
-	err = storagePoolCreateGlobal(d.State(), req, clientType)
-	if err != nil {
-		return response.SmartError(err)
-	}
-
-	d.State().Events.SendLifecycle(projectName, lifecycle.StoragePoolCreated.Event(req.Name, projectName, requestor, ctx))
+	d.State().Events.SendLifecycle(project.Default, lc)
 
 	return resp
 }
@@ -370,7 +371,7 @@ func storagePoolPartiallyCreated(pool *api.StoragePool) bool {
 	// If the pool has global config keys, then it has previously been created by having its global config
 	// inserted, and this means it is partialled created.
 	for key := range pool.Config {
-		if !shared.StringInSlice(key, db.StoragePoolNodeConfigKeys) {
+		if !shared.StringInSlice(key, db.NodeSpecificStorageConfig) {
 			return true
 		}
 	}
@@ -383,8 +384,8 @@ func storagePoolPartiallyCreated(pool *api.StoragePool) bool {
 func storagePoolsPostCluster(d *Daemon, pool *api.StoragePool, req api.StoragePoolsPost, clientType clusterRequest.ClientType) error {
 	// Check that no node-specific config key has been defined.
 	for key := range req.Config {
-		if shared.StringInSlice(key, db.StoragePoolNodeConfigKeys) {
-			return fmt.Errorf("Config key %q is node-specific", key)
+		if shared.StringInSlice(key, db.NodeSpecificStorageConfig) {
+			return fmt.Errorf("Config key %q is cluster member specific", key)
 		}
 	}
 
@@ -395,7 +396,7 @@ func storagePoolsPostCluster(d *Daemon, pool *api.StoragePool, req api.StoragePo
 			return fmt.Errorf("The storage pool is already created")
 		}
 
-		// Check the requested pool type matches the type created when adding the local node config.
+		// Check the requested pool type matches the type created when adding the local member config.
 		if req.Driver != pool.Driver {
 			return fmt.Errorf("Requested storage pool driver %q doesn't match driver in existing database record %q", req.Driver, pool.Driver)
 		}
@@ -403,13 +404,12 @@ func storagePoolsPostCluster(d *Daemon, pool *api.StoragePool, req api.StoragePo
 
 	// Check that the pool is properly defined, fetch the node-specific configs and insert the global config.
 	var configs map[string]map[string]string
-	var nodeName string
 	var poolID int64
-	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+	err := d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
 		// Check that the pool was defined at all. Must come before partially created checks.
-		poolID, err = tx.GetStoragePoolID(req.Name)
+		poolID, err = tx.GetStoragePoolID(ctx, req.Name)
 		if err != nil {
 			return err
 		}
@@ -420,18 +420,12 @@ func storagePoolsPostCluster(d *Daemon, pool *api.StoragePool, req api.StoragePo
 				return fmt.Errorf("Storage pool already partially created. Please do not specify any global config when re-running create")
 			}
 
-			logger.Debug("Skipping global storage pool create as global config already partially created", log.Ctx{"pool": req.Name})
+			logger.Debug("Skipping global storage pool create as global config already partially created", logger.Ctx{"pool": req.Name})
 			return nil
 		}
 
 		// Fetch the node-specific configs and check the pool is defined for all nodes.
-		configs, err = tx.GetStoragePoolNodeConfigs(poolID)
-		if err != nil {
-			return err
-		}
-
-		// Take note of the name of this node
-		nodeName, err = tx.GetLocalNodeName()
+		configs, err = tx.GetStoragePoolNodeConfigs(ctx, poolID)
 		if err != nil {
 			return err
 		}
@@ -449,6 +443,7 @@ func storagePoolsPostCluster(d *Daemon, pool *api.StoragePool, req api.StoragePo
 		if response.IsNotFoundError(err) {
 			return fmt.Errorf("Pool not pending on any node (use --target <node> first)")
 		}
+
 		return err
 	}
 
@@ -461,25 +456,23 @@ func storagePoolsPostCluster(d *Daemon, pool *api.StoragePool, req api.StoragePo
 	// Create the pool on this node.
 	nodeReq := req
 
-	// Merge node specific config items into global config.
-	for key, value := range configs[nodeName] {
-		nodeReq.Config[key] = value
-	}
+	serverName := d.State().ServerName
 
-	err = storagePoolValidate(req.Name, req.Driver, nodeReq.Config)
-	if err != nil {
-		return err
+	// Merge node specific config items into global config.
+	for key, value := range configs[serverName] {
+		nodeReq.Config[key] = value
 	}
 
 	updatedConfig, err := storagePoolCreateLocal(d.State(), poolID, req, clientType)
 	if err != nil {
 		return err
 	}
+
 	req.Config = updatedConfig
-	logger.Debug("Created storage pool on local cluster member", log.Ctx{"pool": req.Name})
+	logger.Debug("Created storage pool on local cluster member", logger.Ctx{"pool": req.Name})
 
 	// Strip node specific config keys from config. Very important so we don't forward node-specific config.
-	for _, k := range db.StoragePoolNodeConfigKeys {
+	for _, k := range db.NodeSpecificStorageConfig {
 		delete(req.Config, k)
 	}
 
@@ -492,6 +485,13 @@ func storagePoolsPostCluster(d *Daemon, pool *api.StoragePool, req api.StoragePo
 
 		nodeReq := req
 
+		// Clone fresh node config so we don't modify req.Config with this node's specific config which
+		// could result in it being sent to other nodes later.
+		nodeReq.Config = make(map[string]string, len(req.Config))
+		for k, v := range req.Config {
+			nodeReq.Config[k] = v
+		}
+
 		// Merge node specific config items into global config.
 		for key, value := range configs[server.Environment.ServerName] {
 			nodeReq.Config[key] = value
@@ -501,7 +501,8 @@ func storagePoolsPostCluster(d *Daemon, pool *api.StoragePool, req api.StoragePo
 		if err != nil {
 			return err
 		}
-		logger.Debug("Created storage pool on cluster member", log.Ctx{"pool": req.Name, "member": server.Environment.ServerName})
+
+		logger.Debug("Created storage pool on cluster member", logger.Ctx{"pool": req.Name, "member": server.Environment.ServerName})
 
 		return nil
 	})
@@ -510,13 +511,14 @@ func storagePoolsPostCluster(d *Daemon, pool *api.StoragePool, req api.StoragePo
 	}
 
 	// Finally update the storage pool state.
-	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+	err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		return tx.StoragePoolCreated(req.Name)
 	})
 	if err != nil {
 		return err
 	}
-	logger.Debug("Marked storage pool global status as created", log.Ctx{"pool": req.Name})
+
+	logger.Debug("Marked storage pool global status as created", logger.Ctx{"pool": req.Name})
 
 	return nil
 }
@@ -573,30 +575,29 @@ func storagePoolGet(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	poolName := mux.Vars(r)["name"]
-
-	clustered, err := cluster.Enabled(d.db)
+	poolName, err := url.PathUnescape(mux.Vars(r)["name"])
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	allNodes := false
-	if clustered && queryParam(r, "target") == "" {
-		allNodes = true
+	clustered, err := cluster.Enabled(d.db.Node)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	memberSpecific := false
+	if queryParam(r, "target") != "" {
+		memberSpecific = true
 	}
 
 	// Get the existing storage pool.
-	pool, err := storagePools.GetPoolByName(d.State(), poolName)
+	pool, err := storagePools.LoadByName(d.State(), poolName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	// Get all users of the storage pool.
-	poolUsedBy := []string{}
-	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
-		poolUsedBy, err = tx.GetStoragePoolUsedBy(poolName, allNodes)
-		return err
-	})
+	poolUsedBy, err := storagePools.UsedBy(r.Context(), d.State(), pool, false, memberSpecific)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -604,17 +605,22 @@ func storagePoolGet(d *Daemon, r *http.Request) response.Response {
 	poolAPI := pool.ToAPI()
 	poolAPI.UsedBy = project.FilterUsedBy(r, poolUsedBy)
 
+	if !rbac.UserIsAdmin(r) {
+		// Don't allow non-admins to see pool config as sensitive info can be stored there.
+		poolAPI.Config = nil
+	}
+
 	// If no member is specified and the daemon is clustered, we omit the node-specific fields.
-	if allNodes {
-		for _, key := range db.StoragePoolNodeConfigKeys {
+	if clustered && !memberSpecific {
+		for _, key := range db.NodeSpecificStorageConfig {
 			delete(poolAPI.Config, key)
 		}
 	} else {
-		// Use local status if not clustered. To allow seeing unavailable pools.
+		// Use local status if not clustered or memberSpecific. To allow seeing unavailable pools.
 		poolAPI.Status = pool.LocalStatus()
 	}
 
-	etag := []interface{}{pool.Name, pool.Driver, poolAPI.Config}
+	etag := []any{pool.Name, pool.Driver, poolAPI.Config}
 
 	return response.SyncResponseETag(true, &poolAPI, etag)
 }
@@ -665,16 +671,19 @@ func storagePoolPut(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	poolName := mux.Vars(r)["name"]
+	poolName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Get the existing storage pool.
-	pool, err := storagePools.GetPoolByName(d.State(), poolName)
+	pool, err := storagePools.LoadByName(d.State(), poolName)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
 	targetNode := queryParam(r, "target")
-	clustered, err := cluster.Enabled(d.db)
+	clustered, err := cluster.Enabled(d.db.Node)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -690,13 +699,13 @@ func storagePoolPut(d *Daemon, r *http.Request) response.Response {
 	// the e-tag can be generated correctly. This is because the GET request used to populate the request
 	// will also remove node-specific keys when no target is specified.
 	if targetNode == "" && clustered {
-		for _, key := range db.StoragePoolNodeConfigKeys {
+		for _, key := range db.NodeSpecificStorageConfig {
 			delete(etagConfig, key)
 		}
 	}
 
 	// Validate the ETag.
-	etag := []interface{}{pool.Name(), pool.Driver().Info().Name, etagConfig}
+	etag := []any{pool.Name(), pool.Driver().Info().Name, etagConfig}
 
 	err = util.EtagCheck(r, etag)
 	if err != nil {
@@ -705,7 +714,8 @@ func storagePoolPut(d *Daemon, r *http.Request) response.Response {
 
 	// Decode the request.
 	req := api.StoragePoolPut{}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	err = json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
 		return response.BadRequest(err)
 	}
 
@@ -715,8 +725,8 @@ func storagePoolPut(d *Daemon, r *http.Request) response.Response {
 		if targetNode == "" {
 			// If no target is specified, then ensure only non-node-specific config keys are changed.
 			for k := range req.Config {
-				if shared.StringInSlice(k, db.StoragePoolNodeConfigKeys) {
-					return response.BadRequest(fmt.Errorf("Config key %q is node-specific", k))
+				if shared.StringInSlice(k, db.NodeSpecificStorageConfig) {
+					return response.BadRequest(fmt.Errorf("Config key %q is cluster member specific", k))
 				}
 			}
 		} else {
@@ -724,8 +734,8 @@ func storagePoolPut(d *Daemon, r *http.Request) response.Response {
 
 			// If a target is specified, then ensure only node-specific config keys are changed.
 			for k, v := range req.Config {
-				if !shared.StringInSlice(k, db.StoragePoolNodeConfigKeys) && curConfig[k] != v {
-					return response.BadRequest(fmt.Errorf("Config key %q may not be used as node-specific key", k))
+				if !shared.StringInSlice(k, db.NodeSpecificStorageConfig) && curConfig[k] != v {
+					return response.BadRequest(fmt.Errorf("Config key %q may not be used as cluster member specific key", k))
 				}
 			}
 		}
@@ -735,18 +745,16 @@ func storagePoolPut(d *Daemon, r *http.Request) response.Response {
 
 	response := doStoragePoolUpdate(d, pool, req, targetNode, clientType, r.Method, clustered)
 
-	projectName := projectParam(r)
 	requestor := request.CreateRequestor(r)
 
-	ctx := log.Ctx{}
+	ctx := logger.Ctx{}
 	if targetNode != "" {
 		ctx["target"] = targetNode
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.StoragePoolUpdated.Event(pool.Name(), projectName, requestor, ctx))
+	d.State().Events.SendLifecycle(project.Default, lifecycle.StoragePoolUpdated.Event(pool.Name(), requestor, ctx))
 
 	return response
-
 }
 
 // swagger:operation PATCH /1.0/storage-pools/{name} storage storage_pool_patch
@@ -806,7 +814,7 @@ func doStoragePoolUpdate(d *Daemon, pool storagePools.Pool, req api.StoragePoolP
 		// node-specific network config with the submitted config to allow validation.
 		// This allows removal of non-node specific keys when they are absent from request config.
 		for k, v := range pool.Driver().Config() {
-			if shared.StringInSlice(k, db.StoragePoolNodeConfigKeys) {
+			if shared.StringInSlice(k, db.NodeSpecificStorageConfig) {
 				req.Config[k] = v
 			}
 		}
@@ -822,7 +830,7 @@ func doStoragePoolUpdate(d *Daemon, pool storagePools.Pool, req api.StoragePoolP
 	}
 
 	// Validate the configuration.
-	err := storagePoolValidateConfig(pool.Name(), pool.Driver().Info().Name, req.Config, pool.Driver().Config())
+	err := pool.Validate(req.Config)
 	if err != nil {
 		return response.BadRequest(err)
 	}
@@ -838,7 +846,7 @@ func doStoragePoolUpdate(d *Daemon, pool storagePools.Pool, req api.StoragePoolP
 		sendPool.Config = make(map[string]string)
 		for k, v := range req.Config {
 			// Don't forward node specific keys (these will be merged in on recipient node).
-			if shared.StringInSlice(k, db.StoragePoolNodeConfigKeys) {
+			if shared.StringInSlice(k, db.NodeSpecificStorageConfig) {
 				continue
 			}
 
@@ -886,14 +894,16 @@ func doStoragePoolUpdate(d *Daemon, pool storagePools.Pool, req api.StoragePoolP
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func storagePoolDelete(d *Daemon, r *http.Request) response.Response {
-	poolName := mux.Vars(r)["name"]
-
-	pool, err := storagePools.GetPoolByName(d.State(), poolName)
+	poolName, err := url.PathUnescape(mux.Vars(r)["name"])
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	projectName := projectParam(r)
+	pool, err := storagePools.LoadByName(d.State(), poolName)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	clientType := clusterRequest.UserAgentClientType(r.Header.Get("User-Agent"))
 	clusterNotification := isClusterNotification(r)
 	var notifier cluster.Notifier
@@ -915,23 +925,37 @@ func storagePoolDelete(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	// Only delete images if locally stored or running on initial member.
+	// Only perform the deletion of remote image volumes on the server handling the request.
+	// Otherwise delete local image volumes on each server.
 	if !clusterNotification || !pool.Driver().Info().Remote {
-		// Only image volumes should remain now.
-		volumeNames, err := d.cluster.GetStoragePoolVolumesNames(pool.ID())
-		if err != nil {
-			return response.InternalError(err)
-		}
+		var removeImgFingerprints []string
 
-		for _, volume := range volumeNames {
-			_, imgInfo, err := d.cluster.GetImage(volume, db.ImageFilter{Project: &projectName})
+		err = d.db.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+			// Get all the volumes using the storage pool on this server.
+			// Only image volumes should remain now.
+			volumes, err := tx.GetStoragePoolVolumes(ctx, pool.ID(), true)
 			if err != nil {
-				return response.InternalError(fmt.Errorf("Failed getting image info for %q: %w", volume, err))
+				return fmt.Errorf("Failed loading storage volumes: %w", err)
 			}
 
-			err = doDeleteImageFromPool(d.State(), imgInfo.Fingerprint, pool.Name())
+			for _, vol := range volumes {
+				if vol.Type != db.StoragePoolVolumeTypeNameImage {
+					return fmt.Errorf("Volume %q of type %q in project %q still exists in storage pool %q", vol.Name, vol.Type, vol.Project, pool.Name())
+				}
+
+				removeImgFingerprints = append(removeImgFingerprints, vol.Name)
+			}
+
+			return nil
+		})
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		for _, removeImgFingerprint := range removeImgFingerprints {
+			err = pool.DeleteImage(removeImgFingerprint, nil)
 			if err != nil {
-				return response.InternalError(fmt.Errorf("Error deleting image %q from pool: %w", volume, err))
+				return response.InternalError(fmt.Errorf("Error deleting image %q from storage pool %q: %w", removeImgFingerprint, pool.Name(), err))
 			}
 		}
 	}
@@ -955,6 +979,7 @@ func storagePoolDelete(d *Daemon, r *http.Request) response.Response {
 		if err != nil {
 			return err
 		}
+
 		return client.DeleteStoragePool(pool.Name())
 	})
 	if err != nil {
@@ -967,7 +992,7 @@ func storagePoolDelete(d *Daemon, r *http.Request) response.Response {
 	}
 
 	requestor := request.CreateRequestor(r)
-	d.State().Events.SendLifecycle(projectName, lifecycle.StoragePoolDeleted.Event(pool.Name(), projectName, requestor, nil))
+	d.State().Events.SendLifecycle(project.Default, lifecycle.StoragePoolDeleted.Event(pool.Name(), requestor, nil))
 
 	return response.EmptySyncResponse
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +18,8 @@ import (
 
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	clusterDB "github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/node"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared"
 )
@@ -41,8 +42,20 @@ func TestNotifyUpgradeCompleted(t *testing.T) {
 	}()
 
 	state0 := f.State(gateway0)
+
+	// Populate state.LocalConfig after nodes created above.
+	var err error
+	var nodeConfig *node.Config
+	err = state0.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		nodeConfig, err = node.ConfigLoad(ctx, tx)
+		return err
+	})
+	require.NoError(t, err)
+
+	state0.LocalConfig = nodeConfig
+
 	serverCert0 := gateway0.ServerCert()
-	err := cluster.NotifyUpgradeCompleted(state0, serverCert0, serverCert0)
+	err = cluster.NotifyUpgradeCompleted(state0, serverCert0, serverCert0)
 	require.NoError(t, err)
 
 	wg.Wait()
@@ -51,36 +64,37 @@ func TestNotifyUpgradeCompleted(t *testing.T) {
 // The task function checks if the node is out of date and runs whatever is in
 // LXD_CLUSTER_UPDATE if so.
 func TestMaybeUpdate_Upgrade(t *testing.T) {
-	dir, err := ioutil.TempDir("", "")
+	dir, err := os.MkdirTemp("", "")
 	require.NoError(t, err)
 
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	// Create a stub upgrade script that just touches a stamp file.
 	stamp := filepath.Join(dir, "stamp")
 	script := filepath.Join(dir, "cluster-upgrade")
 	data := []byte(fmt.Sprintf("#!/bin/sh\ntouch %s\n", stamp))
-	err = ioutil.WriteFile(script, data, 0755)
+	err = os.WriteFile(script, data, 0755)
 	require.NoError(t, err)
 
 	state, cleanup := state.NewTestState(t)
 	defer cleanup()
 
-	state.Node.Transaction(func(tx *db.NodeTx) error {
+	_ = state.DB.Node.Transaction(context.Background(), func(ctx context.Context, tx *db.NodeTx) error {
 		nodes := []db.RaftNode{
 			{NodeInfo: client.NodeInfo{ID: 1, Address: "0.0.0.0:666"}},
 			{NodeInfo: client.NodeInfo{ID: 2, Address: "1.2.3.4:666"}},
 		}
+
 		err := tx.ReplaceRaftNodes(nodes)
 		require.NoError(t, err)
 		return nil
 	})
 
-	state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+	_ = state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		id, err := tx.CreateNode("buzz", "1.2.3.4:666")
 		require.NoError(t, err)
 
-		node, err := tx.GetNodeByName("buzz")
+		node, err := tx.GetNodeByName(ctx, "buzz")
 		require.NoError(t, err)
 
 		version := node.Version()
@@ -92,10 +106,10 @@ func TestMaybeUpdate_Upgrade(t *testing.T) {
 		return nil
 	})
 
-	os.Setenv("LXD_CLUSTER_UPDATE", script)
-	defer os.Unsetenv("LXD_CLUSTER_UPDATE")
+	_ = os.Setenv("LXD_CLUSTER_UPDATE", script)
+	defer func() { _ = os.Unsetenv("LXD_CLUSTER_UPDATE") }()
 
-	cluster.MaybeUpdate(state)
+	_ = cluster.MaybeUpdate(state)
 
 	_, err = os.Stat(stamp)
 	require.NoError(t, err)
@@ -103,25 +117,25 @@ func TestMaybeUpdate_Upgrade(t *testing.T) {
 
 // If the node is up-to-date, nothing is done.
 func TestMaybeUpdate_NothingToDo(t *testing.T) {
-	dir, err := ioutil.TempDir("", "")
+	dir, err := os.MkdirTemp("", "")
 	require.NoError(t, err)
 
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	// Create a stub upgrade script that just touches a stamp file.
 	stamp := filepath.Join(dir, "stamp")
 	script := filepath.Join(dir, "cluster-upgrade")
 	data := []byte(fmt.Sprintf("#!/bin/sh\ntouch %s\n", stamp))
-	err = ioutil.WriteFile(script, data, 0755)
+	err = os.WriteFile(script, data, 0755)
 	require.NoError(t, err)
 
 	state, cleanup := state.NewTestState(t)
 	defer cleanup()
 
-	os.Setenv("LXD_CLUSTER_UPDATE", script)
-	defer os.Unsetenv("LXD_CLUSTER_UPDATE")
+	_ = os.Setenv("LXD_CLUSTER_UPDATE", script)
+	defer func() { _ = os.Unsetenv("LXD_CLUSTER_UPDATE") }()
 
-	cluster.MaybeUpdate(state)
+	_ = cluster.MaybeUpdate(state)
 
 	_, err = os.Stat(stamp)
 	require.True(t, os.IsNotExist(err))
@@ -137,12 +151,14 @@ func TestUpgradeMembersWithoutRole(t *testing.T) {
 	defer server.Close()
 
 	address := server.Listener.Addr().String()
-	setRaftRole(t, state.Node, address)
+	setRaftRole(t, state.DB.Node, address)
 
-	gateway := newGateway(t, state.Node, serverCert, serverCert)
-	defer gateway.Shutdown()
+	state.ServerCert = func() *shared.CertInfo { return serverCert }
 
-	trustedCerts := func() map[db.CertificateType]map[string]x509.Certificate {
+	gateway := newGateway(t, state.DB.Node, serverCert, state)
+	defer func() { _ = gateway.Shutdown() }()
+
+	trustedCerts := func() map[clusterDB.CertificateType]map[string]x509.Certificate {
 		return nil
 	}
 
@@ -151,21 +167,21 @@ func TestUpgradeMembersWithoutRole(t *testing.T) {
 	}
 
 	var err error
-	require.NoError(t, state.Cluster.Close())
+	require.NoError(t, state.DB.Cluster.Close())
 	store := gateway.NodeStore()
 	dial := gateway.DialFunc()
-	state.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, nil, driver.WithDialFunc(dial))
+	state.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, nil, driver.WithDialFunc(dial))
 	require.NoError(t, err)
-	gateway.Cluster = state.Cluster
+	gateway.Cluster = state.DB.Cluster
 
 	// Add a couple of members to the database.
 	var members []db.NodeInfo
-	err = state.Cluster.Transaction(func(tx *db.ClusterTx) error {
+	err = state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		_, err := tx.CreateNode("foo", "1.2.3.4")
 		require.NoError(t, err)
 		_, err = tx.CreateNode("bar", "5.6.7.8")
 		require.NoError(t, err)
-		members, err = tx.GetNodes()
+		members, err = tx.GetNodes(ctx)
 		require.NoError(t, err)
 		return nil
 	})

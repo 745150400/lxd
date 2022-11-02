@@ -1,8 +1,8 @@
 package device
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,7 +103,7 @@ func (d *tpm) startContainer() (*deviceConfig.RunConfig, error) {
 		return nil, fmt.Errorf("Failed to create new process: %w", err)
 	}
 
-	err = proc.Start()
+	err = proc.Start(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("Failed to start process %q: %w", "swtpm", err)
 	}
@@ -112,7 +112,7 @@ func (d *tpm) startContainer() (*deviceConfig.RunConfig, error) {
 	defer revert.Fail()
 
 	// Stop the TPM emulator if anything goes wrong.
-	revert.Add(func() { proc.Stop() })
+	revert.Add(func() { _ = proc.Stop() })
 
 	pidPath := filepath.Join(d.inst.DevicesPath(), fmt.Sprintf("%s.pid", d.name))
 
@@ -139,7 +139,7 @@ func (d *tpm) startContainer() (*deviceConfig.RunConfig, error) {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	line, err := ioutil.ReadFile(logPath)
+	line, err := os.ReadFile(logPath)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to read %q: %w", logPath, err)
 	}
@@ -191,7 +191,7 @@ func (d *tpm) startVM() (*deviceConfig.RunConfig, error) {
 	}
 
 	// Start the TPM emulator.
-	err = proc.Start()
+	err = proc.Start(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("Failed to start swtpm for device %q: %w", d.name, err)
 	}
@@ -199,7 +199,7 @@ func (d *tpm) startVM() (*deviceConfig.RunConfig, error) {
 	revert := revert.New()
 	defer revert.Fail()
 
-	revert.Add(func() { proc.Stop() })
+	revert.Add(func() { _ = proc.Stop() })
 
 	pidPath := filepath.Join(d.inst.DevicesPath(), fmt.Sprintf("%s.pid", d.name))
 
@@ -218,7 +218,7 @@ func (d *tpm) Stop() (*deviceConfig.RunConfig, error) {
 	pidPath := filepath.Join(d.inst.DevicesPath(), fmt.Sprintf("%s.pid", d.name))
 	runConf := deviceConfig.RunConfig{}
 
-	defer os.Remove(pidPath)
+	defer func() { _ = os.Remove(pidPath) }()
 
 	if shared.PathExists(pidPath) {
 		proc, err := subprocess.ImportProcess(pidPath)

@@ -4,14 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/gorilla/mux"
-	log "gopkg.in/inconshreveable/log15.v2"
 	"gopkg.in/yaml.v2"
 
 	"github.com/lxc/lxd/lxd/instance"
@@ -22,6 +21,7 @@ import (
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/logger"
 )
 
 // swagger:operation GET /1.0/instances/{name}/metadata instances instance_metadata_get
@@ -71,13 +71,21 @@ func instanceMetadataGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to a container on a different node
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
@@ -89,7 +97,7 @@ func instanceMetadataGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Start the storage if needed
-	pool, err := storagePools.GetPoolByInstance(d.State(), c)
+	pool, err := storagePools.LoadByInstance(d.State(), c)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -98,7 +106,8 @@ func instanceMetadataGet(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.SmartError(err)
 	}
-	defer storagePools.InstanceUnmount(pool, c, nil)
+
+	defer func() { _ = storagePools.InstanceUnmount(pool, c, nil) }()
 
 	// If missing, just return empty result
 	metadataPath := filepath.Join(c.Path(), "metadata.yaml")
@@ -111,9 +120,10 @@ func instanceMetadataGet(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.InternalError(err)
 	}
-	defer metadataFile.Close()
 
-	data, err := ioutil.ReadAll(metadataFile)
+	defer func() { _ = metadataFile.Close() }()
+
+	data, err := io.ReadAll(metadataFile)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -171,13 +181,21 @@ func instanceMetadataPatch(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to an instance on a different node.
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
@@ -189,7 +207,7 @@ func instanceMetadataPatch(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Start the storage if needed.
-	pool, err := storagePools.GetPoolByInstance(d.State(), inst)
+	pool, err := storagePools.LoadByInstance(d.State(), inst)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -198,7 +216,8 @@ func instanceMetadataPatch(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.SmartError(err)
 	}
-	defer storagePools.InstanceUnmount(pool, inst, nil)
+
+	defer func() { _ = storagePools.InstanceUnmount(pool, inst, nil) }()
 
 	// Read the existing data.
 	metadataPath := filepath.Join(inst.Path(), "metadata.yaml")
@@ -208,9 +227,10 @@ func instanceMetadataPatch(d *Daemon, r *http.Request) response.Response {
 		if err != nil {
 			return response.InternalError(err)
 		}
-		defer metadataFile.Close()
 
-		data, err := ioutil.ReadAll(metadataFile)
+		defer func() { _ = metadataFile.Close() }()
+
+		data, err := io.ReadAll(metadataFile)
 		if err != nil {
 			return response.InternalError(err)
 		}
@@ -279,13 +299,21 @@ func instanceMetadataPut(d *Daemon, r *http.Request) response.Response {
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to an instance on a different node.
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
@@ -304,7 +332,7 @@ func instanceMetadataPut(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Start the storage if needed.
-	pool, err := storagePools.GetPoolByInstance(d.State(), inst)
+	pool, err := storagePools.LoadByInstance(d.State(), inst)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -313,7 +341,8 @@ func instanceMetadataPut(d *Daemon, r *http.Request) response.Response {
 	if err != nil {
 		return response.SmartError(err)
 	}
-	defer storagePools.InstanceUnmount(pool, inst, nil)
+
+	defer func() { _ = storagePools.InstanceUnmount(pool, inst, nil) }()
 
 	return doInstanceMetadataUpdate(d, inst, metadata, r)
 }
@@ -327,12 +356,12 @@ func doInstanceMetadataUpdate(d *Daemon, inst instance.Instance, metadata api.Im
 
 	// Update the metadata.
 	metadataPath := filepath.Join(inst.Path(), "metadata.yaml")
-	err = ioutil.WriteFile(metadataPath, data, 0644)
+	err = os.WriteFile(metadataPath, data, 0644)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	d.State().Events.SendLifecycle(inst.Project(), lifecycle.InstanceMetadataUpdated.Event(inst, request.CreateRequestor(r), nil))
+	d.State().Events.SendLifecycle(inst.Project().Name, lifecycle.InstanceMetadataUpdated.Event(inst, request.CreateRequestor(r), nil))
 
 	return response.EmptySyncResponse
 }
@@ -392,13 +421,21 @@ func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response 
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to a container on a different node
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
@@ -410,7 +447,7 @@ func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response 
 	}
 
 	// Start the storage if needed
-	pool, err := storagePools.GetPoolByInstance(d.State(), c)
+	pool, err := storagePools.LoadByInstance(d.State(), c)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -419,7 +456,8 @@ func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response 
 	if err != nil {
 		return response.SmartError(err)
 	}
-	defer storagePools.InstanceUnmount(pool, c, nil)
+
+	defer func() { _ = storagePools.InstanceUnmount(pool, c, nil) }()
 
 	// Look at the request
 	templateName := r.FormValue("path")
@@ -431,14 +469,14 @@ func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response 
 
 		// List templates
 		templatesPath := filepath.Join(c.Path(), "templates")
-		filesInfo, err := ioutil.ReadDir(templatesPath)
+		entries, err := os.ReadDir(templatesPath)
 		if err != nil {
 			return response.InternalError(err)
 		}
 
-		for _, info := range filesInfo {
-			if !info.IsDir() {
-				templates = append(templates, info.Name())
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				templates = append(templates, entry.Name())
 			}
 		}
 
@@ -452,7 +490,7 @@ func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response 
 	}
 
 	if !shared.PathExists(templatePath) {
-		return response.NotFound(fmt.Errorf("Template '%s' not found", templateName))
+		return response.NotFound(fmt.Errorf("Template %q not found", templateName))
 	}
 
 	// Create a temporary file with the template content (since the container
@@ -461,15 +499,20 @@ func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response 
 	if err != nil {
 		return response.SmartError(err)
 	}
-	defer template.Close()
 
-	tempfile, err := ioutil.TempFile("", "lxd_template")
+	defer func() { _ = template.Close() }()
+
+	tempfile, err := os.CreateTemp("", "lxd_template")
 	if err != nil {
 		return response.SmartError(err)
 	}
-	defer tempfile.Close()
 
 	_, err = io.Copy(tempfile, template)
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	err = tempfile.Close()
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -478,9 +521,9 @@ func instanceMetadataTemplatesGet(d *Daemon, r *http.Request) response.Response 
 	files[0].Identifier = templateName
 	files[0].Path = tempfile.Name()
 	files[0].Filename = templateName
-	files[0].Cleanup = func() { os.Remove(tempfile.Name()) }
+	files[0].Cleanup = func() { _ = os.Remove(tempfile.Name()) }
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.InstanceMetadataTemplateRetrieved.Event(c, request.CreateRequestor(r), log.Ctx{"path": templateName}))
+	d.State().Events.SendLifecycle(projectName, lifecycle.InstanceMetadataTemplateRetrieved.Event(c, request.CreateRequestor(r), logger.Ctx{"path": templateName}))
 
 	return response.FileResponse(r, files, nil)
 }
@@ -528,13 +571,21 @@ func instanceMetadataTemplatesPost(d *Daemon, r *http.Request) response.Response
 	}
 
 	projectName := projectParam(r)
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to a container on a different node
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
@@ -546,7 +597,7 @@ func instanceMetadataTemplatesPost(d *Daemon, r *http.Request) response.Response
 	}
 
 	// Start the storage if needed
-	pool, err := storagePools.GetPoolByInstance(d.State(), c)
+	pool, err := storagePools.LoadByInstance(d.State(), c)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -555,7 +606,8 @@ func instanceMetadataTemplatesPost(d *Daemon, r *http.Request) response.Response
 	if err != nil {
 		return response.SmartError(err)
 	}
-	defer storagePools.InstanceUnmount(pool, c, nil)
+
+	defer func() { _ = storagePools.InstanceUnmount(pool, c, nil) }()
 
 	// Look at the request
 	templateName := r.FormValue("path")
@@ -581,14 +633,18 @@ func instanceMetadataTemplatesPost(d *Daemon, r *http.Request) response.Response
 	if err != nil {
 		return response.SmartError(err)
 	}
-	defer template.Close()
 
 	_, err = io.Copy(template, r.Body)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.InstanceMetadataTemplateCreated.Event(c, request.CreateRequestor(r), log.Ctx{"path": templateName}))
+	err = template.Close()
+	if err != nil {
+		return response.InternalError(err)
+	}
+
+	d.State().Events.SendLifecycle(projectName, lifecycle.InstanceMetadataTemplateCreated.Event(c, request.CreateRequestor(r), logger.Ctx{"path": templateName}))
 
 	return response.EmptySyncResponse
 }
@@ -632,13 +688,21 @@ func instanceMetadataTemplatesDelete(d *Daemon, r *http.Request) response.Respon
 
 	projectName := projectParam(r)
 
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to a container on a different node
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
@@ -650,7 +714,7 @@ func instanceMetadataTemplatesDelete(d *Daemon, r *http.Request) response.Respon
 	}
 
 	// Start the storage if needed
-	pool, err := storagePools.GetPoolByInstance(d.State(), c)
+	pool, err := storagePools.LoadByInstance(d.State(), c)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -659,7 +723,8 @@ func instanceMetadataTemplatesDelete(d *Daemon, r *http.Request) response.Respon
 	if err != nil {
 		return response.SmartError(err)
 	}
-	defer storagePools.InstanceUnmount(pool, c, nil)
+
+	defer func() { _ = storagePools.InstanceUnmount(pool, c, nil) }()
 
 	// Look at the request
 	templateName := r.FormValue("path")
@@ -673,7 +738,7 @@ func instanceMetadataTemplatesDelete(d *Daemon, r *http.Request) response.Respon
 	}
 
 	if !shared.PathExists(templatePath) {
-		return response.NotFound(fmt.Errorf("Template '%s' not found", templateName))
+		return response.NotFound(fmt.Errorf("Template %q not found", templateName))
 	}
 
 	// Delete the template
@@ -682,7 +747,7 @@ func instanceMetadataTemplatesDelete(d *Daemon, r *http.Request) response.Respon
 		return response.InternalError(err)
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.InstanceMetadataTemplateDeleted.Event(c, request.CreateRequestor(r), log.Ctx{"path": templateName}))
+	d.State().Events.SendLifecycle(projectName, lifecycle.InstanceMetadataTemplateDeleted.Event(c, request.CreateRequestor(r), logger.Ctx{"path": templateName}))
 
 	return response.EmptySyncResponse
 }

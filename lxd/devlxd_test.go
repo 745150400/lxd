@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -23,7 +23,7 @@ type DevLxdDialer struct {
 	Path string
 }
 
-func (d DevLxdDialer) DevLxdDial(network, path string) (net.Conn, error) {
+func (d DevLxdDialer) DevLxdDial(ctx context.Context, network, path string) (net.Conn, error) {
 	addr, err := net.ResolveUnixAddr("unix", d.Path)
 	if err != nil {
 		return nil, err
@@ -40,10 +40,11 @@ func (d DevLxdDialer) DevLxdDial(network, path string) (net.Conn, error) {
 func setupDir() error {
 	var err error
 
-	testDir, err = ioutil.TempDir("", "lxd_test_devlxd_")
+	testDir, err = os.MkdirTemp("", "lxd_test_devlxd_")
 	if err != nil {
 		return err
 	}
+
 	err = sys.SetupTestCerts(testDir)
 	if err != nil {
 		return err
@@ -54,13 +55,13 @@ func setupDir() error {
 		return err
 	}
 
-	os.MkdirAll(fmt.Sprintf("%s/devlxd", testDir), 0755)
+	_ = os.MkdirAll(fmt.Sprintf("%s/devlxd", testDir), 0755)
 
 	return os.Setenv("LXD_DIR", testDir)
 }
 
 func setupSocket() (*net.UnixListener, error) {
-	setupDir()
+	_ = setupDir()
 	path := filepath.Join(testDir, "test-devlxd-sock")
 	addr, err := net.ResolveUnixAddr("unix", path)
 	if err != nil {
@@ -71,6 +72,7 @@ func setupSocket() (*net.UnixListener, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return listener, nil
 }
 
@@ -95,8 +97,9 @@ func TestCredsSendRecv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
-	defer os.RemoveAll(testDir)
+
+	defer func() { _ = listener.Close() }()
+	defer func() { _ = os.RemoveAll(testDir) }()
 
 	go func() {
 		conn, err := listener.AcceptUnix()
@@ -105,7 +108,8 @@ func TestCredsSendRecv(t *testing.T) {
 			result <- -1
 			return
 		}
-		defer conn.Close()
+
+		defer func() { _ = conn.Close() }()
 
 		cred, err := ucred.GetCred(conn)
 		if err != nil {
@@ -113,6 +117,7 @@ func TestCredsSendRecv(t *testing.T) {
 			result <- -1
 			return
 		}
+
 		result <- cred.Pid
 	}()
 
@@ -120,7 +125,8 @@ func TestCredsSendRecv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+
+	defer func() { _ = conn.Close() }()
 
 	pid := <-result
 	if pid != int32(os.Getpid()) {
@@ -135,8 +141,8 @@ func TestCredsSendRecv(t *testing.T) {
  * point where it realizes the pid isn't in a container without crashing).
  */
 func TestHttpRequest(t *testing.T) {
-	setupDir()
-	defer os.RemoveAll(testDir)
+	_ = setupDir()
+	defer func() { _ = os.RemoveAll(testDir) }()
 
 	d := defaultDaemon()
 	d.os.MockMode = true
@@ -144,9 +150,10 @@ func TestHttpRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Stop(context.Background(), unix.SIGQUIT)
 
-	c := http.Client{Transport: &http.Transport{Dial: DevLxdDialer{Path: fmt.Sprintf("%s/devlxd/sock", testDir)}.DevLxdDial}}
+	defer func() { _ = d.Stop(context.Background(), unix.SIGQUIT) }()
+
+	c := http.Client{Transport: &http.Transport{DialContext: DevLxdDialer{Path: fmt.Sprintf("%s/devlxd/sock", testDir)}.DevLxdDial}}
 
 	raw, err := c.Get("http://1.0")
 	if err != nil {
@@ -157,7 +164,7 @@ func TestHttpRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := ioutil.ReadAll(raw.Body)
+	resp, err := io.ReadAll(raw.Body)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,7 +15,6 @@ import (
 	cli "github.com/lxc/lxd/shared/cmd"
 	"github.com/lxc/lxd/shared/i18n"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 	"github.com/lxc/lxd/shared/version"
 )
 
@@ -288,7 +287,11 @@ To easily setup a local LXD server in a virtual machine, consider using: https:/
 
 		// Default error handling
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+
+		// If custom exit status not set, use default error status.
+		if globalCmd.ret == 0 {
+			globalCmd.ret = 1
+		}
 	}
 
 	if globalCmd.ret != 0 {
@@ -382,8 +385,8 @@ func (c *cmdGlobal) PreRun(cmd *cobra.Command, args []string) error {
 		}
 
 		if !shared.StringInSlice(cmd.Name(), []string{"init", "launch"}) {
-			fmt.Fprintf(os.Stderr, i18n.G(`To start your first container, try: lxc launch ubuntu:20.04
-Or for a virtual machine: lxc launch ubuntu:20.04 --vm`)+"\n")
+			fmt.Fprintf(os.Stderr, i18n.G(`To start your first container, try: lxc launch ubuntu:22.04
+Or for a virtual machine: lxc launch ubuntu:22.04 --vm`)+"\n")
 			flush = true
 		}
 
@@ -402,7 +405,7 @@ Or for a virtual machine: lxc launch ubuntu:20.04 --vm`)+"\n")
 	c.conf.UserAgent = version.UserAgent
 
 	// Setup the logger
-	logger.Log, err = logging.GetLogger("", "", c.flagLogVerbose, c.flagLogDebug, nil)
+	err = logger.InitLogger("", "", c.flagLogVerbose, c.flagLogDebug, nil)
 	if err != nil {
 		return err
 	}
@@ -467,7 +470,7 @@ func (c *cmdGlobal) ParseServers(remotes ...string) ([]remoteResource, error) {
 
 func (c *cmdGlobal) CheckArgs(cmd *cobra.Command, args []string, minArgs int, maxArgs int) (bool, error) {
 	if len(args) < minArgs || (maxArgs != -1 && len(args) > maxArgs) {
-		cmd.Help()
+		_ = cmd.Help()
 
 		if len(args) == 0 {
 			return true, nil

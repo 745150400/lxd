@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -101,6 +101,10 @@ func (c *cmdNetwork) Command() *cobra.Command {
 	networkForwardCmd := cmdNetworkForward{global: c.global}
 	cmd.AddCommand(networkForwardCmd.Command())
 
+	// Load Balancer
+	networkLoadBalancerCmd := cmdNetworkLoadBalancer{global: c.global}
+	cmd.AddCommand(networkLoadBalancerCmd.Command())
+
 	// Peer
 	networkPeerCmd := cmdNetworkPeer{global: c.global}
 	cmd.AddCommand(networkPeerCmd.Command())
@@ -111,11 +115,11 @@ func (c *cmdNetwork) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Attach
+// Attach.
 type cmdNetworkAttach struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -200,7 +204,7 @@ func (c *cmdNetworkAttach) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Attach profile
+// Attach profile.
 type cmdNetworkAttachProfile struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -273,7 +277,7 @@ func (c *cmdNetworkAttachProfile) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Create
+// Create.
 type cmdNetworkCreate struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -346,7 +350,7 @@ func (c *cmdNetworkCreate) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Delete
+// Delete.
 type cmdNetworkDelete struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -397,7 +401,7 @@ func (c *cmdNetworkDelete) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Detach
+// Detach.
 type cmdNetworkDetach struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -482,7 +486,7 @@ func (c *cmdNetworkDetach) Run(cmd *cobra.Command, args []string) error {
 	return op.Wait()
 }
 
-// Detach profile
+// Detach profile.
 type cmdNetworkDetachProfile struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -567,7 +571,7 @@ func (c *cmdNetworkDetachProfile) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Edit
+// Edit.
 type cmdNetworkEdit struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -626,7 +630,7 @@ func (c *cmdNetworkEdit) Run(cmd *cobra.Command, args []string) error {
 
 	// If stdin isn't a terminal, read text from it
 	if !termios.IsTerminal(getStdinFd()) {
-		contents, err := ioutil.ReadAll(os.Stdin)
+		contents, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -683,14 +687,17 @@ func (c *cmdNetworkEdit) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			continue
 		}
+
 		break
 	}
+
 	return nil
 }
 
-// Get
+// Get.
 type cmdNetworkGet struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -748,7 +755,7 @@ func (c *cmdNetworkGet) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Info
+// Info.
 type cmdNetworkInfo struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -868,7 +875,7 @@ func (c *cmdNetworkInfo) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// List
+// List.
 type cmdNetworkList struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -940,12 +947,12 @@ func (c *cmdNetworkList) Run(cmd *cobra.Command, args []string) error {
 			network.Config["ipv6.address"],
 			network.Description,
 			strUsedBy,
+			strings.ToUpper(network.Status),
 		}
-		if resource.server.IsClustered() {
-			details = append(details, strings.ToUpper(network.Status))
-		}
+
 		data = append(data, details)
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -956,15 +963,13 @@ func (c *cmdNetworkList) Run(cmd *cobra.Command, args []string) error {
 		i18n.G("IPV6"),
 		i18n.G("DESCRIPTION"),
 		i18n.G("USED BY"),
-	}
-	if resource.server.IsClustered() {
-		header = append(header, i18n.G("STATE"))
+		i18n.G("STATE"),
 	}
 
 	return utils.RenderTable(c.flagFormat, header, data, networks)
 }
 
-// List leases
+// List leases.
 type cmdNetworkListLeases struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -1019,6 +1024,7 @@ func (c *cmdNetworkListLeases) Run(cmd *cobra.Command, args []string) error {
 
 		data = append(data, entry)
 	}
+
 	sort.Sort(utils.ByName(data))
 
 	header := []string{
@@ -1027,6 +1033,7 @@ func (c *cmdNetworkListLeases) Run(cmd *cobra.Command, args []string) error {
 		i18n.G("IP ADDRESS"),
 		i18n.G("TYPE"),
 	}
+
 	if resource.server.IsClustered() {
 		header = append(header, i18n.G("LOCATION"))
 	}
@@ -1034,7 +1041,7 @@ func (c *cmdNetworkListLeases) Run(cmd *cobra.Command, args []string) error {
 	return utils.RenderTable(c.flagFormat, header, data, leases)
 }
 
-// Rename
+// Rename.
 type cmdNetworkRename struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -1085,7 +1092,7 @@ func (c *cmdNetworkRename) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Set
+// Set.
 type cmdNetworkSet struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -1155,7 +1162,7 @@ func (c *cmdNetworkSet) Run(cmd *cobra.Command, args []string) error {
 	return client.UpdateNetwork(resource.name, network.Writable(), etag)
 }
 
-// Show
+// Show.
 type cmdNetworkShow struct {
 	global  *cmdGlobal
 	network *cmdNetwork
@@ -1216,7 +1223,7 @@ func (c *cmdNetworkShow) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Unset
+// Unset.
 type cmdNetworkUnset struct {
 	global     *cmdGlobal
 	network    *cmdNetwork

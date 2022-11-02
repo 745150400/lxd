@@ -2,7 +2,6 @@ package device
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
@@ -37,11 +36,7 @@ type usb struct {
 // isRequired indicates whether the device config requires this device to start OK.
 func (d *usb) isRequired() bool {
 	// Defaults to not required.
-	if shared.IsTrue(d.config["required"]) {
-		return true
-	}
-
-	return false
+	return shared.IsTrue(d.config["required"])
 }
 
 // validateConfig checks the supplied config for correctness.
@@ -113,6 +108,12 @@ func (d *usb) Register() error {
 
 		runConf.Uevents = append(runConf.Uevents, e.UeventParts)
 
+		// Add the USB device to runConf so that the device handler can handle physical hotplugging.
+		runConf.USBDevice = append(runConf.USBDevice, deviceConfig.USBDeviceItem{
+			DeviceName:     d.getUniqueDeviceNameFromUSBEvent(e),
+			HostDevicePath: e.Path,
+		})
+
 		return &runConf, nil
 	}
 
@@ -173,7 +174,7 @@ func (d *usb) startVM() (*deviceConfig.RunConfig, error) {
 	for _, usb := range usbs {
 		if usbIsOurDevice(d.config, &usb) {
 			runConf.USBDevice = append(runConf.USBDevice, deviceConfig.USBDeviceItem{
-				DeviceName:     fmt.Sprintf("%s-%d", d.name, len(runConf.USBDevice)),
+				DeviceName:     d.getUniqueDeviceNameFromUSBEvent(usb),
 				HostDevicePath: fmt.Sprintf("/dev/bus/usb/%03d/%03d", usb.BusNum, usb.DevNum),
 			})
 		}
@@ -190,6 +191,20 @@ func (d *usb) startVM() (*deviceConfig.RunConfig, error) {
 func (d *usb) Stop() (*deviceConfig.RunConfig, error) {
 	runConf := deviceConfig.RunConfig{
 		PostHooks: []func() error{d.postStop},
+	}
+
+	usbs, err := d.loadUsb()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, usb := range usbs {
+		if usbIsOurDevice(d.config, &usb) {
+			runConf.USBDevice = append(runConf.USBDevice, deviceConfig.USBDeviceItem{
+				DeviceName:     d.getUniqueDeviceNameFromUSBEvent(usb),
+				HostDevicePath: fmt.Sprintf("/dev/bus/usb/%03d/%03d", usb.BusNum, usb.DevNum),
+			})
+		}
 	}
 
 	if d.inst.Type() == instancetype.Container {
@@ -220,13 +235,14 @@ func (d *usb) postStop() error {
 func (d *usb) loadUsb() ([]USBEvent, error) {
 	result := []USBEvent{}
 
-	ents, err := ioutil.ReadDir(usbDevPath)
+	ents, err := os.ReadDir(usbDevPath)
 	if err != nil {
 		/* if there are no USB devices, let's render an empty list,
 		 * i.e. no usb devices */
 		if os.IsNotExist(err) {
 			return result, nil
 		}
+
 		return nil, err
 	}
 
@@ -261,6 +277,7 @@ func (d *usb) loadUsb() ([]USBEvent, error) {
 			if os.IsNotExist(err) {
 				continue
 			}
+
 			return nil, err
 		}
 
@@ -280,7 +297,7 @@ func (d *usb) loadRawValues(p string) (map[string]string, error) {
 	}
 
 	for k := range values {
-		v, err := ioutil.ReadFile(path.Join(p, k))
+		v, err := os.ReadFile(path.Join(p, k))
 		if err != nil {
 			return nil, err
 		}
@@ -289,4 +306,17 @@ func (d *usb) loadRawValues(p string) (map[string]string, error) {
 	}
 
 	return values, nil
+}
+
+// getUniqueDeviceNameFromUSBEvent returns a unique device name including the bus and device number.
+// Previously, the device name contained a simple incremental value as suffix. This would make the
+// device unidentifiable when using hotplugging. Including the bus and device number makes the
+// device identifiable.
+func (d *usb) getUniqueDeviceNameFromUSBEvent(e USBEvent) string {
+	return fmt.Sprintf("%s-%03d-%03d", d.name, e.BusNum, e.DevNum)
+}
+
+// CanHotPlug returns whether the device can be managed whilst the instance is running.
+func (d *usb) CanHotPlug() bool {
+	return true
 }

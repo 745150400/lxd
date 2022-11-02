@@ -1,8 +1,10 @@
 package lex
 
-import "fmt"
+import (
+	"fmt"
+)
 
-// VarDecl holds information about a variable declaration
+// VarDecl holds information about a variable declaration.
 type VarDecl struct {
 	Name string
 	Expr string

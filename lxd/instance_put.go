@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/gorilla/mux"
 
 	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/db/operationtype"
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
@@ -61,31 +65,40 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 	projectName := projectParam(r)
 
 	// Get the container
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
 
 	// Handle requests targeted to a container on a different node
 	resp, err := forwardedResponseIfInstanceIsRemote(d, r, projectName, name, instanceType)
 	if err != nil {
 		return response.SmartError(err)
 	}
+
 	if resp != nil {
 		return resp
 	}
 
 	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
 	if err != nil {
-		return response.NotFound(err)
+		return response.SmartError(err)
 	}
 
 	// Validate the ETag
-	etag := []interface{}{inst.Architecture(), inst.LocalConfig(), inst.LocalDevices(), inst.IsEphemeral(), inst.Profiles()}
+	etag := []any{inst.Architecture(), inst.LocalConfig(), inst.LocalDevices(), inst.IsEphemeral(), inst.Profiles()}
 	err = util.EtagCheck(r, etag)
 	if err != nil {
 		return response.PreconditionFailed(err)
 	}
 
 	configRaw := api.InstancePut{}
-	if err := json.NewDecoder(r.Body).Decode(&configRaw); err != nil {
+	err = json.NewDecoder(r.Body).Decode(&configRaw)
+	if err != nil {
 		return response.BadRequest(err)
 	}
 
@@ -95,10 +108,25 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 	}
 
 	var do func(*operations.Operation) error
-	var opType db.OperationType
+	var opType operationtype.Type
 	if configRaw.Restore == "" {
 		// Check project limits.
-		err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		apiProfiles := make([]api.Profile, 0, len(configRaw.Profiles))
+		err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			profiles, err := cluster.GetProfilesIfEnabled(ctx, tx.Tx(), projectName, configRaw.Profiles)
+			if err != nil {
+				return err
+			}
+
+			for _, profile := range profiles {
+				apiProfile, err := profile.ToAPI(ctx, tx.Tx())
+				if err != nil {
+					return err
+				}
+
+				apiProfiles = append(apiProfiles, *apiProfile)
+			}
+
 			return projecthelpers.AllowInstanceUpdate(tx, projectName, name, configRaw, inst.LocalConfig())
 		})
 		if err != nil {
@@ -113,7 +141,7 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 				Description:  configRaw.Description,
 				Devices:      deviceConfig.NewDevices(configRaw.Devices),
 				Ephemeral:    configRaw.Ephemeral,
-				Profiles:     configRaw.Profiles,
+				Profiles:     apiProfiles,
 				Project:      projectName,
 			}
 
@@ -125,14 +153,14 @@ func instancePut(d *Daemon, r *http.Request) response.Response {
 			return nil
 		}
 
-		opType = db.OperationInstanceUpdate
+		opType = operationtype.InstanceUpdate
 	} else {
 		// Snapshot Restore
 		do = func(op *operations.Operation) error {
 			return instanceSnapRestore(d.State(), projectName, name, configRaw.Restore, configRaw.Stateful)
 		}
 
-		opType = db.OperationSnapshotRestore
+		opType = operationtype.SnapshotRestore
 	}
 
 	resources := map[string][]string{}

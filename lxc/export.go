@@ -40,7 +40,7 @@ func (c *cmdExport) Command() *cobra.Command {
 		i18n.G("Whether or not to only backup the instance (without snapshots)"))
 	cmd.Flags().BoolVar(&c.flagOptimizedStorage, "optimized-storage", false,
 		i18n.G("Use storage driver optimized format (can only be restored on a similar pool)"))
-	cmd.Flags().StringVar(&c.flagCompressionAlgorithm, "compression", "", i18n.G("Compression algorithm to use (`none` for uncompressed)"))
+	cmd.Flags().StringVar(&c.flagCompressionAlgorithm, "compression", "", i18n.G("Compression algorithm to use (none for uncompressed)")+"``")
 
 	return cmd
 }
@@ -99,6 +99,7 @@ func (c *cmdExport) Run(cmd *cobra.Command, args []string) error {
 		progress.Done("")
 		return err
 	}
+
 	progress.Done("")
 
 	err = op.Wait()
@@ -114,7 +115,7 @@ func (c *cmdExport) Run(cmd *cobra.Command, args []string) error {
 		// Delete backup after we're done
 		op, err = d.DeleteInstanceBackup(name, backupName)
 		if err == nil {
-			op.Wait()
+			_ = op.Wait()
 		}
 	}()
 
@@ -134,7 +135,8 @@ func (c *cmdExport) Run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		defer target.Close()
+
+		defer func() { _ = target.Close() }()
 	}
 
 	// Prepare the download request
@@ -142,6 +144,7 @@ func (c *cmdExport) Run(cmd *cobra.Command, args []string) error {
 		Format: i18n.G("Exporting the backup: %s"),
 		Quiet:  c.global.flagQuiet,
 	}
+
 	backupFileRequest := lxd.BackupFileRequest{
 		BackupFile:      io.WriteSeeker(target),
 		ProgressHandler: progress.UpdateProgress,
@@ -150,9 +153,14 @@ func (c *cmdExport) Run(cmd *cobra.Command, args []string) error {
 	// Export tarball
 	_, err = d.GetInstanceBackupFile(name, backupName, &backupFileRequest)
 	if err != nil {
-		os.Remove(targetName)
+		_ = os.Remove(targetName)
 		progress.Done("")
 		return fmt.Errorf("Fetch instance backup file: %w", err)
+	}
+
+	err = target.Close()
+	if err != nil {
+		return fmt.Errorf("Failed to close export file: %w", err)
 	}
 
 	progress.Done(i18n.G("Backup exported successfully!"))

@@ -15,7 +15,7 @@ test_snapshots() {
 }
 
 snapshots() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local lxd_backend
   lxd_backend=$(storage_backend "$LXD_DIR")
 
@@ -105,7 +105,7 @@ test_snap_restore() {
 }
 
 snap_restore() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local lxd_backend
   lxd_backend=$(storage_backend "$LXD_DIR")
 
@@ -127,10 +127,14 @@ snap_restore() {
   lxc exec bar -- ln -s file_only_in_snap0 /root/statelink
   lxc stop bar --force
 
+  # Get container's pool.
+  pool=$(lxc config profile device get default root pool)
+
+  lxc storage volume set "${pool}" container/bar user.foo=snap0
+
   # Check parent volume.block.filesystem is copied to snapshot and not from pool.
   if [ "$lxd_backend" = "lvm" ] || [ "$lxd_backend" = "ceph" ]; then
     # Change pool volume.block.filesystem setting after creation of instance and before snapshot.
-    pool=$(lxc config profile device get default root pool)
     lxc storage set "${pool}" volume.block.filesystem=xfs
   fi
 
@@ -148,6 +152,7 @@ snap_restore() {
   lxc exec bar -- ln -s file_only_in_snap1 /root/statelink
   lxc exec bar -- mkdir /root/dir_only_in_snap1
   lxc stop bar --force
+  lxc storage volume set "${pool}" container/bar user.foo=snap1
 
   # Delete the state file we created to prevent leaking.
   rm state
@@ -155,6 +160,7 @@ snap_restore() {
   lxc config set bar limits.cpu 1
 
   lxc snapshot bar snap1
+  lxc storage volume set "${pool}" container/bar user.foo=postsnaps
 
   # Check volume.block.filesystem on storage volume in parent and snapshot match.
   if [ "${lxd_backend}" = "lvm" ] || [ "${lxd_backend}" = "ceph" ]; then
@@ -184,6 +190,9 @@ snap_restore() {
       echo "==> config didn't match expected value after restore (${cpus})"
       false
     fi
+
+    # Check storage volume has been restored (user.foo=snap0)
+    lxc storage volume get "${pool}" container/bar user.foo | grep -Fx "snap0"
   fi
 
   ##########################################################
@@ -197,6 +206,9 @@ snap_restore() {
    echo "==> config didn't match expected value after restore (${cpus})"
    false
   fi
+
+  # Check storage volume has been restored (user.foo=snap0)
+  lxc storage volume get "${pool}" container/bar user.foo | grep -Fx "snap1"
 
   ##########################################################
 
@@ -216,16 +228,12 @@ snap_restore() {
   lxc delete bar
 
   # Test if container's with hyphen's in their names are treated correctly.
-  if [ "$lxd_backend" = "lvm" ]; then
-    lxc launch testimage a-b
-    lxc snapshot a-b base
-    lxc restore a-b base
-
-    lxc snapshot a-b c-d
-    lxc restore a-b c-d
-
-    lxc delete -f a-b
-  fi
+  lxc launch testimage a-b
+  lxc snapshot a-b base
+  lxc restore a-b base
+  lxc snapshot a-b c-d
+  lxc restore a-b c-d
+  lxc delete -f a-b
 }
 
 restore_and_compare_fs() {
@@ -242,7 +250,7 @@ restore_and_compare_fs() {
 }
 
 test_snap_expiry() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local lxd_backend
   lxd_backend=$(storage_backend "$LXD_DIR")
 
@@ -268,7 +276,7 @@ test_snap_expiry() {
 }
 
 test_snap_schedule() {
-  # shellcheck disable=2039
+  # shellcheck disable=2039,3043
   local lxd_backend
   lxd_backend=$(storage_backend "$LXD_DIR")
 
@@ -292,4 +300,30 @@ test_snap_schedule() {
   lxc info c1 | grep -q snap1
 
   lxc rm -f c1 c2 c3 c4 c5
+}
+
+test_snap_volume_db_recovery() {
+  # shellcheck disable=2039,3043
+  local lxd_backend
+  lxd_backend=$(storage_backend "$LXD_DIR")
+
+  ensure_import_testimage
+  ensure_has_localhost_remote "${LXD_ADDR}"
+
+  poolName=$(lxc profile device get default root pool)
+
+  lxc init testimage c1
+  lxc snapshot c1
+  lxc snapshot c1
+  lxc start c1
+  lxc stop -f c1
+  lxd sql global 'DELETE FROM storage_volumes_snapshots' # Remove volume snapshot DB records.
+  lxd sql local 'DELETE FROM  patches WHERE name = "storage_missing_snapshot_records"' # Clear patch indicator.
+  ! lxc start c1 || false # Shouldn't be able to start as backup.yaml generation checks for DB consistency.
+  lxd shutdown
+  respawn_lxd "${LXD_DIR}" true
+  lxc storage volume show "${poolName}" container/c1/snap0 | grep "Auto repaired"
+  lxc storage volume show "${poolName}" container/c1/snap1 | grep "Auto repaired"
+  lxc start c1
+  lxc delete -f c1
 }

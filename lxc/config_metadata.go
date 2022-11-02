@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -37,11 +37,11 @@ func (c *cmdConfigMetadata) Command() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
-// Edit
+// Edit.
 type cmdConfigMetadataEdit struct {
 	global         *cmdGlobal
 	config         *cmdConfig
@@ -106,7 +106,7 @@ func (c *cmdConfigMetadataEdit) Run(cmd *cobra.Command, args []string) error {
 	// Edit the metadata
 	if !termios.IsTerminal(getStdinFd()) {
 		metadata := api.ImageMetadata{}
-		content, err := ioutil.ReadAll(os.Stdin)
+		content, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
@@ -115,6 +115,7 @@ func (c *cmdConfigMetadataEdit) Run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+
 		return resource.server.UpdateInstanceMetadata(resource.name, metadata, "")
 	}
 
@@ -122,6 +123,7 @@ func (c *cmdConfigMetadataEdit) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
 	origContent, err := yaml.Marshal(metadata)
 	if err != nil {
 		return err
@@ -154,6 +156,7 @@ func (c *cmdConfigMetadataEdit) Run(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return err
 			}
+
 			continue
 		}
 
@@ -163,7 +166,7 @@ func (c *cmdConfigMetadataEdit) Run(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// Show
+// Show.
 type cmdConfigMetadataShow struct {
 	global         *cmdGlobal
 	config         *cmdConfig
@@ -211,6 +214,7 @@ func (c *cmdConfigMetadataShow) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
 	fmt.Printf("%s", content)
 
 	return nil

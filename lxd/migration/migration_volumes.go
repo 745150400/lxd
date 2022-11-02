@@ -3,12 +3,39 @@ package migration
 import (
 	"fmt"
 	"io"
+	"net/http"
 
+	backupConfig "github.com/lxc/lxd/lxd/backup/config"
 	"github.com/lxc/lxd/lxd/operations"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/ioprogress"
 	"github.com/lxc/lxd/shared/units"
 )
+
+// Info represents the index frame sent if supported.
+type Info struct {
+	Config *backupConfig.Config `json:"config,omitempty" yaml:"config,omitempty"` // Equivalent of backup.yaml but embedded in index.
+}
+
+// InfoResponse represents the response to the index frame sent if supported.
+// Right now this doesn't contain anything useful, its just used to indicate receipt of the index header.
+// But in the future the itention is to use it allow the target to send back additional information to the source
+// about which frames (such as snapshots) it needs for the migration after having inspected the Info index header.
+type InfoResponse struct {
+	StatusCode int
+	Error      string
+	Refresh    *bool // This is used to let the source know whether to actually refresh a volume.
+}
+
+// Err returns the error of the response.
+func (r *InfoResponse) Err() error {
+	if r.StatusCode != http.StatusOK {
+		return api.StatusErrorf(r.StatusCode, r.Error)
+	}
+
+	return nil
+}
 
 // Type represents the migration transport type. It indicates the method by which the migration can
 // take place and what optional features are available.
@@ -19,29 +46,35 @@ type Type struct {
 
 // VolumeSourceArgs represents the arguments needed to setup a volume migration source.
 type VolumeSourceArgs struct {
-	Name              string
-	Snapshots         []string
-	MigrationType     Type
-	TrackProgress     bool
-	MultiSync         bool
-	FinalSync         bool
-	Data              interface{} // Optional store to persist storage driver state between MultiSync phases.
-	ContentType       string
-	AllowInconsistent bool
+	IndexHeaderVersion uint32
+	Name               string
+	Snapshots          []string
+	MigrationType      Type
+	TrackProgress      bool
+	MultiSync          bool
+	FinalSync          bool
+	Data               any // Optional store to persist storage driver state between MultiSync phases.
+	ContentType        string
+	AllowInconsistent  bool
+	Refresh            bool
+	Info               *Info
+	VolumeOnly         bool
 }
 
 // VolumeTargetArgs represents the arguments needed to setup a volume migration sink.
 type VolumeTargetArgs struct {
-	Name          string
-	Description   string
-	Config        map[string]string
-	Snapshots     []string
-	MigrationType Type
-	TrackProgress bool
-	Refresh       bool
-	Live          bool
-	VolumeSize    int64
-	ContentType   string
+	IndexHeaderVersion uint32
+	Name               string
+	Description        string
+	Config             map[string]string // Only used for custom volume migration.
+	Snapshots          []string
+	MigrationType      Type
+	TrackProgress      bool
+	Refresh            bool
+	Live               bool
+	VolumeSize         int64
+	ContentType        string
+	VolumeOnly         bool
 }
 
 // TypesToHeader converts one or more Types to a MigrationHeader. It uses the first type argument
@@ -66,9 +99,12 @@ func TypesToHeader(types ...Type) *MigrationHeader {
 		features := ZfsFeatures{
 			Compress: &missingFeature,
 		}
+
 		for _, feature := range preferredType.Features {
 			if feature == "compress" {
 				features.Compress = &hasFeature
+			} else if feature == ZFSFeatureMigrationHeader {
+				features.MigrationHeader = &hasFeature
 			}
 		}
 
@@ -81,11 +117,14 @@ func TypesToHeader(types ...Type) *MigrationHeader {
 			MigrationHeader:  &missingFeature,
 			HeaderSubvolumes: &missingFeature,
 		}
+
 		for _, feature := range preferredType.Features {
 			if feature == BTRFSFeatureMigrationHeader {
 				features.MigrationHeader = &hasFeature
 			} else if feature == BTRFSFeatureSubvolumes {
 				features.HeaderSubvolumes = &hasFeature
+			} else if feature == BTRFSFeatureSubvolumeUUIDs {
+				features.HeaderSubvolumeUuids = &hasFeature
 			}
 		}
 
@@ -168,6 +207,18 @@ func MatchTypes(offer *MigrationHeader, fallbackType MigrationFSType, ourTypes [
 				}
 			}
 
+			if offer.GetRefresh() {
+				// Optimized refresh with zfs only works if ZfsFeatureMigrationHeader is available.
+				if ourType.FSType == MigrationFSType_ZFS && !shared.StringInSlice(ZFSFeatureMigrationHeader, commonFeatures) {
+					continue
+				}
+
+				// Optimized refresh with btrfs only works if BtrfsFeatureSubvolumeUUIDs is available.
+				if ourType.FSType == MigrationFSType_BTRFS && !shared.StringInSlice(BTRFSFeatureSubvolumeUUIDs, commonFeatures) {
+					continue
+				}
+			}
+
 			// Append type with combined features.
 			matchedTypes = append(matchedTypes, Type{
 				FSType:   ourType.FSType,
@@ -197,7 +248,7 @@ func MatchTypes(offer *MigrationHeader, fallbackType MigrationFSType, ourTypes [
 func progressWrapperRender(op *operations.Operation, key string, description string, progressInt int64, speedInt int64) {
 	meta := op.Metadata()
 	if meta == nil {
-		meta = make(map[string]interface{})
+		meta = make(map[string]any)
 	}
 
 	progress := fmt.Sprintf("%s (%s/s)", units.GetByteSizeString(progressInt, 2), units.GetByteSizeString(speedInt, 2))
@@ -207,7 +258,7 @@ func progressWrapperRender(op *operations.Operation, key string, description str
 
 	if meta[key] != progress {
 		meta[key] = progress
-		op.UpdateMetadata(meta)
+		_ = op.UpdateMetadata(meta)
 	}
 }
 
@@ -255,7 +306,7 @@ func ProgressWriter(op *operations.Operation, key string, description string) fu
 	}
 }
 
-// ProgressTracker returns a migration I/O tracker
+// ProgressTracker returns a migration I/O tracker.
 func ProgressTracker(op *operations.Operation, key string, description string) *ioprogress.ProgressTracker {
 	progress := func(progressInt int64, speedInt int64) {
 		progressWrapperRender(op, key, description, progressInt, speedInt)

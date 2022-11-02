@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,10 +10,9 @@ import (
 	"sync"
 	"time"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/db/warningtype"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/project"
@@ -23,7 +21,6 @@ import (
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 )
 
 var instancesCmd = APIEndpoint{
@@ -86,6 +83,7 @@ var instanceFileCmd = APIEndpoint{
 	},
 
 	Get:    APIEndpointAction{Handler: instanceFileHandler, AccessHandler: allowProjectPermission("containers", "operate-containers")},
+	Head:   APIEndpointAction{Handler: instanceFileHandler, AccessHandler: allowProjectPermission("containers", "operate-containers")},
 	Post:   APIEndpointAction{Handler: instanceFileHandler, AccessHandler: allowProjectPermission("containers", "operate-containers")},
 	Delete: APIEndpointAction{Handler: instanceFileHandler, AccessHandler: allowProjectPermission("containers", "operate-containers")},
 }
@@ -255,7 +253,7 @@ func instancesStart(s *state.State, instances []instance.Instance) {
 			continue
 		}
 
-		instLogger := logging.AddContext(logger.Log, log.Ctx{"project": inst.Project(), "instance": inst.Name()})
+		instLogger := logger.AddContext(logger.Log, logger.Ctx{"project": inst.Project().Name, "instance": inst.Name()})
 
 		// Try to start the instance.
 		var attempt = 0
@@ -263,20 +261,20 @@ func instancesStart(s *state.State, instances []instance.Instance) {
 			attempt++
 			err := inst.Start(false)
 			if err != nil {
-				if _, matched := api.StatusErrorMatch(err, http.StatusServiceUnavailable); matched {
+				if api.StatusErrorCheck(err, http.StatusServiceUnavailable) {
 					break // Don't log or retry instances that are not ready to start yet.
 				}
 
-				instLogger.Warn("Failed auto start instance attempt", log.Ctx{"attempt": attempt, "maxAttempts": maxAttempts, "err": err})
+				instLogger.Warn("Failed auto start instance attempt", logger.Ctx{"attempt": attempt, "maxAttempts": maxAttempts, "err": err})
 
 				if attempt >= maxAttempts {
 					// If unable to start after 3 tries, record a warning.
-					warnErr := s.Cluster.UpsertWarningLocalNode(inst.Project(), cluster.TypeInstance, inst.ID(), db.WarningInstanceAutostartFailure, fmt.Sprintf("%v", err))
+					warnErr := s.DB.Cluster.UpsertWarningLocalNode(inst.Project().Name, cluster.TypeInstance, inst.ID(), warningtype.InstanceAutostartFailure, fmt.Sprintf("%v", err))
 					if warnErr != nil {
-						instLogger.Warn("Failed to create instance autostart failure warning", log.Ctx{"err": warnErr})
+						instLogger.Warn("Failed to create instance autostart failure warning", logger.Ctx{"err": warnErr})
 					}
 
-					instLogger.Error("Failed to auto start instance", log.Ctx{"err": err})
+					instLogger.Error("Failed to auto start instance", logger.Ctx{"err": err})
 
 					break
 				}
@@ -287,9 +285,9 @@ func instancesStart(s *state.State, instances []instance.Instance) {
 			}
 
 			// Resolve any previous warning.
-			warnErr := warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(s.Cluster, inst.Project(), db.WarningInstanceAutostartFailure, cluster.TypeInstance, inst.ID())
+			warnErr := warnings.ResolveWarningsByLocalNodeAndProjectAndTypeAndEntity(s.DB.Cluster, inst.Project().Name, warningtype.InstanceAutostartFailure, cluster.TypeInstance, inst.ID())
 			if warnErr != nil {
-				instLogger.Warn("Failed to resolve instance autostart failure warning", log.Ctx{"err": warnErr})
+				instLogger.Warn("Failed to resolve instance autostart failure warning", logger.Ctx{"err": warnErr})
 			}
 
 			// Wait the auto-start delay if set.
@@ -301,8 +299,6 @@ func instancesStart(s *state.State, instances []instance.Instance) {
 			break
 		}
 	}
-
-	return
 }
 
 type instanceStopList []instance.Instance
@@ -339,14 +335,14 @@ func instancesOnDisk(s *state.State) ([]instance.Instance, error) {
 		instancetype.VM:        shared.VarPath("virtual-machines"),
 	}
 
-	instanceTypeNames := make(map[instancetype.Type][]os.FileInfo, 2)
+	instanceTypeNames := make(map[instancetype.Type][]os.DirEntry, 2)
 
-	instanceTypeNames[instancetype.Container], err = ioutil.ReadDir(instancePaths[instancetype.Container])
+	instanceTypeNames[instancetype.Container], err = os.ReadDir(instancePaths[instancetype.Container])
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 
-	instanceTypeNames[instancetype.VM], err = ioutil.ReadDir(instancePaths[instancetype.VM])
+	instanceTypeNames[instancetype.VM], err = os.ReadDir(instancePaths[instancetype.VM])
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -366,7 +362,7 @@ func instancesOnDisk(s *state.State) ([]instance.Instance, error) {
 			if shared.PathExists(backupYamlPath) {
 				inst, err = instance.LoadFromBackup(s, projectName, filepath.Join(instancePaths[instanceType], file.Name()), false)
 				if err != nil {
-					logger.Warn("Failed loading instance", log.Ctx{"project": projectName, "instance": instanceName, "backup_file": backupYamlPath, "err": err})
+					logger.Warn("Failed loading instance", logger.Ctx{"project": projectName, "instance": instanceName, "backup_file": backupYamlPath, "err": err})
 				}
 			}
 
@@ -380,9 +376,13 @@ func instancesOnDisk(s *state.State) ([]instance.Instance, error) {
 					Config:  make(map[string]string),
 				}
 
-				inst, err = instance.Load(s, *instDBArgs, nil)
+				emptyProject := api.Project{
+					Name: projectName,
+				}
+
+				inst, err = instance.Load(s, *instDBArgs, emptyProject)
 				if err != nil {
-					logger.Warn("Failed loading instance", log.Ctx{"project": projectName, "instance": instanceName, "err": err})
+					logger.Warn("Failed loading instance", logger.Ctx{"project": projectName, "instance": instanceName, "err": err})
 					continue
 				}
 			}
@@ -394,7 +394,7 @@ func instancesOnDisk(s *state.State) ([]instance.Instance, error) {
 	return instances, nil
 }
 
-func instancesShutdown(s *state.State, instances []instance.Instance) error {
+func instancesShutdown(s *state.State, instances []instance.Instance) {
 	var wg sync.WaitGroup
 
 	sort.Sort(instanceStopList(instances))
@@ -429,10 +429,10 @@ func instancesShutdown(s *state.State, instances []instance.Instance) error {
 
 				err := inst.Shutdown(time.Second * time.Duration(timeoutSeconds))
 				if err != nil {
-					logger.Warn("Failed shutting down instance, forcefully stopping", log.Ctx{"project": inst.Project(), "instance": inst.Name(), "err": err})
+					logger.Warn("Failed shutting down instance, forcefully stopping", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "err": err})
 					err = inst.Stop(false)
 					if err != nil {
-						logger.Warn("Failed forcefully stopping instance", log.Ctx{"project": inst.Project(), "instance": inst.Name(), "err": err})
+						logger.Warn("Failed forcefully stopping instance", logger.Ctx{"project": inst.Project().Name, "instance": inst.Name(), "err": err})
 					}
 				}
 
@@ -440,7 +440,7 @@ func instancesShutdown(s *state.State, instances []instance.Instance) error {
 					// If DB was available then the instance shutdown process will have set
 					// the last power state to STOPPED, so set that back to RUNNING so that
 					// when LXD restarts the instance will be started again.
-					inst.VolatileSet(map[string]string{"volatile.last_state.power": "RUNNING"})
+					_ = inst.VolatileSet(map[string]string{"volatile.last_state.power": "RUNNING"})
 				}
 
 				wg.Done()
@@ -448,6 +448,4 @@ func instancesShutdown(s *state.State, instances []instance.Instance) error {
 		}
 	}
 	wg.Wait()
-
-	return nil
 }

@@ -2,7 +2,6 @@ package apparmor
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,7 +150,7 @@ func forkproxyProfile(sysOS *sys.OS, inst instance, dev device) (string, error) 
 
 	// Render the profile.
 	var sb *strings.Builder = &strings.Builder{}
-	err = forkproxyProfileTpl.Execute(sb, map[string]interface{}{
+	err = forkproxyProfileTpl.Execute(sb, map[string]any{
 		"name":        ForkproxyProfileName(inst, dev),
 		"varPath":     shared.VarPath(""),
 		"rootPath":    rootPath,
@@ -171,13 +170,13 @@ func forkproxyProfile(sysOS *sys.OS, inst instance, dev device) (string, error) 
 // ForkproxyProfileName returns the AppArmor profile name.
 func ForkproxyProfileName(inst instance, dev device) string {
 	path := shared.VarPath("")
-	name := fmt.Sprintf("%s_%s_<%s>", dev.Name(), project.Instance(inst.Project(), inst.Name()), path)
+	name := fmt.Sprintf("%s_%s_<%s>", dev.Name(), project.Instance(inst.Project().Name, inst.Name()), path)
 	return profileName("forkproxy", name)
 }
 
 // forkproxyProfileFilename returns the name of the on-disk profile name.
 func forkproxyProfileFilename(inst instance, dev device) string {
-	name := fmt.Sprintf("%s_%s", dev.Name(), project.Instance(inst.Project(), inst.Name()))
+	name := fmt.Sprintf("%s_%s", dev.Name(), project.Instance(inst.Project().Name, inst.Name()))
 	return profileName("forkproxy", name)
 }
 
@@ -195,7 +194,7 @@ func ForkproxyLoad(sysOS *sys.OS, inst instance, dev device) error {
 	 * force a recompile.
 	 */
 	profile := filepath.Join(aaPath, "profiles", forkproxyProfileFilename(inst, dev))
-	content, err := ioutil.ReadFile(profile)
+	content, err := os.ReadFile(profile)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -206,7 +205,7 @@ func ForkproxyLoad(sysOS *sys.OS, inst instance, dev device) error {
 	}
 
 	if string(content) != string(updated) {
-		err = ioutil.WriteFile(profile, []byte(updated), 0600)
+		err = os.WriteFile(profile, []byte(updated), 0600)
 		if err != nil {
 			return err
 		}

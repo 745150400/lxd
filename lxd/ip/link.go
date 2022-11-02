@@ -12,27 +12,29 @@ import (
 	"github.com/lxc/lxd/shared"
 )
 
-// Link represents base arguments for link device
+// Link represents base arguments for link device.
 type Link struct {
 	Name   string
 	MTU    string
 	Parent string
 }
 
-// args generate common arguments for the virtual link
+// args generate common arguments for the virtual link.
 func (l *Link) args(linkType string) []string {
 	var result []string
 	if l.Parent != "" {
 		result = append(result, "link", l.Parent)
 	}
+
 	if l.MTU != "" {
 		result = append(result, "mtu", l.MTU)
 	}
+
 	result = append(result, "type", linkType)
 	return result
 }
 
-// add adds new virtual link
+// add adds new virtual link.
 func (l *Link) add(linkType string, additionalArgs []string) error {
 	cmd := []string{"link", "add", l.Name}
 	cmd = append(cmd, l.args(linkType)...)
@@ -41,105 +43,117 @@ func (l *Link) add(linkType string, additionalArgs []string) error {
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetUp enables the link device
+// SetUp enables the link device.
 func (l *Link) SetUp() error {
 	_, err := shared.RunCommand("ip", "link", "set", "dev", l.Name, "up")
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetDown disables the link device
+// SetDown disables the link device.
 func (l *Link) SetDown() error {
 	_, err := shared.RunCommand("ip", "link", "set", "dev", l.Name, "down")
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetMTU sets the MTU of the link device
+// SetMTU sets the MTU of the link device.
 func (l *Link) SetMTU(mtu string) error {
 	_, err := shared.RunCommand("ip", "link", "set", "dev", l.Name, "mtu", mtu)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetAddress sets the address of the link device
+// SetAddress sets the address of the link device.
 func (l *Link) SetAddress(address string) error {
 	_, err := shared.RunCommand("ip", "link", "set", "dev", l.Name, "address", address)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetMaster sets the master of the link device
+// SetMaster sets the master of the link device.
 func (l *Link) SetMaster(master string) error {
 	_, err := shared.RunCommand("ip", "link", "set", "dev", l.Name, "master", master)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetNoMaster removes the master of the link device
+// SetNoMaster removes the master of the link device.
 func (l *Link) SetNoMaster() error {
 	_, err := shared.RunCommand("ip", "link", "set", "dev", l.Name, "nomaster")
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetName sets the name of the link device
+// SetName sets the name of the link device.
 func (l *Link) SetName(newName string) error {
 	_, err := shared.RunCommand("ip", "link", "set", "dev", l.Name, "name", newName)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetNetns moves the link to the selected network namespace
+// SetNetns moves the link to the selected network namespace.
 func (l *Link) SetNetns(netns string) error {
 	_, err := shared.RunCommand("ip", "link", "set", "dev", l.Name, "netns", netns)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetVfAddress changes the address for the specified vf
+// SetVfAddress changes the address for the specified vf.
 func (l *Link) SetVfAddress(vf string, address string) error {
 	_, err := shared.TryRunCommand("ip", "link", "set", "dev", l.Name, "vf", vf, "mac", address)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetVfVlan changes the assigned VLAN for the specified vf
+// SetVfVlan changes the assigned VLAN for the specified vf.
 func (l *Link) SetVfVlan(vf string, vlan string) error {
 	_, err := shared.TryRunCommand("ip", "link", "set", "dev", l.Name, "vf", vf, "vlan", vlan)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// SetVfSpoofchk turns packet spoof checking on or off for the specified VF
+// SetVfSpoofchk turns packet spoof checking on or off for the specified VF.
 func (l *Link) SetVfSpoofchk(vf string, mode string) error {
 	_, err := shared.TryRunCommand("ip", "link", "set", "dev", l.Name, "vf", vf, "spoofchk", mode)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -152,7 +166,7 @@ type VirtFuncInfo struct {
 	SpoofCheck bool             `json:"spoofchk"`
 }
 
-// GetVFInfo returns info about virtual function
+// GetVFInfo returns info about virtual function.
 func (l *Link) GetVFInfo(vfID int) (VirtFuncInfo, error) {
 	vf := VirtFuncInfo{}
 	vfNotFoundErr := fmt.Errorf("no matching virtual function found")
@@ -169,13 +183,15 @@ func (l *Link) GetVFInfo(vfID int) (VirtFuncInfo, error) {
 		if err != nil {
 			return vf, err
 		}
-		defer stdout.Close()
+
+		defer func() { _ = stdout.Close() }()
 
 		err = cmd.Start()
 		if err != nil {
 			return vf, err
 		}
-		defer cmd.Wait()
+
+		defer func() { _ = cmd.Wait() }()
 
 		// Try and match: "vf 1 MAC 00:00:00:00:00:00, vlan 4095, spoof checking off"
 		reVlan := regexp.MustCompile(fmt.Sprintf(`vf %d MAC ((?:[[:xdigit:]]{2}:){5}[[:xdigit:]]{2}).*, vlan (\d+), spoof checking (\w+)`, vfID))
@@ -226,13 +242,15 @@ func (l *Link) GetVFInfo(vfID int) (VirtFuncInfo, error) {
 	if err != nil {
 		return vf, err
 	}
-	defer stdout.Close()
+
+	defer func() { _ = stdout.Close() }()
 
 	err = cmd.Start()
 	if err != nil {
 		return vf, err
 	}
-	defer cmd.Wait()
+
+	defer func() { _ = cmd.Wait() }()
 
 	// Temporary struct to decode ip output into.
 	var ifInfo []struct {
@@ -288,41 +306,41 @@ func (l *Link) GetVFInfo(vfID int) (VirtFuncInfo, error) {
 	return vf, nil
 }
 
-// Change sets map for link device
+// Change sets map for link device.
 func (l *Link) Change(devType string, fanMap string) error {
 	_, err := shared.RunCommand("ip", "link", "change", "dev", l.Name, "type", devType, "fan-map", fanMap)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// Delete deletes the link device
+// Delete deletes the link device.
 func (l *Link) Delete() error {
 	_, err := shared.RunCommand("ip", "link", "delete", "dev", l.Name)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// BridgeVLANAdd adds a new vlan filter entry
-func (l *Link) BridgeVLANAdd(vid string, pvid bool, untagged bool, self bool, master bool) error {
+// BridgeVLANAdd adds a new vlan filter entry.
+func (l *Link) BridgeVLANAdd(vid string, pvid bool, untagged bool, self bool) error {
 	cmd := []string{"vlan", "add", "dev", l.Name, "vid", vid}
 
-	if pvid == true {
+	if pvid {
 		cmd = append(cmd, "pvid")
 	}
 
-	if untagged == true {
+	if untagged {
 		cmd = append(cmd, "untagged")
 	}
 
-	if self == true {
+	if self {
 		cmd = append(cmd, "self")
-	}
-
-	if master == true {
+	} else {
 		cmd = append(cmd, "master")
 	}
 
@@ -330,18 +348,17 @@ func (l *Link) BridgeVLANAdd(vid string, pvid bool, untagged bool, self bool, ma
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// BridgeVLANDelete removes an existing vlan filter entry
-func (l *Link) BridgeVLANDelete(vid string, self bool, master bool) error {
+// BridgeVLANDelete removes an existing vlan filter entry.
+func (l *Link) BridgeVLANDelete(vid string, self bool) error {
 	cmd := []string{"vlan", "del", "dev", l.Name, "vid", vid}
 
-	if self == true {
+	if self {
 		cmd = append(cmd, "self")
-	}
-
-	if master == true {
+	} else {
 		cmd = append(cmd, "master")
 	}
 
@@ -349,13 +366,14 @@ func (l *Link) BridgeVLANDelete(vid string, self bool, master bool) error {
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// BridgeLinkSetIsolated sets bridge 'isolated' attribute on a port
+// BridgeLinkSetIsolated sets bridge 'isolated' attribute on a port.
 func (l *Link) BridgeLinkSetIsolated(isolated bool) error {
 	isolatedState := "on"
-	if isolated == false {
+	if !isolated {
 		isolatedState = "off"
 	}
 
@@ -363,13 +381,14 @@ func (l *Link) BridgeLinkSetIsolated(isolated bool) error {
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
-// BridgeLinkSetHairpin sets bridge 'hairpin' attribute on a port
+// BridgeLinkSetHairpin sets bridge 'hairpin' attribute on a port.
 func (l *Link) BridgeLinkSetHairpin(hairpin bool) error {
 	hairpinState := "on"
-	if hairpin == false {
+	if !hairpin {
 		hairpinState = "off"
 	}
 
@@ -377,5 +396,6 @@ func (l *Link) BridgeLinkSetHairpin(hairpin bool) error {
 	if err != nil {
 		return err
 	}
+
 	return nil
 }

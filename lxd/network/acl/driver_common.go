@@ -9,12 +9,11 @@ import (
 	"strings"
 	"sync"
 
-	log "gopkg.in/inconshreveable/log15.v2"
-
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/cluster/request"
 	"github.com/lxc/lxd/lxd/db"
+	dbCluster "github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/network/openvswitch"
 	"github.com/lxc/lxd/lxd/project"
 	"github.com/lxc/lxd/lxd/revert"
@@ -23,7 +22,6 @@ import (
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 	"github.com/lxc/lxd/shared/validate"
 	"github.com/lxc/lxd/shared/version"
 )
@@ -68,7 +66,7 @@ func (d *common) init(state *state.State, id int64, projectName string, info *ap
 		d.info = info
 	}
 
-	d.logger = logging.AddContext(logger.Log, log.Ctx{"project": projectName, "networkACL": d.info.Name})
+	d.logger = logger.AddContext(logger.Log, logger.Ctx{"project": projectName, "networkACL": d.info.Name})
 	d.id = id
 	d.projectName = projectName
 	d.state = state
@@ -124,9 +122,9 @@ func (d *common) usedBy(firstOnly bool) ([]string, error) {
 	usedBy := []string{}
 
 	// Find all networks, profiles and instance NICs that use this Network ACL.
-	err := UsedBy(d.state, d.projectName, func(_ []string, usageType interface{}, _ string, _ map[string]string) error {
+	err := UsedBy(d.state, d.projectName, func(_ []string, usageType any, _ string, _ map[string]string) error {
 		switch u := usageType.(type) {
-		case db.Instance:
+		case db.InstanceArgs:
 			uri := fmt.Sprintf("/%s/instances/%s", version.APIVersion, u.Name)
 			if u.Project != project.Default {
 				uri += fmt.Sprintf("?project=%s", u.Project)
@@ -140,7 +138,7 @@ func (d *common) usedBy(firstOnly bool) ([]string, error) {
 			}
 
 			usedBy = append(usedBy, uri)
-		case db.Profile:
+		case dbCluster.Profile:
 			uri := fmt.Sprintf("/%s/profiles/%s", version.APIVersion, u.Name)
 			if u.Project != project.Default {
 				uri += fmt.Sprintf("?project=%s", u.Project)
@@ -191,8 +189,8 @@ func (d *common) isUsed() (bool, error) {
 }
 
 // Etag returns the values used for etag generation.
-func (d *common) Etag() []interface{} {
-	return []interface{}{d.info.Name, d.info.Description, d.info.Ingress, d.info.Egress, d.info.Config}
+func (d *common) Etag() []any {
+	return []any{d.info.Name, d.info.Description, d.info.Ingress, d.info.Egress, d.info.Config}
 }
 
 // validateName checks name is valid.
@@ -302,7 +300,7 @@ func (d *common) validateRule(direction ruleDirection, rule api.NetworkACLRule) 
 	}
 
 	// Get map of ACL names to DB IDs (used for generating OVN port group names).
-	acls, err := d.state.Cluster.GetNetworkACLIDsByNames(d.Project())
+	acls, err := d.state.DB.Cluster.GetNetworkACLIDsByNames(d.Project())
 	if err != nil {
 		return fmt.Errorf("Failed getting network ACLs for security ACL subject validation: %w", err)
 	}
@@ -320,7 +318,7 @@ func (d *common) validateRule(direction ruleDirection, rule api.NetworkACLRule) 
 
 	// Validate Source field.
 	if rule.Source != "" {
-		srcHasName, srcHasIPv4, srcHasIPv6, err = d.validateRuleSubjects("Source", direction, util.SplitNTrimSpace(rule.Source, ",", -1, false), validSubjectNames)
+		srcHasName, srcHasIPv4, srcHasIPv6, err = d.validateRuleSubjects("Source", direction, shared.SplitNTrimSpace(rule.Source, ",", -1, false), validSubjectNames)
 		if err != nil {
 			return fmt.Errorf("Invalid Source: %w", err)
 		}
@@ -328,7 +326,7 @@ func (d *common) validateRule(direction ruleDirection, rule api.NetworkACLRule) 
 
 	// Validate Destination field.
 	if rule.Destination != "" {
-		dstHasName, dstHasIPv4, dstHasIPv6, err = d.validateRuleSubjects("Destination", direction, util.SplitNTrimSpace(rule.Destination, ",", -1, false), validSubjectNames)
+		dstHasName, dstHasIPv4, dstHasIPv6, err = d.validateRuleSubjects("Destination", direction, shared.SplitNTrimSpace(rule.Destination, ",", -1, false), validSubjectNames)
 		if err != nil {
 			return fmt.Errorf("Invalid Destination: %w", err)
 		}
@@ -364,7 +362,7 @@ func (d *common) validateRule(direction ruleDirection, rule api.NetworkACLRule) 
 
 		// Validate SourcePort field.
 		if rule.SourcePort != "" {
-			err := d.validatePorts(util.SplitNTrimSpace(rule.SourcePort, ",", -1, false))
+			err := d.validatePorts(shared.SplitNTrimSpace(rule.SourcePort, ",", -1, false))
 			if err != nil {
 				return fmt.Errorf("Invalid Source port: %w", err)
 			}
@@ -372,7 +370,7 @@ func (d *common) validateRule(direction ruleDirection, rule api.NetworkACLRule) 
 
 		// Validate DestinationPort field.
 		if rule.DestinationPort != "" {
-			err := d.validatePorts(util.SplitNTrimSpace(rule.DestinationPort, ",", -1, false))
+			err := d.validatePorts(shared.SplitNTrimSpace(rule.DestinationPort, ",", -1, false))
 			if err != nil {
 				return fmt.Errorf("Invalid Destination port: %w", err)
 			}
@@ -511,7 +509,6 @@ func (d *common) validateRuleSubjects(fieldName string, direction ruleDirection,
 			ipVersion, err := c(subject)
 			if err == nil {
 				return ipVersion, nil // Found valid subject.
-
 			}
 		}
 
@@ -588,7 +585,7 @@ func (d *common) Update(config *api.NetworkACLPut, clientType request.ClientType
 
 		// Update database. Its important this occurs before we attempt to apply to networks using the ACL
 		// as usage functions will inspect the database.
-		err = d.state.Cluster.UpdateNetworkACL(d.id, config)
+		err = d.state.DB.Cluster.UpdateNetworkACL(d.id, config)
 		if err != nil {
 			return err
 		}
@@ -598,7 +595,7 @@ func (d *common) Update(config *api.NetworkACLPut, clientType request.ClientType
 		d.init(d.state, d.id, d.projectName, d.info)
 
 		revert.Add(func() {
-			d.state.Cluster.UpdateNetworkACL(d.id, &oldConfig)
+			_ = d.state.DB.Cluster.UpdateNetworkACL(d.id, &oldConfig)
 			d.info.NetworkACLPut = oldConfig
 			d.init(d.state, d.id, d.projectName, d.info)
 		})
@@ -640,7 +637,7 @@ func (d *common) Update(config *api.NetworkACLPut, clientType request.ClientType
 		}
 
 		// Get map of ACL names to DB IDs (used for generating OVN port group names).
-		aclNameIDs, err := d.state.Cluster.GetNetworkACLIDsByNames(d.Project())
+		aclNameIDs, err := d.state.DB.Cluster.GetNetworkACLIDsByNames(d.Project())
 		if err != nil {
 			return fmt.Errorf("Failed getting network ACL IDs for security ACL update: %w", err)
 		}
@@ -651,11 +648,12 @@ func (d *common) Update(config *api.NetworkACLPut, clientType request.ClientType
 		// apply those rules to each network affected by the ACL, so pass the full list of OVN networks
 		// affected by this ACL (either because the ACL is assigned directly or because it is assigned to
 		// an OVN NIC in an instance or profile).
-		r, err := OVNEnsureACLs(d.state, d.logger, client, d.projectName, aclNameIDs, aclOVNNets, []string{d.info.Name}, true)
+		cleanup, err := OVNEnsureACLs(d.state, d.logger, client, d.projectName, aclNameIDs, aclOVNNets, []string{d.info.Name}, true)
 		if err != nil {
 			return fmt.Errorf("Failed ensuring ACL is configured in OVN: %w", err)
 		}
-		revert.Add(r.Fail)
+
+		revert.Add(cleanup)
 
 		// Run unused port group cleanup in case any formerly referenced ACL in this ACL's rules means that
 		// an ACL port group is now considered unused.
@@ -706,7 +704,7 @@ func (d *common) Rename(newName string) error {
 		return err
 	}
 
-	err = d.state.Cluster.RenameNetworkACL(d.id, newName)
+	err = d.state.DB.Cluster.RenameNetworkACL(d.id, newName)
 	if err != nil {
 		return err
 	}
@@ -728,7 +726,7 @@ func (d *common) Delete() error {
 		return fmt.Errorf("Cannot delete an ACL that is in use")
 	}
 
-	return d.state.Cluster.DeleteNetworkACL(d.id)
+	return d.state.DB.Cluster.DeleteNetworkACL(d.id)
 }
 
 // GetLog gets the ACL log.
@@ -744,7 +742,8 @@ func (d *common) GetLog(clientType request.ClientType) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("Couldn't open OVN log file: %w", err)
 	}
-	defer logFile.Close()
+
+	defer func() { _ = logFile.Close() }()
 
 	logEntries := []string{}
 	scanner := bufio.NewScanner(logFile)
@@ -777,7 +776,8 @@ func (d *common) GetLog(clientType request.ClientType) (string, error) {
 			if err != nil {
 				return err
 			}
-			defer entries.Close()
+
+			defer func() { _ = entries.Close() }()
 
 			// Prevent concurrent writes to the log entries slice.
 			mu.Lock()

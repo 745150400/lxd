@@ -9,14 +9,18 @@ import (
 	"time"
 
 	"github.com/canonical/go-dqlite/driver"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/lxc/lxd/lxd/cluster"
+	clusterConfig "github.com/lxc/lxd/lxd/cluster/config"
 	"github.com/lxc/lxd/lxd/db"
+	clusterDB "github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/node"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/osarch"
 	"github.com/lxc/lxd/shared/version"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // After a heartbeat request is completed, the leader updates the heartbeat
@@ -35,34 +39,36 @@ func TestHeartbeat(t *testing.T) {
 	leaderState := f.State(leader)
 
 	// Artificially mark all nodes as down
-	err := leaderState.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		nodes, err := tx.GetNodes()
+	err := leaderState.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		members, err := tx.GetNodes(ctx)
 		require.NoError(t, err)
-		for _, node := range nodes {
-			err := tx.SetNodeHeartbeat(node.Address, time.Now().Add(-time.Minute))
+		for _, member := range members {
+			err := tx.SetNodeHeartbeat(member.Address, time.Now().Add(-time.Minute))
 			require.NoError(t, err)
 		}
+
 		return nil
 	})
 	require.NoError(t, err)
 
 	// Perform the heartbeat requests.
-	leader.Cluster = leaderState.Cluster
+	leader.Cluster = leaderState.DB.Cluster
 	heartbeat, _ := cluster.HeartbeatTask(leader)
 	ctx := context.Background()
 	heartbeat(ctx)
 
 	// The heartbeat timestamps of all nodes got updated
-	err = leaderState.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		nodes, err := tx.GetNodes()
+	err = leaderState.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		members, err := tx.GetNodes(ctx)
 		require.NoError(t, err)
 
-		offlineThreshold, err := tx.GetNodeOfflineThreshold()
+		offlineThreshold, err := tx.GetNodeOfflineThreshold(ctx)
 		require.NoError(t, err)
 
-		for _, node := range nodes {
-			assert.False(t, node.IsOffline(offlineThreshold))
+		for _, member := range members {
+			assert.False(t, member.IsOffline(offlineThreshold))
 		}
+
 		return nil
 	})
 	require.NoError(t, err)
@@ -120,6 +126,7 @@ func (f *heartbeatFixture) Leader() *cluster.Gateway {
 			if err != nil {
 				f.t.Errorf("failed to check leadership: %v", err)
 			}
+
 			if isLeader {
 				return gateway
 			}
@@ -148,6 +155,7 @@ func (f *heartbeatFixture) Follower() *cluster.Gateway {
 			if err != nil {
 				f.t.Errorf("failed to check leadership: %v", err)
 			}
+
 			if !isLeader {
 				return gateway
 			}
@@ -199,13 +207,14 @@ func (f *heartbeatFixture) node() (*state.State, *cluster.Gateway, string) {
 
 	serverCert := shared.TestingKeyPair()
 	state.ServerCert = func() *shared.CertInfo { return serverCert }
-	gateway := newGateway(f.t, state.Node, serverCert, serverCert)
-	f.cleanups = append(f.cleanups, func() { gateway.Shutdown() })
+
+	gateway := newGateway(f.t, state.DB.Node, serverCert, state)
+	f.cleanups = append(f.cleanups, func() { _ = gateway.Shutdown() })
 
 	mux := http.NewServeMux()
 	server := newServer(serverCert, mux)
 
-	trustedCerts := func() map[db.CertificateType]map[string]x509.Certificate {
+	trustedCerts := func() map[clusterDB.CertificateType]map[string]x509.Certificate {
 		return nil
 	}
 
@@ -218,10 +227,32 @@ func (f *heartbeatFixture) node() (*state.State, *cluster.Gateway, string) {
 	mf.ClusterAddress(address)
 
 	var err error
-	require.NoError(f.t, state.Cluster.Close())
+	require.NoError(f.t, state.DB.Cluster.Close())
 	store := gateway.NodeStore()
 	dial := gateway.DialFunc()
-	state.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, nil, driver.WithDialFunc(dial))
+	state.DB.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, address, "/unused/db/dir", 5*time.Second, nil, driver.WithDialFunc(dial))
+	require.NoError(f.t, err)
+
+	err = state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		state.GlobalConfig, err = clusterConfig.Load(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		// Get the local node (will be used if clustered).
+		state.ServerName, err = tx.GetLocalNodeName(ctx)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	require.NoError(f.t, err)
+
+	err = state.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		state.LocalConfig, err = node.ConfigLoad(ctx, tx)
+		return err
+	})
 	require.NoError(f.t, err)
 
 	f.gateways[len(f.gateways)] = gateway
@@ -236,6 +267,7 @@ func (f *heartbeatFixture) Cleanup() {
 	for i := len(f.cleanups) - 1; i >= 0; i-- {
 		f.cleanups[i]()
 	}
+
 	for _, server := range f.servers {
 		server.Close()
 	}

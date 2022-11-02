@@ -1,12 +1,13 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/http"
 
 	"github.com/lxc/lxd/lxd/db/query"
 	"github.com/lxc/lxd/shared/api"
@@ -22,8 +23,8 @@ func (c *Cluster) GetNetworkACLs(project string) ([]string, error) {
 
 	var aclNames []string
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 			var aclName string
 
 			err := scan(&aclName)
@@ -52,8 +53,8 @@ func (c *Cluster) GetNetworkACLIDsByNames(project string) (map[string]int64, err
 
 	acls := make(map[string]int64)
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 			var aclID int64
 			var aclName string
 
@@ -93,13 +94,13 @@ func (c *Cluster) GetNetworkACL(projectName string, name string) (int64, *api.Ne
 		LIMIT 1
 	`
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		err := tx.tx.QueryRow(q, projectName, name).Scan(&id, &acl.Description, &ingressJSON, &egressJSON)
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		err := tx.tx.QueryRowContext(ctx, q, projectName, name).Scan(&id, &acl.Description, &ingressJSON, &egressJSON)
 		if err != nil {
 			return err
 		}
 
-		err = networkACLConfig(tx, id, &acl)
+		err = networkACLConfig(ctx, tx, id, &acl)
 		if err != nil {
 			return fmt.Errorf("Failed loading config: %w", err)
 		}
@@ -108,7 +109,7 @@ func (c *Cluster) GetNetworkACL(projectName string, name string) (int64, *api.Ne
 	})
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return -1, nil, ErrNoSuchObject
+			return -1, nil, api.StatusErrorf(http.StatusNotFound, "Network ACL not found")
 		}
 
 		return -1, nil, err
@@ -140,12 +141,12 @@ func (c *Cluster) GetNetworkACLNameAndProjectWithID(networkACLID int) (string, s
 
 	q := `SELECT networks_acls.name, projects.name FROM networks_acls JOIN projects ON projects.id=networks.project_id WHERE networks_acls.id=?`
 
-	err := c.Transaction(func(tx *ClusterTx) error {
-		return tx.tx.QueryRow(q, networkACLID).Scan(&networkACLName, &projectName)
+	err := c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
+		return tx.tx.QueryRowContext(ctx, q, networkACLID).Scan(&networkACLName, &projectName)
 	})
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return "", "", ErrNoSuchObject
+			return "", "", api.StatusErrorf(http.StatusNotFound, "Network ACL not found")
 		}
 
 		return "", "", err
@@ -155,7 +156,7 @@ func (c *Cluster) GetNetworkACLNameAndProjectWithID(networkACLID int) (string, s
 }
 
 // networkACLConfig populates the config map of the Network ACL with the given ID.
-func networkACLConfig(tx *ClusterTx, id int64, acl *api.NetworkACL) error {
+func networkACLConfig(ctx context.Context, tx *ClusterTx, id int64, acl *api.NetworkACL) error {
 	q := `
 		SELECT key, value
 		FROM networks_acls_config
@@ -163,7 +164,7 @@ func networkACLConfig(tx *ClusterTx, id int64, acl *api.NetworkACL) error {
 	`
 
 	acl.Config = make(map[string]string)
-	return tx.QueryScan(q, func(scan func(dest ...interface{}) error) error {
+	return query.Scan(ctx, tx.Tx(), q, func(scan func(dest ...any) error) error {
 		var key, value string
 
 		err := scan(&key, &value)
@@ -202,7 +203,7 @@ func (c *Cluster) CreateNetworkACL(projectName string, info *api.NetworkACLsPost
 		}
 	}
 
-	err = c.Transaction(func(tx *ClusterTx) error {
+	err = c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Insert a new Network ACL record.
 		result, err := tx.tx.Exec(`
 			INSERT INTO networks_acls (project_id, name, description, ingress, egress)
@@ -238,7 +239,8 @@ func networkACLConfigAdd(tx *sql.Tx, id int64, config map[string]string) error {
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+
+	defer func() { _ = stmt.Close() }()
 
 	for k, v := range config {
 		if v == "" {
@@ -273,7 +275,7 @@ func (c *Cluster) UpdateNetworkACL(id int64, config *api.NetworkACLPut) error {
 		}
 	}
 
-	return c.Transaction(func(tx *ClusterTx) error {
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		_, err := tx.tx.Exec(`
 			UPDATE networks_acls
 			SET description=?, ingress = ?, egress = ?
@@ -299,7 +301,7 @@ func (c *Cluster) UpdateNetworkACL(id int64, config *api.NetworkACLPut) error {
 
 // RenameNetworkACL renames a Network ACL.
 func (c *Cluster) RenameNetworkACL(id int64, newName string) error {
-	return c.Transaction(func(tx *ClusterTx) error {
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		_, err := tx.tx.Exec("UPDATE networks_acls SET name=? WHERE id=?", newName, id)
 		return err
 	})
@@ -307,17 +309,17 @@ func (c *Cluster) RenameNetworkACL(id int64, newName string) error {
 
 // DeleteNetworkACL deletes the Network ACL.
 func (c *Cluster) DeleteNetworkACL(id int64) error {
-	return c.Transaction(func(tx *ClusterTx) error {
+	return c.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		_, err := tx.tx.Exec("DELETE FROM networks_acls WHERE id=?", id)
 		return err
 	})
 }
 
 // GetNetworkACLURIs returns the URIs for the network ACLs with the given project.
-func (c *ClusterTx) GetNetworkACLURIs(projectID int, project string) ([]string, error) {
+func (c *ClusterTx) GetNetworkACLURIs(ctx context.Context, projectID int, project string) ([]string, error) {
 	sql := `SELECT networks_acls.name from networks_acls WHERE networks_acls.project_id = ?`
 
-	names, err := query.SelectStrings(c.tx, sql, projectID)
+	names, err := query.SelectStrings(ctx, c.tx, sql, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("Unable to get URIs for network acl: %w", err)
 	}

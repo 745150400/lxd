@@ -1,12 +1,13 @@
 package network
 
 import (
-	log "gopkg.in/inconshreveable/log15.v2"
+	"fmt"
 
 	"github.com/lxc/lxd/lxd/cluster/request"
 	"github.com/lxc/lxd/lxd/db"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/shared/api"
+	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/validate"
 )
 
@@ -46,14 +47,14 @@ func (n *macvlan) Validate(config map[string]string) error {
 
 // Delete deletes a network.
 func (n *macvlan) Delete(clientType request.ClientType) error {
-	n.logger.Debug("Delete", log.Ctx{"clientType": clientType})
+	n.logger.Debug("Delete", logger.Ctx{"clientType": clientType})
 
 	return n.common.delete(clientType)
 }
 
 // Rename renames a network.
 func (n *macvlan) Rename(newName string) error {
-	n.logger.Debug("Rename", log.Ctx{"newName": newName})
+	n.logger.Debug("Rename", logger.Ctx{"newName": newName})
 
 	// Rename common steps.
 	err := n.common.rename(newName)
@@ -68,6 +69,20 @@ func (n *macvlan) Rename(newName string) error {
 func (n *macvlan) Start() error {
 	n.logger.Debug("Start")
 
+	revert := revert.New()
+	defer revert.Fail()
+
+	revert.Add(func() { n.setUnavailable() })
+
+	if !InterfaceExists(n.config["parent"]) {
+		return fmt.Errorf("Parent interface %q not found", n.config["parent"])
+	}
+
+	revert.Success()
+
+	// Ensure network is marked as available now its started.
+	n.setAvailable()
+
 	return nil
 }
 
@@ -81,7 +96,7 @@ func (n *macvlan) Stop() error {
 // Update updates the network. Accepts notification boolean indicating if this update request is coming from a
 // cluster notification, in which case do not update the database, just apply local changes needed.
 func (n *macvlan) Update(newNetwork api.NetworkPut, targetNode string, clientType request.ClientType) error {
-	n.logger.Debug("Update", log.Ctx{"clientType": clientType, "newNetwork": newNetwork})
+	n.logger.Debug("Update", logger.Ctx{"clientType": clientType, "newNetwork": newNetwork})
 
 	dbUpdateNeeeded, _, oldNetwork, err := n.common.configChanged(newNetwork)
 	if err != nil {
@@ -105,7 +120,7 @@ func (n *macvlan) Update(newNetwork api.NetworkPut, targetNode string, clientTyp
 	// Define a function which reverts everything.
 	revert.Add(func() {
 		// Reset changes to all nodes and database.
-		n.common.update(oldNetwork, targetNode, clientType)
+		_ = n.common.update(oldNetwork, targetNode, clientType)
 	})
 
 	// Apply changes to all nodes and databse.

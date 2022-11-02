@@ -5,7 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -114,8 +114,7 @@ func (c *cmdForkfile) Command() *cobra.Command {
   listen fd.
 
   The command can be called with PID and PIDFd set to 0 to just operate on the rootfs fd.
-  In such cases, it's the responsibility of the caller to handle any
-  kind of userns shifting (likely by calling forkfile through forkuserns).
+  In such cases, it's the responsibility of the caller to handle any kind of userns shifting.
 `
 	cmd.Hidden = true
 	cmd.Args = cobra.ExactArgs(4)
@@ -125,7 +124,9 @@ func (c *cmdForkfile) Command() *cobra.Command {
 }
 
 func (c *cmdForkfile) Run(cmd *cobra.Command, args []string) error {
-	var connections int64
+	var mu sync.RWMutex
+	var connections uint64
+	var transactions uint64
 
 	// Convert the listener FD number.
 	listenFD, err := strconv.Atoi(args[0])
@@ -139,7 +140,8 @@ func (c *cmdForkfile) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
+
+	defer func() { _ = listener.Close() }()
 
 	// Convert the rootfs FD number.
 	rootfsFD, err := strconv.Atoi(args[1])
@@ -152,10 +154,28 @@ func (c *cmdForkfile) Run(cmd *cobra.Command, args []string) error {
 		for {
 			time.Sleep(10 * time.Second)
 
-			if atomic.CompareAndSwapInt64(&connections, 0, -1) {
-				// Exit if no more connections.
+			// Check for active connections.
+			mu.RLock()
+			if connections > 0 {
+				mu.RUnlock()
+				continue
+			}
+
+			// Look for recent activity
+			oldCount := transactions
+			mu.RUnlock()
+
+			time.Sleep(5 * time.Second)
+
+			mu.RLock()
+			if oldCount == transactions {
+				mu.RUnlock()
+
+				// Daemon has been inactive for 10s, exit.
 				os.Exit(0)
 			}
+
+			mu.RUnlock()
 		}
 	}()
 
@@ -167,17 +187,22 @@ func (c *cmdForkfile) Run(cmd *cobra.Command, args []string) error {
 		<-sigs
 
 		// Prevent new connections.
-		listener.Close()
+		_ = listener.Close()
 
 		// Wait for connections to be gone and exit.
 		for {
-			if atomic.CompareAndSwapInt64(&connections, 0, -1) {
-				// Exit if no more connections.
-				os.Exit(0)
+			mu.RLock()
+			if connections == 0 {
+				mu.RUnlock()
+				break
 			}
+
+			mu.RUnlock()
 
 			time.Sleep(time.Second)
 		}
+
+		os.Exit(0)
 	}()
 
 	// Connection handler.
@@ -189,29 +214,21 @@ func (c *cmdForkfile) Run(cmd *cobra.Command, args []string) error {
 		}
 
 		go func(conn net.Conn) {
-			defer conn.Close()
-
-			// Setup connection counter.
-			for {
-				count := atomic.LoadInt64(&connections)
-
-				// Check if we're currently exiting.
-				if count == -1 {
-					return
-				}
-
-				// Ideally we'd loop here but we can't because go's cmpxchg
-				// strangely doesn't return the old value it rather returns a
-				// bool preventing such patterns as the one we use here.
-				if atomic.CompareAndSwapInt64(&connections, count, count+1) {
-					break
-				}
-			}
-
 			defer func() {
-				atomic.AddInt64(&connections, -1)
+				_ = conn.Close()
+
+				mu.Lock()
+				connections -= 1
+				mu.Unlock()
 			}()
 
+			// Increase counters.
+			mu.Lock()
+			transactions += 1
+			connections += 1
+			mu.Unlock()
+
+			// Spawn the server.
 			server, err := sftp.NewServer(conn)
 			if err != nil {
 				return
@@ -220,7 +237,7 @@ func (c *cmdForkfile) Run(cmd *cobra.Command, args []string) error {
 			_ = server.Serve()
 
 			// Sync the filesystem.
-			unix.Syncfs(int(rootfsFD))
+			_ = unix.Syncfs(int(rootfsFD))
 		}(conn)
 	}
 }

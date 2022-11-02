@@ -39,21 +39,22 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   {{ .ovmfPath }}/OVMF_CODE.fd              kr,
   /usr/share/qemu/**                        kr,
   /usr/share/seabios/**                     kr,
+  owner @{PROC}/@{pid}/cpuset               r,
   owner @{PROC}/@{pid}/task/@{tid}/comm     rw,
   {{ .rootPath }}/etc/nsswitch.conf         r,
   {{ .rootPath }}/etc/passwd                r,
   {{ .rootPath }}/etc/group                 r,
   @{PROC}/version                           r,
 
+  # Used by qemu when inside a container
+{{- if .userns }}
+  unix (send, receive) type=stream,
+{{- end }}
+
   # Instance specific paths
   {{ .logPath }}/** rwk,
   {{ .path }}/** rwk,
   {{ .devicesPath }}/** rwk,
-
-  # Instance specific external device paths
-{{- range $index, $element := .externalDevPaths}}
-  {{$element}} rwk,
-{{- end }}
 
   # Needed for lxd fork commands
   {{ .exePath }} mr,

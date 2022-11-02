@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/canonical/go-dqlite/client"
-	"gopkg.in/inconshreveable/log15.v2"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/db"
@@ -40,6 +38,7 @@ func NotifyUpgradeCompleted(state *state.State, networkCert *shared.CertInfo, se
 		if err != nil {
 			return fmt.Errorf("failed to create database notify upgrade request: %w", err)
 		}
+
 		setDqliteVersionHeader(request)
 
 		httpClient, err := client.GetHTTPClient()
@@ -65,23 +64,25 @@ func NotifyUpgradeCompleted(state *state.State, networkCert *shared.CertInfo, se
 func MaybeUpdate(state *state.State) error {
 	shouldUpdate := false
 
-	enabled, err := Enabled(state.Node)
+	enabled, err := Enabled(state.DB.Node)
 	if err != nil {
 		return fmt.Errorf("Failed to check clustering is enabled: %w", err)
 	}
+
 	if !enabled {
 		return nil
 	}
 
-	if state.Cluster == nil {
+	if state.DB.Cluster == nil {
 		return fmt.Errorf("Failed checking cluster update, state not initialised yet")
 	}
 
-	err = state.Cluster.Transaction(func(tx *db.ClusterTx) error {
-		outdated, err := tx.NodeIsOutdated()
+	err = state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		outdated, err := tx.NodeIsOutdated(ctx)
 		if err != nil {
 			return err
 		}
+
 		shouldUpdate = outdated
 		return nil
 	})
@@ -112,15 +113,16 @@ func triggerUpdate() error {
 	// restarting all cluster members at the same time, and make the
 	// upgrade more graceful.
 	wait := time.Duration(rand.Intn(30)) * time.Second
-	logger.Info("Triggering cluster auto-update soon", log.Ctx{"wait": wait, "updateExecutable": updateExecutable})
+	logger.Info("Triggering cluster auto-update soon", logger.Ctx{"wait": wait, "updateExecutable": updateExecutable})
 	time.Sleep(wait)
 
 	logger.Info("Triggering cluster auto-update now")
 	_, err := shared.RunCommand(updateExecutable)
 	if err != nil {
-		logger.Error("Triggering cluster update failed", log.Ctx{"err": err})
+		logger.Error("Triggering cluster update failed", logger.Ctx{"err": err})
 		return err
 	}
+
 	logger.Info("Triggering cluster auto-update succeeded")
 
 	return nil
@@ -133,6 +135,7 @@ func UpgradeMembersWithoutRole(gateway *Gateway, members []db.NodeInfo) error {
 	if err == ErrNotLeader {
 		return nil
 	}
+
 	if err != nil {
 		return fmt.Errorf("Failed to get current raft members: %w", err)
 	}
@@ -147,7 +150,8 @@ func UpgradeMembersWithoutRole(gateway *Gateway, members []db.NodeInfo) error {
 	if err != nil {
 		return fmt.Errorf("Failed to connect to local dqlite member: %w", err)
 	}
-	defer dqliteClient.Close()
+
+	defer func() { _ = dqliteClient.Close() }()
 
 	// Check that each member is present in the raft configuration, and add it if not.
 	for _, member := range members {
@@ -164,9 +168,11 @@ func UpgradeMembersWithoutRole(gateway *Gateway, members []db.NodeInfo) error {
 
 		// Try to use the same ID as the node, but it might not be possible if it's use.
 		id := uint64(member.ID)
-		if _, ok := raftNodeIDs[id]; ok {
+		_, ok := raftNodeIDs[id]
+		if ok {
 			for _, other := range members {
-				if _, ok := raftNodeIDs[uint64(other.ID)]; !ok {
+				_, ok := raftNodeIDs[uint64(other.ID)]
+				if !ok {
 					id = uint64(other.ID) // Found unused raft ID for member.
 					break
 				}
@@ -175,7 +181,7 @@ func UpgradeMembersWithoutRole(gateway *Gateway, members []db.NodeInfo) error {
 			// This can't really happen (but has in the past) since there are always at least as many
 			// members as there are nodes, and all of them have different IDs.
 			if id == uint64(member.ID) {
-				logger.Error("No available raft ID for cluster member", log.Ctx{"memberID": member.ID, "members": members, "raftMembers": nodes})
+				logger.Error("No available raft ID for cluster member", logger.Ctx{"memberID": member.ID, "members": members, "raftMembers": nodes})
 				return fmt.Errorf("No available raft ID for cluster member ID %d", member.ID)
 			}
 		}
@@ -190,7 +196,7 @@ func UpgradeMembersWithoutRole(gateway *Gateway, members []db.NodeInfo) error {
 			Name: "",
 		}
 
-		logger.Info("Add spare dqlite node", log15.Ctx{"id": info.ID, "address": info.Address})
+		logger.Info("Add spare dqlite node", logger.Ctx{"id": info.ID, "address": info.Address})
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

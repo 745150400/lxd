@@ -1,5 +1,4 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package sys
 
@@ -14,11 +13,6 @@ func (s *OS) LocalDatabasePath() string {
 	return filepath.Join(s.VarDir, "database", "local.db")
 }
 
-// LegacyLocalDatabasePath returns the path of legacy local database file.
-func (s *OS) LegacyLocalDatabasePath() string {
-	return filepath.Join(s.VarDir, "lxd.db")
-}
-
 // GlobalDatabaseDir returns the path of the global database directory.
 func (s *OS) GlobalDatabaseDir() string {
 	return filepath.Join(s.VarDir, "database", "global")
@@ -28,11 +22,6 @@ func (s *OS) GlobalDatabaseDir() string {
 // managed by dqlite.
 func (s *OS) GlobalDatabasePath() string {
 	return filepath.Join(s.GlobalDatabaseDir(), "db.bin")
-}
-
-// LegacyGlobalDatabasePath returns the path of legacy global database file.
-func (s *OS) LegacyGlobalDatabasePath() string {
-	return filepath.Join(s.VarDir, "raft", "db.bin")
 }
 
 // initDirs Make sure all our directories are available.

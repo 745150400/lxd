@@ -1,8 +1,9 @@
 package endpoints_test
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -12,13 +13,13 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/lxc/lxd/lxd/endpoints"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
-	"github.com/lxc/lxd/shared/logging"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // Return a new unstarted Endpoints instance, a Config with stub rest/devlxd
@@ -26,8 +27,7 @@ import (
 // associated with the endpoints (e.g. the temporary LXD var dir and any
 // goroutine that was spawned by the tomb).
 func newEndpoints(t *testing.T) (*endpoints.Endpoints, *endpoints.Config, func()) {
-	logging.Testing(t)
-	dir, err := ioutil.TempDir("", "lxd-endpoints-test-")
+	dir, err := os.MkdirTemp("", "lxd-endpoints-test-")
 	require.NoError(t, err)
 	require.NoError(t, os.Mkdir(filepath.Join(dir, "devlxd"), 0755))
 
@@ -37,7 +37,9 @@ func newEndpoints(t *testing.T) (*endpoints.Endpoints, *endpoints.Config, func()
 		RestServer:   newServer(),
 		DevLxdServer: newServer(),
 		Cert:         shared.TestingKeyPair(),
+		VsockServer:  newServer(),
 	}
+
 	endpoints := endpoints.Unstarted()
 
 	cleanup := func() {
@@ -58,10 +60,11 @@ func newEndpoints(t *testing.T) (*endpoints.Endpoints, *endpoints.Config, func()
 
 // Perform an HTTP GET "/" over the unix socket at the given path.
 func httpGetOverUnixSocket(path string) error {
-	dial := func(network, addr string) (net.Conn, error) {
+	dial := func(_ context.Context, network, addr string) (net.Conn, error) {
 		return net.Dial("unix", path)
 	}
-	client := &http.Client{Transport: &http.Transport{Dial: dial}}
+
+	client := &http.Client{Transport: &http.Transport{DialContext: dial}}
 	_, err := client.Get("http://unix.socket/")
 	return err
 }
@@ -81,16 +84,16 @@ func newServer() *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/1.0/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		util.WriteJSON(w, api.ResponseRaw{}, nil)
+		_ = util.WriteJSON(w, api.ResponseRaw{}, nil)
 	})
-	return &http.Server{Handler: mux, ErrorLog: log.New(ioutil.Discard, "", 0)}
+	return &http.Server{Handler: mux, ErrorLog: log.New(io.Discard, "", 0)}
 }
 
 // Set the environment-variable for socket-based activation using the given
 // file.
 func setupSocketBasedActivation(endpoints *endpoints.Endpoints, file *os.File) {
-	os.Setenv("LISTEN_PID", strconv.Itoa(os.Getpid()))
-	os.Setenv("LISTEN_FDS", "1")
+	_ = os.Setenv("LISTEN_PID", strconv.Itoa(os.Getpid()))
+	_ = os.Setenv("LISTEN_FDS", "1")
 	endpoints.SystemdListenFDsStart(int(file.Fd()))
 }
 

@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -11,13 +11,9 @@ import (
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/version"
 )
-
-type cmdInitData struct {
-	Node    initDataNode     `yaml:",inline"`
-	Cluster *initDataCluster `json:"cluster" yaml:"cluster"`
-}
 
 type cmdInit struct {
 	global *cmdGlobal
@@ -34,6 +30,8 @@ type cmdInit struct {
 	flagStorageLoopSize int
 	flagStoragePool     string
 	flagTrustPassword   string
+
+	hostname string
 }
 
 func (c *cmdInit) Command() *cobra.Command {
@@ -118,7 +116,7 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Prepare the input data
-	var config *cmdInitData
+	var config *api.InitPreseed
 
 	// Preseed mode
 	if c.flagPreseed {
@@ -150,16 +148,18 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 		if !shared.PathExists(config.Cluster.ClusterCertificatePath) {
 			return fmt.Errorf("Path %s doesn't exist", config.Cluster.ClusterCertificatePath)
 		}
-		content, err := ioutil.ReadFile(config.Cluster.ClusterCertificatePath)
+
+		content, err := os.ReadFile(config.Cluster.ClusterCertificatePath)
 		if err != nil {
 			return err
 		}
+
 		config.Cluster.ClusterCertificate = string(content)
 	}
 
 	// Check if we got a cluster join token, if so, fill in the config with it.
 	if config.Cluster != nil && config.Cluster.ClusterToken != "" {
-		joinToken, err := clusterMemberJoinTokenDecode(config.Cluster.ClusterToken)
+		joinToken, err := shared.JoinTokenDecode(config.Cluster.ClusterToken)
 		if err != nil {
 			return fmt.Errorf("Invalid cluster join token: %w", err)
 		}
@@ -217,10 +217,12 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("Failed to join cluster: %w", err)
 		}
+
 		err = op.Wait()
 		if err != nil {
 			return fmt.Errorf("Failed to join cluster: %w", err)
 		}
+
 		return nil
 	}
 
@@ -231,6 +233,7 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
 	revert.Add(localRevert)
 
 	err = initDataClusterApply(d, config.Cluster)
@@ -240,4 +243,19 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 
 	revert.Success()
 	return nil
+}
+
+func (c *cmdInit) defaultHostname() string {
+	if c.hostname != "" {
+		return c.hostname
+	}
+
+	// Cluster server name
+	hostName, err := os.Hostname()
+	if err != nil {
+		hostName = "lxd"
+	}
+
+	c.hostname = hostName
+	return hostName
 }

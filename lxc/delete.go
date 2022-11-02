@@ -63,6 +63,7 @@ func (c *cmdDelete) doDelete(d lxd.InstanceServer, name string) error {
 		// Instance delete
 		op, err = d.DeleteInstance(name)
 	}
+
 	if err != nil {
 		return err
 	}
@@ -83,6 +84,13 @@ func (c *cmdDelete) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Check that everything exists.
+	err = instancesExist(resources)
+	if err != nil {
+		return err
+	}
+
+	// Process with deletion.
 	for _, resource := range resources {
 		if c.flagInteractive {
 			err := c.promptDelete(resource.name)
@@ -145,7 +153,8 @@ func (c *cmdDelete) Run(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		if err := c.doDelete(resource.server, resource.name); err != nil {
+		err = c.doDelete(resource.server, resource.name)
+		if err != nil {
 			return err
 		}
 	}

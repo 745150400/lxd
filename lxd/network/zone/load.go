@@ -1,10 +1,13 @@
 package zone
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 
+	"github.com/lxc/lxd/lxd/db"
+	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/api"
@@ -12,7 +15,7 @@ import (
 
 // LoadByName loads and initialises a Network zone from the database by name.
 func LoadByName(s *state.State, name string) (NetworkZone, error) {
-	id, projectName, zoneInfo, err := s.Cluster.GetNetworkZone(name)
+	id, projectName, zoneInfo, err := s.DB.Cluster.GetNetworkZone(name)
 	if err != nil {
 		return nil, err
 	}
@@ -25,7 +28,7 @@ func LoadByName(s *state.State, name string) (NetworkZone, error) {
 
 // LoadByNameAndProject loads and initialises a Network zone from the database by project and name.
 func LoadByNameAndProject(s *state.State, projectName string, name string) (NetworkZone, error) {
-	id, zoneInfo, err := s.Cluster.GetNetworkZoneByProject(projectName, name)
+	id, zoneInfo, err := s.DB.Cluster.GetNetworkZoneByProject(projectName, name)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +55,17 @@ func Create(s *state.State, projectName string, zoneInfo *api.NetworkZonesPost) 
 	}
 
 	// Load the project.
-	p, err := s.Cluster.GetProject(projectName)
+	var p *api.Project
+	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		project, err := cluster.GetProject(ctx, tx.Tx(), projectName)
+		if err != nil {
+			return err
+		}
+
+		p, err = project.ToAPI(ctx, tx.Tx())
+
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -75,7 +88,7 @@ func Create(s *state.State, projectName string, zoneInfo *api.NetworkZonesPost) 
 	}
 
 	// Insert DB record.
-	_, err = s.Cluster.CreateNetworkZone(projectName, zoneInfo)
+	_, err = s.DB.Cluster.CreateNetworkZone(projectName, zoneInfo)
 	if err != nil {
 		return err
 	}
@@ -94,7 +107,7 @@ func Create(s *state.State, projectName string, zoneInfo *api.NetworkZonesPost) 
 func Exists(s *state.State, name ...string) error {
 	checkedzoneNames := make(map[string]struct{}, len(name))
 	for _, zoneName := range name {
-		_, _, _, err := s.Cluster.GetNetworkZone(zoneName)
+		_, _, _, err := s.DB.Cluster.GetNetworkZone(zoneName)
 		if err != nil {
 			return fmt.Errorf("Network zone %q does not exist", zoneName)
 		}

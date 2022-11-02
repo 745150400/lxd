@@ -7,9 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lxc/lxd/lxd/db/generate/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lxc/lxd/lxd/db/generate/db"
 )
 
 func TestPackages(t *testing.T) {
@@ -52,6 +53,7 @@ func TestParse(t *testing.T) {
 	files := map[string]*ast.File{
 		"parse_test": file,
 	}
+
 	pkg, _ := ast.NewPackage(fset, files, nil, nil)
 
 	m, err := db.Parse(pkg, "Teacher", "objects")

@@ -1,5 +1,4 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package util
 
@@ -25,19 +24,20 @@ func GetArchitectures() ([]int, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	architectures = append(architectures, architecture)
 
 	personalities, err := osarch.ArchitecturePersonalities(architecture)
 	if err != nil {
 		return nil, err
 	}
-	for _, personality := range personalities {
-		architectures = append(architectures, personality)
-	}
+
+	architectures = append(architectures, personalities...)
+
 	return architectures, nil
 }
 
-// GetExecPath returns the path to the current binary
+// GetExecPath returns the path to the current binary.
 func GetExecPath() string {
 	execPath := os.Getenv("LXD_EXEC_PATH")
 	if execPath != "" {

@@ -1,7 +1,6 @@
 package apparmor
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,11 +27,12 @@ profile "{{.name}}" {
   signal (receive) set=("term") peer=unconfined,
 
   # Capabilities
-  capability dac_read_search,
-  capability dac_override,
   capability chown,
-  capability fsetid,
+  capability dac_override,
+  capability dac_read_search,
   capability fowner,
+  capability fsetid,
+  capability mknod,
   capability setfcap,
 
 {{- if .snap }}
@@ -45,7 +45,7 @@ profile "{{.name}}" {
 // ArchiveLoad ensures that the archive's policy is loaded into the kernel.
 func ArchiveLoad(sysOS *sys.OS, outputPath string, allowedCommandPaths []string) error {
 	profile := filepath.Join(aaPath, "profiles", ArchiveProfileFilename(outputPath))
-	content, err := ioutil.ReadFile(profile)
+	content, err := os.ReadFile(profile)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -56,7 +56,7 @@ func ArchiveLoad(sysOS *sys.OS, outputPath string, allowedCommandPaths []string)
 	}
 
 	if string(content) != string(updated) {
-		err = ioutil.WriteFile(profile, []byte(updated), 0600)
+		err = os.WriteFile(profile, []byte(updated), 0600)
 		if err != nil {
 			return err
 		}
@@ -81,7 +81,7 @@ func ArchiveUnload(sysOS *sys.OS, outputPath string) error {
 	return nil
 }
 
-// ArchiveDelete removes the profile from cache/disk
+// ArchiveDelete removes the profile from cache/disk.
 func ArchiveDelete(sysOS *sys.OS, outputPath string) error {
 	return deleteProfile(sysOS, ArchiveProfileName(outputPath), ArchiveProfileFilename(outputPath))
 }
@@ -96,7 +96,7 @@ func archiveProfile(outputPath string, allowedCommandPaths []string) (string, er
 	// Attempt to deref all paths.
 	outputPathFull, err := filepath.EvalSymlinks(outputPath)
 	if err == nil {
-		outputPath = outputPathFull
+		outputPathFull = outputPath // Use requested path if cannot resolve it.
 	}
 
 	backupsPath := shared.VarPath("backups")
@@ -111,15 +111,25 @@ func archiveProfile(outputPath string, allowedCommandPaths []string) (string, er
 		imagesPath = imagesPathFull
 	}
 
+	derefCommandPaths := make([]string, len(allowedCommandPaths))
+	for i, cmd := range allowedCommandPaths {
+		cmdFull, err := filepath.EvalSymlinks(cmd)
+		if err == nil {
+			derefCommandPaths[i] = cmdFull
+		} else {
+			derefCommandPaths[i] = cmd
+		}
+	}
+
 	// Render the profile.
 	var sb *strings.Builder = &strings.Builder{}
-	err = archiveProfileTpl.Execute(sb, map[string]interface{}{
-		"name":                ArchiveProfileName(outputPath),
-		"outputPath":          outputPath,
+	err = archiveProfileTpl.Execute(sb, map[string]any{
+		"name":                ArchiveProfileName(outputPath), // Use non-deferenced outputPath for name.
+		"outputPath":          outputPathFull,                 // Use deferenced path in AppArmor profile.
 		"rootPath":            rootPath,
 		"backupsPath":         backupsPath,
 		"imagesPath":          imagesPath,
-		"allowedCommandPaths": allowedCommandPaths,
+		"allowedCommandPaths": derefCommandPaths,
 	})
 	if err != nil {
 		return "", err

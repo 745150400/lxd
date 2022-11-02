@@ -12,12 +12,14 @@ import (
 	"testing"
 
 	"github.com/canonical/go-dqlite/driver"
-	"github.com/lxc/lxd/lxd/cluster"
-	"github.com/lxc/lxd/lxd/db"
-	"github.com/lxc/lxd/shared"
-	"github.com/lxc/lxd/shared/logging"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lxc/lxd/lxd/cluster"
+	"github.com/lxc/lxd/lxd/db"
+	clusterDB "github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/state"
+	"github.com/lxc/lxd/shared"
 )
 
 // Basic creation and shutdown. By default, the gateway runs an in-memory gRPC
@@ -27,10 +29,15 @@ func TestGateway_Single(t *testing.T) {
 	defer cleanup()
 
 	cert := shared.TestingKeyPair()
-	gateway := newGateway(t, node, cert, cert)
-	defer gateway.Shutdown()
 
-	trustedCerts := func() map[db.CertificateType]map[string]x509.Certificate {
+	s := &state.State{
+		ServerCert: func() *shared.CertInfo { return cert },
+	}
+
+	gateway := newGateway(t, node, cert, s)
+	defer func() { _ = gateway.Shutdown() }()
+
+	trustedCerts := func() map[clusterDB.CertificateType]map[string]x509.Certificate {
 		return nil
 	}
 
@@ -46,6 +53,7 @@ func TestGateway_Single(t *testing.T) {
 		r.TLS = &tls.ConnectionState{
 			PeerCertificates: []*x509.Certificate{c},
 		}
+
 		f(w, r)
 		assert.Equal(t, 404, w.Code, endpoint)
 	}
@@ -86,10 +94,14 @@ func TestGateway_SingleWithNetworkAddress(t *testing.T) {
 	address := server.Listener.Addr().String()
 	setRaftRole(t, node, address)
 
-	gateway := newGateway(t, node, cert, cert)
-	defer gateway.Shutdown()
+	s := &state.State{
+		ServerCert: func() *shared.CertInfo { return cert },
+	}
 
-	trustedCerts := func() map[db.CertificateType]map[string]x509.Certificate {
+	gateway := newGateway(t, node, cert, s)
+	defer func() { _ = gateway.Shutdown() }()
+
+	trustedCerts := func() map[clusterDB.CertificateType]map[string]x509.Certificate {
 		return nil
 	}
 
@@ -127,10 +139,14 @@ func TestGateway_NetworkAuth(t *testing.T) {
 	address := server.Listener.Addr().String()
 	setRaftRole(t, node, address)
 
-	gateway := newGateway(t, node, cert, cert)
-	defer gateway.Shutdown()
+	s := &state.State{
+		ServerCert: func() *shared.CertInfo { return cert },
+	}
 
-	trustedCerts := func() map[db.CertificateType]map[string]x509.Certificate {
+	gateway := newGateway(t, node, cert, s)
+	defer func() { _ = gateway.Shutdown() }()
+
+	trustedCerts := func() map[clusterDB.CertificateType]map[string]x509.Certificate {
 		return nil
 	}
 
@@ -151,7 +167,6 @@ func TestGateway_NetworkAuth(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusForbidden, response.StatusCode)
 	}
-
 }
 
 // RaftNodes returns all nodes of the cluster.
@@ -167,8 +182,12 @@ func TestGateway_RaftNodesNotLeader(t *testing.T) {
 	address := server.Listener.Addr().String()
 	setRaftRole(t, node, address)
 
-	gateway := newGateway(t, node, cert, cert)
-	defer gateway.Shutdown()
+	s := &state.State{
+		ServerCert: func() *shared.CertInfo { return cert },
+	}
+
+	gateway := newGateway(t, node, cert, s)
+	defer func() { _ = gateway.Shutdown() }()
 
 	nodes, err := gateway.RaftNodes()
 	require.NoError(t, err)
@@ -179,11 +198,10 @@ func TestGateway_RaftNodesNotLeader(t *testing.T) {
 }
 
 // Create a new test Gateway with the given parameters, and ensure no error happens.
-func newGateway(t *testing.T, node *db.Node, networkCert *shared.CertInfo, serverCert *shared.CertInfo) *cluster.Gateway {
-	logging.Testing(t)
+func newGateway(t *testing.T, node *db.Node, networkCert *shared.CertInfo, s *state.State) *cluster.Gateway {
 	require.NoError(t, os.Mkdir(filepath.Join(node.Dir(), "global"), 0755))
-	serverCertFunc := func() *shared.CertInfo { return serverCert }
-	gateway, err := cluster.NewGateway(context.Background(), node, networkCert, serverCertFunc, cluster.Latency(0.2), cluster.LogLevel("TRACE"))
+	stateFunc := func() *state.State { return s }
+	gateway, err := cluster.NewGateway(context.Background(), node, networkCert, stateFunc, cluster.Latency(0.2), cluster.LogLevel("TRACE"))
 	require.NoError(t, err)
 	return gateway
 }

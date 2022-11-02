@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/lxc/lxd/lxd/revert"
+	"github.com/lxc/lxd/shared/logger"
 )
 
 // Server represents a BGP server instance.
@@ -40,6 +41,7 @@ type peer struct {
 	address  net.IP
 	asn      uint32
 	password string
+	holdtime uint64
 	count    int
 }
 
@@ -50,6 +52,7 @@ func NewServer() *Server {
 		paths: map[string]path{},
 		peers: map[string]peer{},
 	}
+
 	return s
 }
 
@@ -69,7 +72,8 @@ func (s *Server) setup() {
 		s.paths = map[string]path{}
 
 		for _, path := range paths {
-			s.addPrefix(path.prefix, path.nexthop, path.owner)
+			err := s.addPrefix(path.prefix, path.nexthop, path.owner)
+			logger.Warn("Unable to add prefix to BGP server", logger.Ctx{"prefix": path.prefix.String(), "err": err})
 		}
 	}
 }
@@ -129,7 +133,7 @@ func (s *Server) start(address string, asn uint32, routerID net.IP) error {
 
 	// Add any existing peers.
 	for _, peer := range s.peers {
-		err := s.addPeer(peer.address, peer.asn, peer.password)
+		err := s.addPeer(peer.address, peer.asn, peer.password, peer.holdtime)
 		if err != nil {
 			return err
 		}
@@ -214,7 +218,7 @@ func (s *Server) reconfigure(address string, asn uint32, routerID net.IP) error 
 	// Check if we should start.
 	if address != "" && asn > 0 && routerID != nil {
 		// Restore old address on failure.
-		revert.Add(func() { s.start(oldAddress, oldASN, oldRouterID) })
+		revert.Add(func() { _ = s.start(oldAddress, oldASN, oldRouterID) })
 
 		// Start the listener with the new address.
 		err = s.start(address, asn, routerID)
@@ -386,15 +390,15 @@ func (s *Server) removePrefixByUUID(pathUUID string) error {
 }
 
 // AddPeer adds a new BGP peer.
-func (s *Server) AddPeer(address net.IP, asn uint32, password string) error {
+func (s *Server) AddPeer(address net.IP, asn uint32, password string, holdTime uint64) error {
 	// Locking.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.addPeer(address, asn, password)
+	return s.addPeer(address, asn, password, holdTime)
 }
 
-func (s *Server) addPeer(address net.IP, asn uint32, password string) error {
+func (s *Server) addPeer(address net.IP, asn uint32, password string, holdTime uint64) error {
 	// Look for an existing peer.
 	bgpPeer, bgpPeerExists := s.peers[address.String()]
 	if bgpPeerExists {
@@ -426,6 +430,21 @@ func (s *Server) addPeer(address net.IP, asn uint32, password string) error {
 			Enabled:     true,
 			RestartTime: 120,
 		},
+
+		// Always allow for the maximum multihop.
+		EbgpMultihop: &bgpAPI.EbgpMultihop{
+			Enabled:     true,
+			MultihopTtl: 255,
+		},
+	}
+
+	// Add hold time if configured.
+	if holdTime > 0 {
+		n.Timers = &bgpAPI.Timers{
+			Config: &bgpAPI.TimersConfig{
+				HoldTime: holdTime,
+			},
+		}
 	}
 
 	// Setup peer for dual-stack.
@@ -469,6 +488,7 @@ func (s *Server) addPeer(address net.IP, asn uint32, password string) error {
 			address:  address,
 			asn:      asn,
 			password: password,
+			holdtime: holdTime,
 			count:    1,
 		}
 	}

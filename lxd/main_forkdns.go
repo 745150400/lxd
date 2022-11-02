@@ -18,7 +18,6 @@ import (
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/dnsutil"
 	"github.com/lxc/lxd/shared/logger"
-	"github.com/lxc/lxd/shared/logging"
 )
 
 type cmdForkDNS struct {
@@ -48,11 +47,13 @@ func serversFileMonitor(watcher *fsnotify.Watcher, networkName string) {
 			if !strings.HasSuffix(ev.Name, network.ForkdnsServersListPath+"/"+network.ForkdnsServersListFile) {
 				continue
 			}
+
 			err := loadServersList(networkName)
 			if err != nil {
 				logger.Errorf("Server list load error: %v", err)
 				continue
 			}
+
 		case err := <-watcher.Errors:
 			logger.Errorf("Inotify error: %v", err)
 		}
@@ -196,7 +197,8 @@ func (h *dnsHandler) getLeaseHostByReverseIPName(reverseName string) (string, er
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -208,7 +210,9 @@ func (h *dnsHandler) getLeaseHostByReverseIPName(reverseName string) (string, er
 			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
+
+	err = scanner.Err()
+	if err != nil {
 		return "", err
 	}
 
@@ -284,7 +288,7 @@ func (h *dnsHandler) handleA(r *dns.Msg) (dns.Msg, error) {
 	return msg, nil
 }
 
-// getLeaseHostByDNSName finds the hostname used in the DHCP lease by supplying a DNS A name
+// getLeaseHostByDNSName finds the hostname used in the DHCP lease by supplying a DNS A name.
 func (h *dnsHandler) getLeaseHostByDNSName(dnsName string) (string, error) {
 	host := strings.TrimSuffix(dnsName, fmt.Sprintf(".%s.", h.domain))
 
@@ -292,7 +296,8 @@ func (h *dnsHandler) getLeaseHostByDNSName(dnsName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -304,7 +309,9 @@ func (h *dnsHandler) getLeaseHostByDNSName(dnsName string) (string, error) {
 			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
+
+	err = scanner.Err()
+	if err != nil {
 		return "", err
 	}
 
@@ -336,7 +343,7 @@ func (c *cmdForkDNS) Command() *cobra.Command {
 func (c *cmdForkDNS) Run(cmd *cobra.Command, args []string) error {
 	// Quick checks.
 	if len(args) < 3 {
-		cmd.Help()
+		_ = cmd.Help()
 
 		if len(args) == 0 {
 			return nil
@@ -345,11 +352,10 @@ func (c *cmdForkDNS) Run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Missing required arguments")
 	}
 
-	log, err := logging.GetLogger("lxd-forkdns", "", c.global.flagLogVerbose, c.global.flagLogDebug, nil)
+	err := logger.InitLogger("", "lxd-forkdns", c.global.flagLogVerbose, c.global.flagLogDebug, nil)
 	if err != nil {
 		return err
 	}
-	logger.Log = log
 
 	// Setup watcher on servers file.
 	watcher, err := fsnotify.NewWatcher()

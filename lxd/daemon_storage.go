@@ -1,8 +1,8 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,8 +21,8 @@ func daemonStorageVolumesUnmount(s *state.State) error {
 	var storageBackups string
 	var storageImages string
 
-	err := s.Node.Transaction(func(tx *db.NodeTx) error {
-		nodeConfig, err := node.ConfigLoad(tx)
+	err := s.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		nodeConfig, err := node.ConfigLoad(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -43,7 +43,7 @@ func daemonStorageVolumesUnmount(s *state.State) error {
 			return err
 		}
 
-		pool, err := storagePools.GetPoolByName(s, poolName)
+		pool, err := storagePools.LoadByName(s, poolName)
 		if err != nil {
 			return err
 		}
@@ -77,8 +77,8 @@ func daemonStorageVolumesUnmount(s *state.State) error {
 func daemonStorageMount(s *state.State) error {
 	var storageBackups string
 	var storageImages string
-	err := s.Node.Transaction(func(tx *db.NodeTx) error {
-		nodeConfig, err := node.ConfigLoad(tx)
+	err := s.DB.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		nodeConfig, err := node.ConfigLoad(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -99,7 +99,7 @@ func daemonStorageMount(s *state.State) error {
 			return err
 		}
 
-		pool, err := storagePools.GetPoolByName(s, poolName)
+		pool, err := storagePools.LoadByName(s, poolName)
 		if err != nil {
 			return err
 		}
@@ -154,18 +154,21 @@ func daemonStorageValidate(s *state.State, target string) error {
 	}
 
 	// Validate pool exists.
-	poolID, _, _, err := s.Cluster.GetStoragePool(poolName)
+	poolID, _, _, err := s.DB.Cluster.GetStoragePool(poolName)
 	if err != nil {
 		return fmt.Errorf("Unable to load storage pool %q: %w", poolName, err)
 	}
 
 	// Confirm volume exists.
-	_, _, err = s.Cluster.GetLocalStoragePoolVolume(project.Default, volumeName, db.StoragePoolVolumeTypeCustom, poolID)
+	err = s.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		_, err = tx.GetStoragePoolVolume(ctx, poolID, project.Default, db.StoragePoolVolumeTypeCustom, volumeName, true)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("Unable to load storage volume %q: %w", target, err)
 	}
 
-	snapshots, err := s.Cluster.GetLocalStoragePoolVolumeSnapshotsWithType(project.Default, volumeName, db.StoragePoolVolumeTypeCustom, poolID)
+	snapshots, err := s.DB.Cluster.GetLocalStoragePoolVolumeSnapshotsWithType(project.Default, volumeName, db.StoragePoolVolumeTypeCustom, poolID)
 	if err != nil {
 		return fmt.Errorf("Unable to load storage volume snapshots %q: %w", target, err)
 	}
@@ -174,7 +177,7 @@ func daemonStorageValidate(s *state.State, target string) error {
 		return fmt.Errorf("Storage volumes for use by LXD itself cannot have snapshots")
 	}
 
-	pool, err := storagePools.GetPoolByName(s, poolName)
+	pool, err := storagePools.LoadByName(s, poolName)
 	if err != nil {
 		return err
 	}
@@ -184,13 +187,14 @@ func daemonStorageValidate(s *state.State, target string) error {
 	if err != nil {
 		return fmt.Errorf("Failed to mount storage volume %q: %w", target, err)
 	}
-	defer pool.UnmountCustomVolume(project.Default, volumeName, nil)
+
+	defer func() { _, _ = pool.UnmountCustomVolume(project.Default, volumeName, nil) }()
 
 	// Validate volume is empty (ignore lost+found).
 	volStorageName := project.StorageVolume(project.Default, volumeName)
 	mountpoint := storageDrivers.GetVolumeMountPath(poolName, storageDrivers.VolumeTypeCustom, volStorageName)
 
-	entries, err := ioutil.ReadDir(mountpoint)
+	entries, err := os.ReadDir(mountpoint)
 	if err != nil {
 		return fmt.Errorf("Failed to list %q: %w", mountpoint, err)
 	}
@@ -238,7 +242,7 @@ func daemonStorageMove(s *state.State, storageType string, target string) error 
 		}
 
 		// Remove the source content.
-		entries, err := ioutil.ReadDir(source)
+		entries, err := os.ReadDir(source)
 		if err != nil {
 			return err
 		}
@@ -278,7 +282,7 @@ func daemonStorageMove(s *state.State, storageType string, target string) error 
 			return fmt.Errorf("Failed to move data over to directory %q: %w", destPath, err)
 		}
 
-		pool, err := storagePools.GetPoolByName(s, sourcePool)
+		pool, err := storagePools.LoadByName(s, sourcePool)
 		if err != nil {
 			return err
 		}
@@ -299,7 +303,7 @@ func daemonStorageMove(s *state.State, storageType string, target string) error 
 		return err
 	}
 
-	pool, err := storagePools.GetPoolByName(s, poolName)
+	pool, err := storagePools.LoadByName(s, poolName)
 	if err != nil {
 		return err
 	}
@@ -345,7 +349,7 @@ func daemonStorageMove(s *state.State, storageType string, target string) error 
 			return fmt.Errorf("Failed to move data over to directory %q: %w", destPath, err)
 		}
 
-		pool, err := storagePools.GetPoolByName(s, sourcePool)
+		pool, err := storagePools.LoadByName(s, sourcePool)
 		if err != nil {
 			return err
 		}

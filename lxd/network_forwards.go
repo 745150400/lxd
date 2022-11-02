@@ -130,14 +130,24 @@ var networkForwardCmd = APIEndpoint{
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func networkForwardsGet(d *Daemon, r *http.Request) response.Response {
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, reqProject, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	n, err := network.LoadByName(d.State(), projectName, mux.Vars(r)["networkName"])
+	networkName, err := url.PathUnescape(mux.Vars(r)["networkName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	n, err := network.LoadByName(d.State(), projectName, networkName)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+	}
+
+	// Check if project allows access to network.
+	if !project.NetworkAllowed(reqProject.Config, networkName, n.IsManaged()) {
+		return response.SmartError(api.StatusErrorf(http.StatusNotFound, "Network not found"))
 	}
 
 	if !n.Info().AddressForwards {
@@ -147,7 +157,7 @@ func networkForwardsGet(d *Daemon, r *http.Request) response.Response {
 	memberSpecific := false // Get forwards for all cluster members.
 
 	if util.IsRecursionRequest(r) {
-		records, err := d.State().Cluster.GetNetworkForwards(n.ID(), memberSpecific)
+		records, err := d.State().DB.Cluster.GetNetworkForwards(r.Context(), n.ID(), memberSpecific)
 		if err != nil {
 			return response.SmartError(fmt.Errorf("Failed loading network forwards: %w", err))
 		}
@@ -160,7 +170,7 @@ func networkForwardsGet(d *Daemon, r *http.Request) response.Response {
 		return response.SyncResponse(true, forwards)
 	}
 
-	listenAddresses, err := d.State().Cluster.GetNetworkForwardListenAddresses(n.ID(), memberSpecific)
+	listenAddresses, err := d.State().DB.Cluster.GetNetworkForwardListenAddresses(n.ID(), memberSpecific)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network forwards: %w", err))
 	}
@@ -211,7 +221,7 @@ func networkForwardsPost(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, reqProject, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -225,9 +235,19 @@ func networkForwardsPost(d *Daemon, r *http.Request) response.Response {
 
 	req.Normalise() // So we handle the request in normalised/canonical form.
 
-	n, err := network.LoadByName(d.State(), projectName, mux.Vars(r)["networkName"])
+	networkName, err := url.PathUnescape(mux.Vars(r)["networkName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	n, err := network.LoadByName(d.State(), projectName, networkName)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+	}
+
+	// Check if project allows access to network.
+	if !project.NetworkAllowed(reqProject.Config, networkName, n.IsManaged()) {
+		return response.SmartError(api.StatusErrorf(http.StatusNotFound, "Network not found"))
 	}
 
 	if !n.Info().AddressForwards {
@@ -241,10 +261,10 @@ func networkForwardsPost(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(fmt.Errorf("Failed creating forward: %w", err))
 	}
 
-	d.State().Events.SendLifecycle(projectName, lifecycle.NetworkForwardCreated.Event(n, req.ListenAddress, request.CreateRequestor(r), nil))
+	lc := lifecycle.NetworkForwardCreated.Event(n, req.ListenAddress, request.CreateRequestor(r), nil)
+	d.State().Events.SendLifecycle(projectName, lc)
 
-	url := fmt.Sprintf("/%s/networks/%s/forwards/%s", version.APIVersion, url.PathEscape(n.Name()), url.PathEscape(req.ListenAddress))
-	return response.SyncResponseLocation(true, nil, url)
+	return response.SyncResponseLocation(true, nil, lc.Source)
 }
 
 // swagger:operation DELETE /1.0/networks/{networkName}/forwards/{listenAddress} network-forwards network_forward_delete
@@ -277,21 +297,34 @@ func networkForwardDelete(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, reqProject, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	n, err := network.LoadByName(d.State(), projectName, mux.Vars(r)["networkName"])
+	networkName, err := url.PathUnescape(mux.Vars(r)["networkName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	n, err := network.LoadByName(d.State(), projectName, networkName)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+	}
+
+	// Check if project allows access to network.
+	if !project.NetworkAllowed(reqProject.Config, networkName, n.IsManaged()) {
+		return response.SmartError(api.StatusErrorf(http.StatusNotFound, "Network not found"))
 	}
 
 	if !n.Info().AddressForwards {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support forwards", n.Type()))
 	}
 
-	listenAddress := mux.Vars(r)["listenAddress"]
+	listenAddress, err := url.PathUnescape(mux.Vars(r)["listenAddress"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	clientType := clusterRequest.UserAgentClientType(r.Header.Get("User-Agent"))
 
@@ -351,25 +384,39 @@ func networkForwardGet(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, reqProject, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	n, err := network.LoadByName(d.State(), projectName, mux.Vars(r)["networkName"])
+	networkName, err := url.PathUnescape(mux.Vars(r)["networkName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	n, err := network.LoadByName(d.State(), projectName, networkName)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+	}
+
+	// Check if project allows access to network.
+	if !project.NetworkAllowed(reqProject.Config, networkName, n.IsManaged()) {
+		return response.SmartError(api.StatusErrorf(http.StatusNotFound, "Network not found"))
 	}
 
 	if !n.Info().AddressForwards {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support forwards", n.Type()))
 	}
 
-	listenAddress := mux.Vars(r)["listenAddress"]
+	listenAddress, err := url.PathUnescape(mux.Vars(r)["listenAddress"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	targetMember := queryParam(r, "target")
 	memberSpecific := targetMember != ""
 
-	_, forward, err := d.State().Cluster.GetNetworkForward(n.ID(), memberSpecific, listenAddress)
+	_, forward, err := d.State().DB.Cluster.GetNetworkForward(r.Context(), n.ID(), memberSpecific, listenAddress)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -452,21 +499,34 @@ func networkForwardPut(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	projectName, _, err := project.NetworkProject(d.State().Cluster, projectParam(r))
+	projectName, reqProject, err := project.NetworkProject(d.State().DB.Cluster, projectParam(r))
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	n, err := network.LoadByName(d.State(), projectName, mux.Vars(r)["networkName"])
+	networkName, err := url.PathUnescape(mux.Vars(r)["networkName"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	n, err := network.LoadByName(d.State(), projectName, networkName)
 	if err != nil {
 		return response.SmartError(fmt.Errorf("Failed loading network: %w", err))
+	}
+
+	// Check if project allows access to network.
+	if !project.NetworkAllowed(reqProject.Config, networkName, n.IsManaged()) {
+		return response.SmartError(api.StatusErrorf(http.StatusNotFound, "Network not found"))
 	}
 
 	if !n.Info().AddressForwards {
 		return response.BadRequest(fmt.Errorf("Network driver %q does not support forwards", n.Type()))
 	}
 
-	listenAddress := mux.Vars(r)["listenAddress"]
+	listenAddress, err := url.PathUnescape(mux.Vars(r)["listenAddress"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	// Decode the request.
 	req := api.NetworkForwardPut{}
@@ -479,9 +539,18 @@ func networkForwardPut(d *Daemon, r *http.Request) response.Response {
 	memberSpecific := targetMember != ""
 
 	if r.Method == http.MethodPatch {
-		_, forward, err := d.State().Cluster.GetNetworkForward(n.ID(), memberSpecific, listenAddress)
+		_, forward, err := d.State().DB.Cluster.GetNetworkForward(r.Context(), n.ID(), memberSpecific, listenAddress)
 		if err != nil {
 			return response.SmartError(err)
+		}
+
+		// If config being updated via "patch" method, then merge all existing config with the keys that
+		// are present in the request config.
+		for k, v := range forward.Config {
+			_, ok := req.Config[k]
+			if !ok {
+				req.Config[k] = v
+			}
 		}
 
 		// If forward being updated via "patch" method and ports not specified, then merge existing ports

@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/lxc/lxd/lxd/db"
@@ -12,8 +13,8 @@ import (
 // the given node is the local one.
 func ResolveTarget(cluster *db.Cluster, target string) (string, error) {
 	address := ""
-	err := cluster.Transaction(func(tx *db.ClusterTx) error {
-		name, err := tx.GetLocalNodeName()
+	err := cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		name, err := tx.GetLocalNodeName(ctx)
 		if err != nil {
 			return err
 		}
@@ -22,7 +23,7 @@ func ResolveTarget(cluster *db.Cluster, target string) (string, error) {
 			return nil
 		}
 
-		node, err := tx.GetNodeByName(target)
+		node, err := tx.GetNodeByName(ctx, target)
 		if err != nil {
 			if response.IsNotFoundError(err) {
 				return fmt.Errorf("No cluster member called '%s'", target)

@@ -1,5 +1,4 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db
 
@@ -8,7 +7,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,7 +16,6 @@ import (
 	"time"
 
 	"github.com/canonical/go-dqlite/driver"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/lxd/db/cluster"
 	"github.com/lxc/lxd/lxd/db/node"
@@ -26,6 +23,12 @@ import (
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
 )
+
+// DB represents access to LXD's global and local databases.
+type DB struct {
+	Node    *Node
+	Cluster *Cluster
+}
 
 // Node mediates access to LXD's data stored in the node-local SQLite database.
 type Node struct {
@@ -38,42 +41,19 @@ type Node struct {
 // The fresh hook parameter is used by the daemon to mark all known patch names
 // as applied when a brand new database is created.
 //
-// The legacyPatches parameter is used as a mean to apply the legacy V10, V11,
-// V15, V29 and V30 non-db updates during the database upgrade sequence, to
-// avoid any change in semantics wrt the old logic (see PR #3322).
-//
-// Return the newly created Node object, and a Dump of the pre-clustering data
-// if we've migrating to a cluster-aware version.
-func OpenNode(dir string, fresh func(*Node) error, legacyPatches map[int]*LegacyPatch) (*Node, *Dump, error) {
-	// When updating the node database schema we'll detect if we're
-	// transitioning to the dqlite-based database and dump all the data
-	// before purging the schema. This data will be then imported by the
-	// daemon into the dqlite database.
-	var dump *Dump
-
+// Return the newly created Node object.
+func OpenNode(dir string, fresh func(*Node) error) (*Node, error) {
 	db, err := node.Open(dir)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	legacyHook := legacyPatchHook(legacyPatches)
-	hook := func(version int, tx *sql.Tx) error {
-		if version == node.UpdateFromPreClustering {
-			logger.Debug("Loading pre-clustering sqlite data")
-			var err error
-			dump, err = LoadPreClusteringData(tx)
-			if err != nil {
-				return err
-			}
-		}
-		return legacyHook(version, tx)
-	}
-	initial, err := node.EnsureSchema(db, dir, hook)
+	initial, err := node.EnsureSchema(db, dir)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	node := &Node{
@@ -85,18 +65,17 @@ func OpenNode(dir string, fresh func(*Node) error, legacyPatches map[int]*Legacy
 		if fresh != nil {
 			err := fresh(node)
 			if err != nil {
-				return nil, nil, err
+				return nil, err
 			}
 		}
 	}
 
-	return node, dump, nil
+	return node, nil
 }
 
-// ForLegacyPatches is a aid for the hack in initializeDbObject, which sets
-// the db-related Deamon attributes upfront, to be backward compatible with the
-// legacy patches that need to interact with the database.
-func ForLegacyPatches(db *sql.DB) *Node {
+// DirectAccess is a bit of a hack which allows getting a database Node struct from any standard Go sql.DB.
+// This is primarily used to access the "db.bin" read-only copy of the database during startup.
+func DirectAccess(db *sql.DB) *Node {
 	return &Node{db: db}
 }
 
@@ -118,11 +97,11 @@ func (n *Node) Dir() string {
 // node-level database interactions invoked by the given function. If the
 // function returns no error, all database changes are committed to the
 // node-level database, otherwise they are rolled back.
-func (n *Node) Transaction(f func(*NodeTx) error) error {
+func (n *Node) Transaction(ctx context.Context, f func(context.Context, *NodeTx) error) error {
 	nodeTx := &NodeTx{}
-	return query.Transaction(n.db, func(tx *sql.Tx) error {
+	return query.Transaction(ctx, n.db, func(ctx context.Context, tx *sql.Tx) error {
 		nodeTx.tx = tx
-		return f(nodeTx)
+		return f(ctx, nodeTx)
 	})
 }
 
@@ -131,17 +110,11 @@ func (n *Node) Close() error {
 	return n.db.Close()
 }
 
-// Begin a new transaction against the local database. Legacy method.
-func (n *Node) Begin() (*sql.Tx, error) {
-	return begin(n.db)
-}
-
 // Cluster mediates access to LXD's data stored in the cluster dqlite database.
 type Cluster struct {
 	db         *sql.DB // Handle to the cluster dqlite database, gated behind gRPC SQL.
 	nodeID     int64   // Node ID of this LXD instance.
 	mu         sync.RWMutex
-	stmts      map[int]*sql.Stmt // Prepared statements by code.
 	closingCtx context.Context
 }
 
@@ -190,7 +163,7 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 		pingCtx, pingCancel := context.WithTimeout(connectCtx, time.Second*5)
 		err = db.PingContext(pingCtx)
 		pingCancel()
-		logCtx := log.Ctx{"err": err, "attempt": i}
+		logCtx := logger.Ctx{"err": err, "attempt": i}
 		if err != nil && !errors.Is(err, driver.ErrNoAvailableLeader) {
 			return nil, err
 		} else if err == nil {
@@ -221,7 +194,7 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 
 	if dump != nil {
 		logger.Infof("Migrating data from local to global database")
-		err := query.Transaction(db, func(tx *sql.Tx) error {
+		err := query.Transaction(context.TODO(), db, func(ctx context.Context, tx *sql.Tx) error {
 			return importPreClusteringData(tx, dump)
 		})
 		if err != nil {
@@ -233,6 +206,7 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 				// Ignore errors here, there's not much we can do
 				logger.Errorf("Failed to restore local database: %v", copyErr)
 			}
+
 			rmErr := os.RemoveAll(filepath.Join(dir, "global"))
 			if rmErr != nil {
 				// Ignore errors here, there's not much we can do
@@ -251,7 +225,6 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 	if !nodesVersionsMatch {
 		cluster := &Cluster{
 			db:         db,
-			stmts:      map[int]*sql.Stmt{},
 			closingCtx: closingCtx,
 		}
 
@@ -263,41 +236,42 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 		return nil, fmt.Errorf("Failed to prepare statements: %w", err)
 	}
 
-	cluster := &Cluster{
+	cluster.PreparedStmts = stmts
+
+	clusterDB := &Cluster{
 		db:         db,
-		stmts:      stmts,
 		closingCtx: closingCtx,
 	}
 
-	err = cluster.Transaction(func(tx *ClusterTx) error {
+	err = clusterDB.Transaction(context.TODO(), func(ctx context.Context, tx *ClusterTx) error {
 		// Figure out the ID of this node.
-		nodes, err := tx.GetNodes()
+		members, err := tx.GetNodes(ctx)
 		if err != nil {
-			return fmt.Errorf("Failed to fetch nodes: %w", err)
+			return fmt.Errorf("Failed getting cluster members: %w", err)
 		}
 
-		nodeID := int64(-1)
-		if len(nodes) == 1 && nodes[0].Address == "0.0.0.0" {
+		memberID := int64(-1)
+		if len(members) == 1 && members[0].Address == "0.0.0.0" {
 			// We're not clustered
-			nodeID = 1
+			memberID = 1
 		} else {
-			for _, node := range nodes {
-				if node.Address == address {
-					nodeID = node.ID
+			for _, member := range members {
+				if member.Address == address {
+					memberID = member.ID
 					break
 				}
 			}
 		}
 
-		if nodeID < 0 {
+		if memberID < 0 {
 			return fmt.Errorf("No node registered with address %s", address)
 		}
 
-		// Set the local node ID
-		cluster.NodeID(nodeID)
+		// Set the local member ID
+		clusterDB.NodeID(memberID)
 
-		// Delete any operation tied to this node
-		err = tx.DeleteOperations(nodeID)
+		// Delete any operation tied to this member
+		err = cluster.DeleteOperations(ctx, tx.tx, memberID)
 		if err != nil {
 			return err
 		}
@@ -308,7 +282,7 @@ func OpenCluster(closingCtx context.Context, name string, store driver.NodeStore
 		return nil, err
 	}
 
-	return cluster, err
+	return clusterDB, err
 }
 
 // ErrSomeNodesAreBehind is returned by OpenCluster if some of the nodes in the
@@ -335,12 +309,12 @@ func ForLocalInspectionWithPreparedStmts(db *sql.DB) (*Cluster, error) {
 		return nil, fmt.Errorf("Prepare database statements: %w", err)
 	}
 
-	c.stmts = stmts
+	cluster.PreparedStmts = stmts
 
 	return c, nil
 }
 
-// GetNodeID returns the current nodeID (0 if not set)
+// GetNodeID returns the current nodeID (0 if not set).
 func (c *Cluster) GetNodeID() int64 {
 	return c.nodeID
 }
@@ -352,10 +326,10 @@ func (c *Cluster) GetNodeID() int64 {
 //
 // If EnterExclusive has been called before, calling Transaction will block
 // until ExitExclusive has been called as well to release the lock.
-func (c *Cluster) Transaction(f func(*ClusterTx) error) error {
+func (c *Cluster) Transaction(ctx context.Context, f func(context.Context, *ClusterTx) error) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.transaction(f)
+	return c.transaction(ctx, f)
 }
 
 // EnterExclusive acquires a lock on the cluster db, so any successive call to
@@ -380,31 +354,30 @@ func (c *Cluster) EnterExclusive() error {
 
 // ExitExclusive runs the given transaction and then releases the lock acquired
 // with EnterExclusive.
-func (c *Cluster) ExitExclusive(f func(*ClusterTx) error) error {
+func (c *Cluster) ExitExclusive(ctx context.Context, f func(context.Context, *ClusterTx) error) error {
 	logger.Debug("Releasing exclusive lock on cluster db")
 	defer c.mu.Unlock()
-	return c.transaction(f)
+	return c.transaction(ctx, f)
 }
 
-func (c *Cluster) transaction(f func(*ClusterTx) error) error {
+func (c *Cluster) transaction(ctx context.Context, f func(context.Context, *ClusterTx) error) error {
 	clusterTx := &ClusterTx{
 		nodeID: c.nodeID,
-		stmts:  c.stmts,
 	}
 
 	return c.retry(func() error {
-		txFunc := func(tx *sql.Tx) error {
+		txFunc := func(ctx context.Context, tx *sql.Tx) error {
 			clusterTx.tx = tx
-			return f(clusterTx)
+			return f(ctx, clusterTx)
 		}
 
-		err := query.Transaction(c.db, txFunc)
+		err := query.Transaction(ctx, c.db, txFunc)
 		if errors.Is(err, context.DeadlineExceeded) {
 			// If the query timed out it likely means that the leader has abruptly become unreachable.
 			// Now that this query has been cancelled, a leader election should have taken place by now.
 			// So let's retry the transaction once more in case the global database is now available again.
-			logger.Warn("Transaction timed out. Retrying once", log.Ctx{"member": c.nodeID, "err": err})
-			return query.Transaction(c.db, txFunc)
+			logger.Warn("Transaction timed out. Retrying once", logger.Ctx{"member": c.nodeID, "err": err})
+			return query.Transaction(ctx, c.db, txFunc)
 		}
 
 		return err
@@ -429,9 +402,10 @@ func (c *Cluster) NodeID(id int64) {
 
 // Close the database facade.
 func (c *Cluster) Close() error {
-	for _, stmt := range c.stmts {
-		stmt.Close()
+	for _, stmt := range cluster.PreparedStmts {
+		_ = stmt.Close()
 	}
+
 	return c.db.Close()
 }
 
@@ -456,10 +430,12 @@ func begin(db *sql.DB) (*sql.Tx, error) {
 		if err == nil {
 			return tx, nil
 		}
+
 		if !query.IsRetriableError(err) {
 			logger.Debugf("DbBegin: error %q", err)
 			return nil, err
 		}
+
 		time.Sleep(30 * time.Millisecond)
 	}
 
@@ -474,6 +450,7 @@ func TxCommit(tx *sql.Tx) error {
 	if err == nil || err == sql.ErrTxDone { // Ignore duplicate commits/rollbacks
 		return nil
 	}
+
 	return err
 }
 
@@ -484,7 +461,8 @@ func DqliteLatestSegment() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("Unable to open directory %s with error %v", dir, err)
 	}
-	defer file.Close()
+
+	defer func() { _ = file.Close() }()
 
 	fileNames, err := file.Readdirnames(0)
 	if err != nil {
@@ -519,27 +497,28 @@ func DqliteLatestSegment() (string, error) {
 	return "none", nil
 }
 
-func dbQueryRowScan(c *Cluster, q string, args []interface{}, outargs []interface{}) error {
+func dbQueryRowScan(c *Cluster, q string, args []any, outargs []any) error {
 	return c.retry(func() error {
-		return query.Transaction(c.db, func(tx *sql.Tx) error {
-			return tx.QueryRow(q, args...).Scan(outargs...)
+		return query.Transaction(context.TODO(), c.db, func(ctx context.Context, tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, q, args...).Scan(outargs...)
 		})
 	})
 }
 
-func doDbQueryScan(c *Cluster, q string, args []interface{}, outargs []interface{}) ([][]interface{}, error) {
-	result := [][]interface{}{}
+func doDbScan(c *Cluster, q string, args []any, outargs []any) ([][]any, error) {
+	result := [][]any{}
 
 	err := c.retry(func() error {
-		return query.Transaction(c.db, func(tx *sql.Tx) error {
-			rows, err := tx.Query(q, args...)
+		return query.Transaction(context.TODO(), c.db, func(ctx context.Context, tx *sql.Tx) error {
+			rows, err := tx.QueryContext(ctx, q, args...)
 			if err != nil {
 				return err
 			}
-			defer rows.Close()
+
+			defer func() { _ = rows.Close() }()
 
 			for rows.Next() {
-				ptrargs := make([]interface{}, len(outargs))
+				ptrargs := make([]any, len(outargs))
 				for i := range outargs {
 					switch t := outargs[i].(type) {
 					case string:
@@ -562,7 +541,8 @@ func doDbQueryScan(c *Cluster, q string, args []interface{}, outargs []interface
 				if err != nil {
 					return err
 				}
-				newargs := make([]interface{}, len(outargs))
+
+				newargs := make([]any, len(outargs))
 				for i := range ptrargs {
 					switch t := outargs[i].(type) {
 					case string:
@@ -579,19 +559,20 @@ func doDbQueryScan(c *Cluster, q string, args []interface{}, outargs []interface
 				}
 				result = append(result, newargs)
 			}
+
 			err = rows.Err()
 			if err != nil {
 				return err
 			}
+
 			return nil
 		})
 	})
 	if err != nil {
-		return [][]interface{}{}, err
+		return [][]any{}, err
 	}
 
 	return result, nil
-
 }
 
 /*
@@ -602,44 +583,21 @@ func doDbQueryScan(c *Cluster, q string, args []interface{}, outargs []interface
  *   arguments, i.e.
  *      var arg1 string
  *      var arg2 int
- *      outfmt := {}interface{}{arg1, arg2}
+ *      outfmt := {}any{arg1, arg2}
  *
  * The result will be an array (one per output row) of arrays (one per output argument)
  * of interfaces, containing pointers to the actual output arguments.
  */
-func queryScan(c *Cluster, q string, inargs []interface{}, outfmt []interface{}) ([][]interface{}, error) {
-	return doDbQueryScan(c, q, inargs, outfmt)
+func queryScan(c *Cluster, q string, inargs []any, outfmt []any) ([][]any, error) {
+	return doDbScan(c, q, inargs, outfmt)
 }
 
-func exec(c *Cluster, q string, args ...interface{}) error {
+func exec(c *Cluster, q string, args ...any) error {
 	err := c.retry(func() error {
-		return query.Transaction(c.db, func(tx *sql.Tx) error {
+		return query.Transaction(context.TODO(), c.db, func(ctx context.Context, tx *sql.Tx) error {
 			_, err := tx.Exec(q, args...)
 			return err
 		})
 	})
 	return err
-}
-
-// urlsToResourceNames returns a list of resource names extracted from one or more URLs of the same resource type.
-// The resource type path prefix to match is provided by the matchPathPrefix argument.
-// TODO: Duplicated method from client/util.go. Remove with decoupling of URL generation from db package.
-func urlsToResourceNames(matchPathPrefix string, urls ...string) ([]string, error) {
-	resourceNames := make([]string, 0, len(urls))
-
-	for _, urlRaw := range urls {
-		u, err := url.Parse(urlRaw)
-		if err != nil {
-			return nil, fmt.Errorf("Failed parsing URL %q: %w", urlRaw, err)
-		}
-
-		fields := strings.Split(u.Path, fmt.Sprintf("%s/", matchPathPrefix))
-		if len(fields) != 2 {
-			return nil, fmt.Errorf("Unexpected URL path %q", u)
-		}
-
-		resourceNames = append(resourceNames, fields[len(fields)-1])
-	}
-
-	return resourceNames, nil
 }

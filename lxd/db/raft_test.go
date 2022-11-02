@@ -1,9 +1,9 @@
 //go:build linux && cgo && !agent
-// +build linux,cgo,!agent
 
 package db_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/canonical/go-dqlite/client"
@@ -25,7 +25,7 @@ func TestRaftNodes(t *testing.T) {
 	id2, err := tx.CreateRaftNode("5.6.7.8:666", "test")
 	require.NoError(t, err)
 
-	nodes, err := tx.GetRaftNodes()
+	nodes, err := tx.GetRaftNodes(context.Background())
 	require.NoError(t, err)
 
 	assert.Equal(t, uint64(id1), nodes[0].ID)
@@ -45,7 +45,7 @@ func TestGetRaftNodeAddresses(t *testing.T) {
 	_, err = tx.CreateRaftNode("5.6.7.8:666", "test")
 	require.NoError(t, err)
 
-	addresses, err := tx.GetRaftNodeAddresses()
+	addresses, err := tx.GetRaftNodeAddresses(context.Background())
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"1.2.3.4:666", "5.6.7.8:666"}, addresses)
@@ -62,7 +62,7 @@ func TestGetRaftNodeAddress(t *testing.T) {
 	id, err := tx.CreateRaftNode("5.6.7.8:666", "test")
 	require.NoError(t, err)
 
-	address, err := tx.GetRaftNodeAddress(id)
+	address, err := tx.GetRaftNodeAddress(context.Background(), id)
 	require.NoError(t, err)
 	assert.Equal(t, "5.6.7.8:666", address)
 }
@@ -81,7 +81,7 @@ func TestCreateFirstRaftNode(t *testing.T) {
 	err = tx.CreateFirstRaftNode("5.6.7.8:666", "test")
 	assert.NoError(t, err)
 
-	address, err := tx.GetRaftNodeAddress(1)
+	address, err := tx.GetRaftNodeAddress(context.Background(), 1)
 	require.NoError(t, err)
 	assert.Equal(t, "5.6.7.8:666", address)
 }
@@ -129,10 +129,11 @@ func TestReplaceRaftNodes(t *testing.T) {
 		{NodeInfo: client.NodeInfo{ID: 2, Address: "2.2.2.2:666"}},
 		{NodeInfo: client.NodeInfo{ID: 3, Address: "3.3.3.3:666"}},
 	}
+
 	err = tx.ReplaceRaftNodes(nodes)
 	assert.NoError(t, err)
 
-	newNodes, err := tx.GetRaftNodes()
+	newNodes, err := tx.GetRaftNodes(context.Background())
 	require.NoError(t, err)
 
 	assert.Equal(t, nodes, newNodes)

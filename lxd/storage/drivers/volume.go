@@ -1,6 +1,7 @@
 package drivers
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/lxc/lxd/lxd/refcount"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/api"
 	"github.com/lxc/lxd/shared/units"
 )
 
@@ -30,6 +32,18 @@ const volIDQuotaSkip = int64(-1)
 
 // VolumeType represents a storage volume type.
 type VolumeType string
+
+// IsInstance indicates if the VolumeType represents an instance type.
+func (t VolumeType) IsInstance() bool {
+	if t == VolumeTypeContainer || t == VolumeTypeVM {
+		return true
+	}
+
+	return false
+}
+
+// VolumeTypeBucket represents a bucket storage volume.
+const VolumeTypeBucket = VolumeType("buckets")
 
 // VolumeTypeImage represents an image storage volume.
 const VolumeTypeImage = VolumeType("images")
@@ -58,6 +72,7 @@ type VolumePostHook func(vol Volume) error
 
 // BaseDirectories maps volume types to the expected directories.
 var BaseDirectories = map[VolumeType][]string{
+	VolumeTypeBucket:    {"buckets"},
 	VolumeTypeContainer: {"containers", "containers-snapshots"},
 	VolumeTypeCustom:    {"custom", "custom-snapshots"},
 	VolumeTypeImage:     {"images"},
@@ -78,7 +93,7 @@ type Volume struct {
 }
 
 // NewVolume instantiates a new Volume struct.
-func NewVolume(driver Driver, poolName string, volType VolumeType, contentType ContentType, volName string, volConfig, poolConfig map[string]string) Volume {
+func NewVolume(driver Driver, poolName string, volType VolumeType, contentType ContentType, volName string, volConfig map[string]string, poolConfig map[string]string) Volume {
 	return Volume{
 		name:        volName,
 		pool:        poolName,
@@ -181,7 +196,7 @@ func (v Volume) EnsureMountPath() error {
 	if !shared.PathExists(volPath) {
 		if v.IsSnapshot() {
 			// Create the parent directory if needed.
-			parentName, _, _ := shared.InstanceGetParentAndSnapshotName(v.name)
+			parentName, _, _ := api.GetParentAndSnapshotName(v.name)
 			err := createParentSnapshotDirIfMissing(v.pool, v.volType, parentName)
 			if err != nil {
 				return err
@@ -192,12 +207,13 @@ func (v Volume) EnsureMountPath() error {
 		if err != nil {
 			return fmt.Errorf("Failed to create mount directory %q: %w", volPath, err)
 		}
-		revert.Add(func() { os.Remove(volPath) })
+
+		revert.Add(func() { _ = os.Remove(volPath) })
 	}
 
-	// Set very restrictive mode 0100 for non-custom and non-image volumes.
+	// Set very restrictive mode 0100 for non-custom, non-bucket and non-image volumes.
 	mode := os.FileMode(0711)
-	if v.volType != VolumeTypeCustom && v.volType != VolumeTypeImage {
+	if v.volType != VolumeTypeCustom && v.volType != VolumeTypeImage && v.volType != VolumeTypeBucket {
 		mode = os.FileMode(0100)
 	}
 
@@ -230,24 +246,38 @@ func (v Volume) EnsureMountPath() error {
 func (v Volume) MountTask(task func(mountPath string, op *operations.Operation) error, op *operations.Operation) error {
 	// If the volume is a snapshot then call the snapshot specific mount/unmount functions as
 	// these will mount the snapshot read only.
-	if v.IsSnapshot() {
-		ourMount, err := v.driver.MountVolumeSnapshot(v, op)
-		if err != nil {
-			return err
-		}
+	var err error
 
-		if ourMount {
-			defer v.driver.UnmountVolumeSnapshot(v, op)
-		}
+	if v.IsSnapshot() {
+		err = v.driver.MountVolumeSnapshot(v, op)
 	} else {
-		err := v.driver.MountVolume(v, op)
-		if err != nil {
-			return err
-		}
-		defer v.driver.UnmountVolume(v, false, op)
+		err = v.driver.MountVolume(v, op)
 	}
 
-	return task(v.MountPath(), op)
+	if err != nil {
+		return err
+	}
+
+	taskErr := task(v.MountPath(), op)
+
+	// Try and unmount, even on task error.
+	if v.IsSnapshot() {
+		_, err = v.driver.UnmountVolumeSnapshot(v, op)
+	} else {
+		_, err = v.driver.UnmountVolume(v, false, op)
+	}
+
+	// Return task error if failed.
+	if taskErr != nil {
+		return taskErr
+	}
+
+	// Return unmount error if failed.
+	if err != nil && !errors.Is(err, ErrInUse) {
+		return err
+	}
+
+	return nil
 }
 
 // UnmountTask runs the supplied task after unmounting the volume if needed.
@@ -263,7 +293,7 @@ func (v Volume) UnmountTask(task func(op *operations.Operation) error, keepBlock
 		}
 
 		if ourUnmount {
-			defer v.driver.MountVolumeSnapshot(v, op)
+			defer func() { _ = v.driver.MountVolumeSnapshot(v, op) }()
 		}
 	} else {
 		ourUnmount, err := v.driver.UnmountVolume(v, keepBlockDev, op)
@@ -272,7 +302,7 @@ func (v Volume) UnmountTask(task func(op *operations.Operation) error, keepBlock
 		}
 
 		if ourUnmount {
-			defer v.driver.MountVolume(v, op)
+			defer func() { _ = v.driver.MountVolume(v, op) }()
 		}
 	}
 

@@ -2,16 +2,20 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/gorilla/mux"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/lxd/cluster"
 	"github.com/lxc/lxd/lxd/db"
+	dbCluster "github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/db/operationtype"
 	"github.com/lxc/lxd/lxd/instance"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
 	"github.com/lxc/lxd/lxd/migration"
@@ -68,6 +72,8 @@ var internalClusterInstanceMovedCmd = APIEndpoint{
 //   "500":
 //     $ref: "#/responses/InternalServerError"
 func instancePost(d *Daemon, r *http.Request) response.Response {
+	s := d.State()
+
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
 		return response.SmartError(err)
@@ -75,7 +81,15 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 
 	projectName := projectParam(r)
 
-	name := mux.Vars(r)["name"]
+	name, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if shared.IsSnapshot(name) {
+		return response.BadRequest(fmt.Errorf("Invalid instance name"))
+	}
+
 	targetNode := queryParam(r, "target")
 
 	// Flag indicating whether the node running the container is offline.
@@ -101,46 +115,49 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 		//       that the user really wants to move the container even
 		//       if we can't know for sure that it's indeed not
 		//       running?
-		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			// Load cluster configuration.
-			config, err := cluster.ConfigLoad(tx)
-			if err != nil {
-				return fmt.Errorf("Failed to load LXD config: %w", err)
-			}
-
-			p, err := tx.GetProject(projectName)
+		err := d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			p, err := dbCluster.GetProject(ctx, tx.Tx(), projectName)
 			if err != nil {
 				return fmt.Errorf("Failed loading project: %w", err)
 			}
 
+			apiProject, err := p.ToAPI(ctx, tx.Tx())
+			if err != nil {
+				return err
+			}
+
 			// Check if user is allowed to use cluster member targeting
-			err = project.CheckClusterTargetRestriction(tx, r, p, targetNode)
+			err = project.CheckClusterTargetRestriction(tx, r, apiProject, targetNode)
 			if err != nil {
 				return err
 			}
 
 			// Load target node.
-			node, err := tx.GetNodeByName(targetNode)
+			node, err := tx.GetNodeByName(ctx, targetNode)
 			if err != nil {
 				return fmt.Errorf("Failed to get target node: %w", err)
 			}
-			targetNodeOffline = node.IsOffline(config.OfflineThreshold())
+
+			targetNodeOffline = node.IsOffline(s.GlobalConfig.OfflineThreshold())
 
 			// Load source node.
-			address, err := tx.GetNodeAddressOfInstance(projectName, name, db.InstanceTypeFilter(instanceType))
+			address, err := tx.GetNodeAddressOfInstance(ctx, projectName, name, instanceType)
 			if err != nil {
 				return fmt.Errorf("Failed to get address of instance's member: %w", err)
 			}
+
 			if address == "" {
 				// Local node.
 				sourceNodeOffline = false
 				return nil
 			}
-			node, err = tx.GetNodeByAddress(address)
+
+			node, err = tx.GetNodeByAddress(ctx, address)
 			if err != nil {
 				return fmt.Errorf("Failed to get source member for %s: %w", address, err)
 			}
-			sourceNodeOffline = node.IsOffline(config.OfflineThreshold())
+
+			sourceNodeOffline = node.IsOffline(s.GlobalConfig.OfflineThreshold())
 
 			return nil
 		})
@@ -180,18 +197,19 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 		if err != nil {
 			return response.SmartError(err)
 		}
+
 		if resp != nil {
 			return resp
 		}
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return response.InternalError(err)
 	}
 
-	rdr1 := ioutil.NopCloser(bytes.NewBuffer(body))
-	rdr2 := ioutil.NopCloser(bytes.NewBuffer(body))
+	rdr1 := io.NopCloser(bytes.NewBuffer(body))
+	rdr2 := io.NopCloser(bytes.NewBuffer(body))
 
 	reqRaw := shared.Jmap{}
 	err = json.NewDecoder(rdr1).Decode(&reqRaw)
@@ -211,7 +229,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 		req.Live = true
 	}
 
-	inst, err := instance.LoadByProjectAndName(d.State(), projectName, name)
+	inst, err := instance.LoadByProjectAndName(s, projectName, name)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -221,12 +239,12 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 		if req.Pool != "" {
 			// Setup the instance move operation.
 			run := func(op *operations.Operation) error {
-				return instancePostPoolMigration(d, inst, req.Name, req.InstanceOnly, req.Pool, req.Live, op)
+				return instancePostPoolMigration(d, inst, req.Name, req.InstanceOnly, req.Pool, req.Live, req.AllowInconsistent, op)
 			}
 
 			resources := map[string][]string{}
 			resources["instances"] = []string{name}
-			op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationInstanceMigrate, resources, nil, run, nil, nil, r)
+			op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask, operationtype.InstanceMigrate, resources, nil, run, nil, nil, r)
 			if err != nil {
 				return response.InternalError(err)
 			}
@@ -243,12 +261,12 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 
 			// Setup the instance move operation.
 			run := func(op *operations.Operation) error {
-				return instancePostProjectMigration(d, inst, req.Name, req.Project, req.InstanceOnly, req.Live, op)
+				return instancePostProjectMigration(d, inst, req.Name, req.Project, req.InstanceOnly, req.Live, req.AllowInconsistent, op)
 			}
 
 			resources := map[string][]string{}
 			resources["instances"] = []string{name}
-			op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationInstanceMigrate, resources, nil, run, nil, nil, r)
+			op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask, operationtype.InstanceMigrate, resources, nil, run, nil, nil, r)
 			if err != nil {
 				return response.InternalError(err)
 			}
@@ -258,11 +276,12 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 
 		if targetNode != "" {
 			// Check if instance has backups.
-			backups, err := d.cluster.GetInstanceBackups(projectName, name)
+			backups, err := d.db.Cluster.GetInstanceBackups(projectName, name)
 			if err != nil {
 				err = fmt.Errorf("Failed to fetch instance's backups: %w", err)
 				return response.SmartError(err)
 			}
+
 			if len(backups) > 0 {
 				return response.BadRequest(fmt.Errorf("Instance has backups"))
 			}
@@ -278,7 +297,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 				resources["containers"] = resources["instances"]
 			}
 
-			op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationInstanceMigrate, resources, nil, run, nil, nil, r)
+			op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask, operationtype.InstanceMigrate, resources, nil, run, nil, nil, r)
 			if err != nil {
 				return response.InternalError(err)
 			}
@@ -287,7 +306,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		instanceOnly := req.InstanceOnly || req.ContainerOnly
-		ws, err := newMigrationSource(inst, req.Live, instanceOnly)
+		ws, err := newMigrationSource(inst, req.Live, instanceOnly, req.AllowInconsistent)
 		if err != nil {
 			return response.InternalError(err)
 		}
@@ -300,7 +319,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		run := func(op *operations.Operation) error {
-			return ws.Do(d.State(), op)
+			return ws.Do(s, op)
 		}
 
 		cancel := func(op *operations.Operation) error {
@@ -315,7 +334,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 				return response.InternalError(err)
 			}
 
-			op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationInstanceMigrate, resources, nil, run, nil, nil, r)
+			op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask, operationtype.InstanceMigrate, resources, nil, run, nil, nil, r)
 			if err != nil {
 				return response.InternalError(err)
 			}
@@ -324,7 +343,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 		}
 
 		// Pull mode.
-		op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassWebsocket, db.OperationInstanceMigrate, resources, ws.Metadata(), run, cancel, ws.Connect, r)
+		op, err := operations.OperationCreate(s, projectName, operations.OperationClassWebsocket, operationtype.InstanceMigrate, resources, ws.Metadata(), run, cancel, ws.Connect, r)
 		if err != nil {
 			return response.InternalError(err)
 		}
@@ -333,7 +352,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// Check that the name isn't already in use.
-	id, _ := d.cluster.GetInstanceID(projectName, req.Name)
+	id, _ := d.db.Cluster.GetInstanceID(projectName, req.Name)
 	if id > 0 {
 		return response.Conflict(fmt.Errorf("Name %q already in use", req.Name))
 	}
@@ -349,7 +368,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 		resources["containers"] = resources["instances"]
 	}
 
-	op, err := operations.OperationCreate(d.State(), projectName, operations.OperationClassTask, db.OperationInstanceRename, resources, nil, run, nil, nil, r)
+	op, err := operations.OperationCreate(s, projectName, operations.OperationClassTask, operationtype.InstanceRename, resources, nil, run, nil, nil, r)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -358,7 +377,7 @@ func instancePost(d *Daemon, r *http.Request) response.Response {
 }
 
 // Move an instance to another pool.
-func instancePostPoolMigration(d *Daemon, inst instance.Instance, newName string, instanceOnly bool, newPool string, stateful bool, op *operations.Operation) error {
+func instancePostPoolMigration(d *Daemon, inst instance.Instance, newName string, instanceOnly bool, newPool string, stateful bool, allowInconsistent bool, op *operations.Operation) error {
 	if inst.IsSnapshot() {
 		return fmt.Errorf("Instance snapshots cannot be moved between pools")
 	}
@@ -399,7 +418,7 @@ func instancePostPoolMigration(d *Daemon, inst instance.Instance, newName string
 		BaseImage:    localConfig["volatile.base_image"],
 		Config:       localConfig,
 		Devices:      localDevices,
-		Project:      inst.Project(),
+		Project:      inst.Project().Name,
 		Type:         inst.Type(),
 		Architecture: inst.Architecture(),
 		Description:  inst.Description(),
@@ -413,7 +432,10 @@ func instancePostPoolMigration(d *Daemon, inst instance.Instance, newName string
 	// avoid conflicts. Then after the source instance has been deleted we will rename the new instance back
 	// to the original name.
 	if newName == inst.Name() {
-		args.Name = instance.MoveTemporaryName(inst)
+		args.Name, err = instance.MoveTemporaryName(inst)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Copy instance to new target instance.
@@ -422,6 +444,7 @@ func instancePostPoolMigration(d *Daemon, inst instance.Instance, newName string
 		targetInstance:       args,
 		instanceOnly:         instanceOnly,
 		applyTemplateTrigger: false, // Don't apply templates when moving.
+		allowInconsistent:    allowInconsistent,
 	}, op)
 	if err != nil {
 		return err
@@ -452,7 +475,7 @@ func instancePostPoolMigration(d *Daemon, inst instance.Instance, newName string
 }
 
 // Move an instance to another project.
-func instancePostProjectMigration(d *Daemon, inst instance.Instance, newName string, newProject string, instanceOnly bool, stateful bool, op *operations.Operation) error {
+func instancePostProjectMigration(d *Daemon, inst instance.Instance, newName string, newProject string, instanceOnly bool, stateful bool, allowInconsistent bool, op *operations.Operation) error {
 	localConfig := inst.LocalConfig()
 
 	statefulStart := false
@@ -499,6 +522,7 @@ func instancePostProjectMigration(d *Daemon, inst instance.Instance, newName str
 		targetInstance:       args,
 		instanceOnly:         instanceOnly,
 		applyTemplateTrigger: false, // Don't apply templates when moving.
+		allowInconsistent:    allowInconsistent,
 	}, op)
 	if err != nil {
 		return err
@@ -521,7 +545,7 @@ func instancePostProjectMigration(d *Daemon, inst instance.Instance, newName str
 }
 
 // Move a non-ceph container to another cluster node.
-func instancePostClusteringMigrate(d *Daemon, r *http.Request, inst instance.Instance, newName string, newNode string, stateful bool) (func(op *operations.Operation) error, error) {
+func instancePostClusteringMigrate(d *Daemon, r *http.Request, inst instance.Instance, newName string, newNode string, stateful bool, allowInconsistent bool) (func(op *operations.Operation) error, error) {
 	var sourceAddress string
 	var targetAddress string
 
@@ -529,18 +553,19 @@ func instancePostClusteringMigrate(d *Daemon, r *http.Request, inst instance.Ins
 	// since we'll want to preserve it in the copied container.
 	origVolatileApplyTemplate := inst.LocalConfig()["volatile.apply_template"]
 
-	err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+	err := d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 		var err error
 
-		sourceAddress, err = tx.GetLocalNodeAddress()
+		sourceAddress, err = tx.GetLocalNodeAddress(ctx)
 		if err != nil {
-			return fmt.Errorf("Failed to get local node address: %w", err)
+			return fmt.Errorf("Failed to get local member address: %w", err)
 		}
 
-		node, err := tx.GetNodeByName(newNode)
+		node, err := tx.GetNodeByName(ctx, newNode)
 		if err != nil {
-			return fmt.Errorf("Failed to get new node address: %w", err)
+			return fmt.Errorf("Failed to get new member address: %w", err)
 		}
+
 		targetAddress = node.Address
 
 		return nil
@@ -555,14 +580,16 @@ func instancePostClusteringMigrate(d *Daemon, r *http.Request, inst instance.Ins
 		if err != nil {
 			return fmt.Errorf("Failed to connect to source server %q: %w", sourceAddress, err)
 		}
-		source = source.UseProject(inst.Project())
+
+		source = source.UseProject(inst.Project().Name)
 
 		// Connect to the destination host, i.e. the node to migrate the container to.
 		dest, err := cluster.Connect(targetAddress, d.endpoints.NetworkCert(), d.serverCert(), r, false)
 		if err != nil {
 			return fmt.Errorf("Failed to connect to destination server %q: %w", targetAddress, err)
 		}
-		dest = dest.UseTarget(newNode).UseProject(inst.Project())
+
+		dest = dest.UseTarget(newNode).UseProject(inst.Project().Name)
 
 		destName := newName
 		isSameName := false
@@ -572,7 +599,10 @@ func instancePostClusteringMigrate(d *Daemon, r *http.Request, inst instance.Ins
 		// name.
 		if destName == "" || destName == inst.Name() {
 			isSameName = true
-			destName = instance.MoveTemporaryName(inst)
+			destName, err = instance.MoveTemporaryName(inst)
+			if err != nil {
+				return err
+			}
 		}
 
 		// First make a copy on the new node of the container to be moved.
@@ -606,8 +636,9 @@ func instancePostClusteringMigrate(d *Daemon, r *http.Request, inst instance.Ins
 		}
 
 		args := lxd.InstanceCopyArgs{
-			Name: destName,
-			Mode: "pull",
+			Name:              destName,
+			Mode:              "pull",
+			AllowInconsistent: allowInconsistent,
 		}
 
 		copyOp, err := dest.CopyInstance(source, *entry, &args)
@@ -616,7 +647,7 @@ func instancePostClusteringMigrate(d *Daemon, r *http.Request, inst instance.Ins
 		}
 
 		handler := func(newOp api.Operation) {
-			op.UpdateMetadata(newOp.Metadata)
+			_ = op.UpdateMetadata(newOp.Metadata)
 		}
 
 		_, err = copyOp.AddHandler(handler)
@@ -656,16 +687,18 @@ func instancePostClusteringMigrate(d *Daemon, r *http.Request, inst instance.Ins
 			if err != nil {
 				return fmt.Errorf("Rename instance operation failed: %w", err)
 			}
+
 			destName = inst.Name()
 		}
 
 		// Restore the original value of "volatile.apply_template"
-		project := inst.Project()
-		err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			id, err := tx.GetInstanceID(project, destName)
+		project := inst.Project().Name
+		err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			id, err := dbCluster.GetInstanceID(ctx, tx.Tx(), project, destName)
 			if err != nil {
 				return fmt.Errorf("Failed to get ID of moved instance: %w", err)
 			}
+
 			err = tx.DeleteInstanceConfigKey(id, "volatile.apply_template")
 			if err != nil {
 				return fmt.Errorf("Failed to remove volatile.apply_template config key: %w", err)
@@ -675,6 +708,7 @@ func instancePostClusteringMigrate(d *Daemon, r *http.Request, inst instance.Ins
 				config := map[string]string{
 					"volatile.apply_template": origVolatileApplyTemplate,
 				}
+
 				err = tx.CreateInstanceConfig(int(id), config)
 				if err != nil {
 					return fmt.Errorf("Failed to set volatile.apply_template config key: %w", err)
@@ -710,7 +744,7 @@ func instancePostClusteringMigrate(d *Daemon, r *http.Request, inst instance.Ins
 	return run, nil
 }
 
-// Special case migrating a container backed response.Responseby ceph across two cluster nodes.
+// Special case migrating a container backed by ceph across two cluster nodes.
 func instancePostClusteringMigrateWithCeph(d *Daemon, r *http.Request, inst instance.Instance, pool storagePools.Pool, newName string, sourceNodeOffline bool, newNode string, stateful bool) (func(op *operations.Operation) error, error) {
 	if pool.Driver().Info().Name != "ceph" {
 		return nil, fmt.Errorf("Source instance's storage pool is not of type ceph")
@@ -722,8 +756,8 @@ func instancePostClusteringMigrateWithCeph(d *Daemon, r *http.Request, inst inst
 	if !sourceNodeOffline {
 		// If the source member is online then get its address so we can connect to it and see if the
 		// instance is running later.
-		err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			sourceMember, err = tx.GetNodeByName(inst.Location())
+		err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			sourceMember, err = tx.GetNodeByName(ctx, inst.Location())
 			if err != nil {
 				return fmt.Errorf("Failed getting cluster member of instance %q", inst.Name())
 			}
@@ -744,7 +778,8 @@ func instancePostClusteringMigrateWithCeph(d *Daemon, r *http.Request, inst inst
 			if err != nil {
 				return fmt.Errorf("Failed to connect to source server %q: %w", sourceMember.Address, err)
 			}
-			source = source.UseProject(inst.Project())
+
+			source = source.UseProject(inst.Project().Name)
 
 			// Get instance state on source member.
 			entry, _, err := source.GetInstance(inst.Name())
@@ -783,18 +818,26 @@ func instancePostClusteringMigrateWithCeph(d *Daemon, r *http.Request, inst inst
 			return err
 		}
 
+		// Check source volume exists, and get its config.
+		srcConfig, err := pool.GenerateInstanceBackupConfig(inst, false, op)
+		if err != nil {
+			return fmt.Errorf("Failed generating instance migration config: %w", err)
+		}
+
 		// Trigger a rename in the Ceph driver.
 		args := migration.VolumeSourceArgs{
-			Data: project.Instance(inst.Project(), newName), // Indicate new storage volume name.
+			Data: project.Instance(inst.Project().Name, newName), // Indicate new storage volume name.
+			Info: &migration.Info{Config: srcConfig},
 		}
+
 		err = pool.MigrateInstance(inst, nil, &args, op)
 		if err != nil {
 			return fmt.Errorf("Failed to migrate ceph RBD volume: %w", err)
 		}
 
 		// Re-link the database entries against the new node name.
-		err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			err := tx.UpdateInstanceNode(inst.Project(), inst.Name(), newName, newNode, volDBType)
+		err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+			err := tx.UpdateInstanceNode(ctx, inst.Project().Name, inst.Name(), newName, newNode, volDBType)
 			if err != nil {
 				return fmt.Errorf("Failed updating cluster member to %q for instance %q: %w", newName, inst.Name(), err)
 			}
@@ -806,16 +849,17 @@ func instancePostClusteringMigrateWithCeph(d *Daemon, r *http.Request, inst inst
 		}
 
 		// Reload instance from database with new state now its been updated.
-		inst, err := instance.LoadByProjectAndName(d.State(), inst.Project(), newName)
+		inst, err := instance.LoadByProjectAndName(d.State(), inst.Project().Name, newName)
 		if err != nil {
 			return fmt.Errorf("Failed loading instance %q: %w", inst.Name(), err)
 		}
 
 		// Create the instance mount point on the target node.
-		target, err := cluster.ConnectIfInstanceIsRemote(d.cluster, inst.Project(), newName, d.endpoints.NetworkCert(), d.serverCert(), r, inst.Type())
+		target, err := cluster.ConnectIfInstanceIsRemote(d.db.Cluster, inst.Project().Name, newName, d.endpoints.NetworkCert(), d.serverCert(), r, inst.Type())
 		if err != nil {
 			return fmt.Errorf("Failed to connect to target node: %w", err)
 		}
+
 		if target == nil {
 			// Create the instance mount point.
 			err := instancePostCreateInstanceMountPoint(d, inst)
@@ -831,15 +875,13 @@ func instancePostClusteringMigrateWithCeph(d *Daemon, r *http.Request, inst inst
 				}
 			}
 		} else {
-			// Use the correct project.
-			target = target.UseProject(inst.Project())
-
 			// Create the instance mount point.
-			url := api.NewURL().Project(inst.Project()).Path("internal", "cluster", "instance-moved", newName)
+			url := api.NewURL().Project(inst.Project().Name).Path("internal", "cluster", "instance-moved", newName)
 			resp, _, err := target.RawQuery("POST", url.String(), nil, "")
 			if err != nil {
 				return fmt.Errorf("Failed creating mount point on target member: %w", err)
 			}
+
 			if resp.StatusCode != http.StatusOK {
 				return fmt.Errorf("Failed creating mount point on target member: %s", resp.Error)
 			}
@@ -875,7 +917,10 @@ func instancePostClusteringMigrateWithCeph(d *Daemon, r *http.Request, inst inst
 // to create the appropriate mount points.
 func internalClusterInstanceMovedPost(d *Daemon, r *http.Request) response.Response {
 	projectName := projectParam(r)
-	instanceName := mux.Vars(r)["name"]
+	instanceName, err := url.PathUnescape(mux.Vars(r)["name"])
+	if err != nil {
+		return response.SmartError(err)
+	}
 
 	inst, err := instance.LoadByProjectAndName(d.State(), projectName, instanceName)
 	if err != nil {
@@ -892,12 +937,12 @@ func internalClusterInstanceMovedPost(d *Daemon, r *http.Request) response.Respo
 
 // Used after to create the appropriate mounts point after an instance has been moved.
 func instancePostCreateInstanceMountPoint(d *Daemon, inst instance.Instance) error {
-	pool, err := storagePools.GetPoolByInstance(d.State(), inst)
+	pool, err := storagePools.LoadByInstance(d.State(), inst)
 	if err != nil {
 		return fmt.Errorf("Failed loading pool of instance on target node: %w", err)
 	}
 
-	err = pool.ImportInstance(inst, nil)
+	err = pool.ImportInstance(inst, nil, nil)
 	if err != nil {
 		return fmt.Errorf("Failed creating mount point of instance on target node: %w", err)
 	}
@@ -912,10 +957,11 @@ func migrateInstance(d *Daemon, r *http.Request, inst instance.Instance, targetN
 	}
 
 	// Check if we are migrating a ceph-based instance.
-	pool, err := storagePools.GetPoolByInstance(d.State(), inst)
+	pool, err := storagePools.LoadByInstance(d.State(), inst)
 	if err != nil {
 		return fmt.Errorf("Failed loading instance storage pool: %w", err)
 	}
+
 	if pool.Driver().Info().Name == "ceph" {
 		f, err := instancePostClusteringMigrateWithCeph(d, r, inst, pool, req.Name, sourceNodeOffline, targetNode, req.Live)
 		if err != nil {
@@ -932,7 +978,7 @@ func migrateInstance(d *Daemon, r *http.Request, inst instance.Instance, targetN
 		return err
 	}
 
-	f, err := instancePostClusteringMigrate(d, r, inst, req.Name, targetNode, req.Live)
+	f, err := instancePostClusteringMigrate(d, r, inst, req.Name, targetNode, req.Live, req.AllowInconsistent)
 	if err != nil {
 		return err
 	}

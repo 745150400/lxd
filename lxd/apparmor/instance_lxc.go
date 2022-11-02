@@ -78,6 +78,9 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   # Handle /run remounts.
   mount options=(rw,nosuid,nodev,remount) -> /run/,
 
+  # Handle ramfs (same as tmpfs)
+  mount fstype=ramfs,
+
   # Handle tmpfs
   mount fstype=tmpfs,
 
@@ -381,7 +384,10 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
   deny /sys/devices/virtual?*{,/**} wklx,
   deny /sys/devices?*{,/**} wklx,
   deny /sys/f[^s]*{,/**} wklx,
-  deny /sys/fs/[^c]*{,/**} wklx,
+  deny /sys/fs/[^cb]*{,/**} wklx,
+  deny /sys/fs/b[^p]*{,/**} wklx,
+  deny /sys/fs/bp[^f]*{,/**} wklx,
+  deny /sys/fs/bpf?*{,/**} wklx,
   deny /sys/fs/c[^g]*{,/**} wklx,
   deny /sys/fs/cg[^r]*{,/**} wklx,
   deny /sys/fs/cgr[^o]*{,/**} wklx,

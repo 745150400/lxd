@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/logger"
@@ -27,21 +26,22 @@ import (
 // DebugJSON helper to log JSON.
 // Accepts a title to prefix the JSON log with, a *bytes.Bufffer containing the JSON and a logger to use for
 // logging the the JSON (allowing for custom context to be added to the log).
-func DebugJSON(title string, r *bytes.Buffer, logger logger.Logger) {
+func DebugJSON(title string, r *bytes.Buffer, l logger.Logger) {
 	pretty := &bytes.Buffer{}
-	if err := json.Indent(pretty, r.Bytes(), "\t", "\t"); err != nil {
-		logger.Debug("Error indenting JSON", log.Ctx{"err": err})
+	err := json.Indent(pretty, r.Bytes(), "\t", "\t")
+	if err != nil {
+		l.Debug("Error indenting JSON", logger.Ctx{"err": err})
 		return
 	}
 
 	// Print the JSON without the last "\n"
 	str := pretty.String()
-	logger.Debug(fmt.Sprintf("%s\n\t%s", title, str[0:len(str)-1]))
+	l.Debug(fmt.Sprintf("%s\n\t%s", title, str[0:len(str)-1]))
 }
 
 // WriteJSON encodes the body as JSON and sends it back to the client
 // Accepts optional debugLogger that activates debug logging if non-nil.
-func WriteJSON(w http.ResponseWriter, body interface{}, debugLogger logger.Logger) error {
+func WriteJSON(w http.ResponseWriter, body any, debugLogger logger.Logger) error {
 	var output io.Writer
 	var captured *bytes.Buffer
 
@@ -62,8 +62,8 @@ func WriteJSON(w http.ResponseWriter, body interface{}, debugLogger logger.Logge
 	return err
 }
 
-// EtagHash hashes the provided data and returns the sha256
-func EtagHash(data interface{}) (string, error) {
+// EtagHash hashes the provided data and returns the sha256.
+func EtagHash(data any) (string, error) {
 	etag := sha256.New()
 	err := json.NewEncoder(etag).Encode(data)
 	if err != nil {
@@ -74,8 +74,8 @@ func EtagHash(data interface{}) (string, error) {
 }
 
 // EtagCheck validates the hash of the current state with the hash
-// provided by the client
-func EtagCheck(r *http.Request, data interface{}) error {
+// provided by the client.
+func EtagCheck(r *http.Request, data any) error {
 	match := r.Header.Get("If-Match")
 	if match == "" {
 		return nil
@@ -118,10 +118,13 @@ func HTTPClient(certificate string, proxy proxyFunc) (*http.Client, error) {
 	}
 
 	tr := &http.Transport{
-		TLSClientConfig:   tlsConfig,
-		Dial:              shared.RFC3493Dialer,
-		Proxy:             proxy,
-		DisableKeepAlives: true,
+		TLSClientConfig:       tlsConfig,
+		DialContext:           shared.RFC3493Dialer,
+		Proxy:                 proxy,
+		DisableKeepAlives:     true,
+		ExpectContinueTimeout: time.Second * 30,
+		ResponseHeaderTimeout: time.Second * 3600,
+		TLSHandshakeTimeout:   time.Second * 5,
 	}
 
 	myhttp := http.Client{
@@ -180,8 +183,8 @@ func CheckTrustState(cert x509.Certificate, trustedCerts map[string]x509.Certifi
 
 	// Check whether client certificate is in trust store.
 	for fingerprint, v := range trustedCerts {
-		if bytes.Compare(cert.Raw, v.Raw) == 0 {
-			logger.Debug("Matched trusted cert", log.Ctx{"fingerprint": fingerprint, "subject": v.Subject})
+		if bytes.Equal(cert.Raw, v.Raw) {
+			logger.Debug("Matched trusted cert", logger.Ctx{"fingerprint": fingerprint, "subject": v.Subject})
 			return true, fingerprint
 		}
 	}
@@ -277,8 +280,8 @@ func ListenAddresses(configListenAddress string) ([]string, error) {
 // see the docstring of SystemdListenFDsStart below.
 func GetListeners(start int) []net.Listener {
 	defer func() {
-		os.Unsetenv("LISTEN_PID")
-		os.Unsetenv("LISTEN_FDS")
+		_ = os.Unsetenv("LISTEN_PID")
+		_ = os.Unsetenv("LISTEN_FDS")
 	}()
 
 	pid, err := strconv.Atoi(os.Getenv("LISTEN_PID"))

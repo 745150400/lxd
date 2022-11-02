@@ -15,6 +15,7 @@ import (
 type cmdGlobal struct {
 	flagHelp        bool
 	flagParallel    int
+	flagProject     string
 	flagReportFile  string
 	flagReportLabel string
 	flagVersion     bool
@@ -30,10 +31,14 @@ func (c *cmdGlobal) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	c.srv = srv
+
+	c.srv = srv.UseProject(c.flagProject)
 
 	// Print the initial header
-	benchmark.PrintServerInfo(srv)
+	err = benchmark.PrintServerInfo(srv)
+	if err != nil {
+		return err
+	}
 
 	// Setup report handling
 	if c.flagReportFile != "" {
@@ -60,9 +65,12 @@ func (c *cmdGlobal) Teardown(cmd *cobra.Command, args []string) error {
 		label = c.flagReportLabel
 	}
 
-	c.report.AddRecord(label, c.reportDuration)
+	err := c.report.AddRecord(label, c.reportDuration)
+	if err != nil {
+		return err
+	}
 
-	err := c.report.Write()
+	err = c.report.Write()
 	if err != nil {
 		return err
 	}
@@ -105,6 +113,7 @@ func main() {
 	app.PersistentFlags().IntVarP(&globalCmd.flagParallel, "parallel", "P", -1, "Number of threads to use"+"``")
 	app.PersistentFlags().StringVar(&globalCmd.flagReportFile, "report-file", "", "Path to the CSV report file"+"``")
 	app.PersistentFlags().StringVar(&globalCmd.flagReportLabel, "report-label", "", "Label for the new entry in the report [default=ACTION]"+"``")
+	app.PersistentFlags().StringVar(&globalCmd.flagProject, "project", "default", "Project to use")
 
 	// Version handling
 	app.SetVersionTemplate("{{.Version}}\n")

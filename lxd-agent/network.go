@@ -4,14 +4,10 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
-
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	"github.com/lxc/lxd/lxd/ip"
@@ -42,21 +38,8 @@ func networkTLSListener(inner net.Listener, config *tls.Config) *networkListener
 // Accept waits for and returns the next incoming TLS connection then use the
 // current TLS configuration to handle it.
 func (l *networkListener) Accept() (net.Conn, error) {
-	var c net.Conn
-	var err error
-
-	// Accept() is non-blocking in go < 1.12 hence the loop and error check.
-	for {
-		c, err = l.Listener.Accept()
-		if err == nil {
-			break
-		}
-
-		if err.(net.Error).Temporary() {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
+	c, err := l.Listener.Accept()
+	if err != nil {
 		return nil, err
 	}
 
@@ -73,25 +56,20 @@ func serverTLSConfig() (*tls.Config, error) {
 	}
 
 	tlsConfig := util.ServerTLSConfig(certInfo)
-	tlsConfig.CipherSuites = []uint16{
-		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-	}
-
 	return tlsConfig, nil
 }
 
 // reconfigureNetworkInterfaces checks for the existence of files under NICConfigDir in the config share.
 // Each file is named <device>.json and contains the Device Name, NIC Name, MTU and MAC address.
 func reconfigureNetworkInterfaces() {
-	nicDirEntries, err := ioutil.ReadDir(deviceConfig.NICConfigDir)
+	nicDirEntries, err := os.ReadDir(deviceConfig.NICConfigDir)
 	if err != nil {
 		// Abort if configuration folder does not exist (nothing to do), otherwise log and return.
 		if os.IsNotExist(err) {
 			return
 		}
 
-		logger.Error("Could not read network interface configuration directory", log.Ctx{"err": err})
+		logger.Error("Could not read network interface configuration directory", logger.Ctx{"err": err})
 		return
 	}
 
@@ -99,15 +77,15 @@ func reconfigureNetworkInterfaces() {
 	nicData := make(map[string]deviceConfig.NICConfig, len(nicDirEntries))
 
 	for _, f := range nicDirEntries {
-		nicBytes, err := ioutil.ReadFile(filepath.Join(deviceConfig.NICConfigDir, f.Name()))
+		nicBytes, err := os.ReadFile(filepath.Join(deviceConfig.NICConfigDir, f.Name()))
 		if err != nil {
-			logger.Error("Could not read network interface configuration file", log.Ctx{"err": err})
+			logger.Error("Could not read network interface configuration file", logger.Ctx{"err": err})
 		}
 
 		var conf deviceConfig.NICConfig
 		err = json.Unmarshal(nicBytes, &conf)
 		if err != nil {
-			logger.Error("Could not parse network interface configuration file", log.Ctx{"err": err})
+			logger.Error("Could not parse network interface configuration file", logger.Ctx{"err": err})
 			return
 		}
 
@@ -118,8 +96,8 @@ func reconfigureNetworkInterfaces() {
 
 	// configureNIC applies any config specified for the interface based on its current MAC address.
 	configureNIC := func(currentNIC net.Interface) error {
-		reverter := revert.New()
-		defer reverter.Fail()
+		revert := revert.New()
+		defer revert.Fail()
 
 		// Look for a NIC config entry for this interface based on its MAC address.
 		nic, ok := nicData[currentNIC.HardwareAddr.String()]
@@ -149,8 +127,9 @@ func reconfigureNetworkInterfaces() {
 		if err != nil {
 			return err
 		}
-		reverter.Add(func() {
-			link.SetUp()
+
+		revert.Add(func() {
+			_ = link.SetUp()
 		})
 
 		// Apply the name from the NIC config if needed.
@@ -159,8 +138,13 @@ func reconfigureNetworkInterfaces() {
 			if err != nil {
 				return err
 			}
-			reverter.Add(func() {
-				link.SetName(currentNIC.Name)
+
+			revert.Add(func() {
+				err := link.SetName(currentNIC.Name)
+				if err != nil {
+					return
+				}
+
 				link.Name = currentNIC.Name
 			})
 
@@ -174,9 +158,14 @@ func reconfigureNetworkInterfaces() {
 			if err != nil {
 				return err
 			}
-			reverter.Add(func() {
+
+			revert.Add(func() {
 				currentMTU := fmt.Sprintf("%d", currentNIC.MTU)
-				link.SetMTU(currentMTU)
+				err := link.SetMTU(currentMTU)
+				if err != nil {
+					return
+				}
+
 				link.MTU = currentMTU
 			})
 
@@ -188,21 +177,19 @@ func reconfigureNetworkInterfaces() {
 			return err
 		}
 
-		reverter.Success()
+		revert.Success()
 		return nil
 	}
 
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		logger.Error("Unable to read network interfaces", log.Ctx{"err": err})
+		logger.Error("Unable to read network interfaces", logger.Ctx{"err": err})
 	}
 
 	for _, iface := range ifaces {
 		err = configureNIC(iface)
 		if err != nil {
-			logger.Error("Unable to reconfigure network interface", log.Ctx{"interface": iface.Name, "err": err})
+			logger.Error("Unable to reconfigure network interface", logger.Ctx{"interface": iface.Name, "err": err})
 		}
 	}
-
-	return
 }

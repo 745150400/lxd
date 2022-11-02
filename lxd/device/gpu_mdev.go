@@ -2,12 +2,10 @@ package device
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
 	"github.com/pborman/uuid"
-	log "gopkg.in/inconshreveable/log15.v2"
 
 	deviceConfig "github.com/lxc/lxd/lxd/device/config"
 	pcidev "github.com/lxc/lxd/lxd/device/pci"
@@ -16,6 +14,7 @@ import (
 	"github.com/lxc/lxd/lxd/resources"
 	"github.com/lxc/lxd/lxd/revert"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/logger"
 )
 
 type gpuMdev struct {
@@ -83,6 +82,7 @@ func (d *gpuMdev) startVM() (*deviceConfig.RunConfig, error) {
 				if v.Available > 0 {
 					mdevAvailable = true
 				}
+
 				break
 			}
 		}
@@ -122,7 +122,7 @@ func (d *gpuMdev) startVM() (*deviceConfig.RunConfig, error) {
 		if mdevUUID == "" || !shared.PathExists(fmt.Sprintf("/sys/bus/pci/devices/%s/%s", pciAddress, mdevUUID)) {
 			mdevUUID = uuid.New()
 
-			err = ioutil.WriteFile(filepath.Join(fmt.Sprintf("/sys/bus/pci/devices/%s/mdev_supported_types/%s/create", pciAddress, d.config["mdev"])), []byte(mdevUUID), 200)
+			err = os.WriteFile(filepath.Join(fmt.Sprintf("/sys/bus/pci/devices/%s/mdev_supported_types/%s/create", pciAddress, d.config["mdev"])), []byte(mdevUUID), 0200)
 			if err != nil {
 				if os.IsNotExist(err) {
 					return nil, fmt.Errorf("The requested profile %q does not exist", d.config["mdev"])
@@ -135,9 +135,9 @@ func (d *gpuMdev) startVM() (*deviceConfig.RunConfig, error) {
 				path := fmt.Sprintf("/sys/bus/mdev/devices/%s", mdevUUID)
 
 				if shared.PathExists(path) {
-					err := ioutil.WriteFile(filepath.Join(path, "remove"), []byte("1\n"), 0200)
+					err := os.WriteFile(filepath.Join(path, "remove"), []byte("1\n"), 0200)
 					if err != nil {
-						d.logger.Error("Failed to remove vgpu", log.Ctx{"device": mdevUUID, "err": err})
+						d.logger.Error("Failed to remove vgpu", logger.Ctx{"device": mdevUUID, "err": err})
 					}
 				}
 			})
@@ -180,11 +180,13 @@ func (d *gpuMdev) startVM() (*deviceConfig.RunConfig, error) {
 
 // postStop is run after the device is removed from the instance.
 func (d *gpuMdev) postStop() error {
-	defer d.volatileSet(map[string]string{
-		"last_state.pci.slot.name": "",
-		"last_state.pci.driver":    "",
-		"vgpu.uuid":                "",
-	})
+	defer func() {
+		_ = d.volatileSet(map[string]string{
+			"last_state.pci.slot.name": "",
+			"last_state.pci.driver":    "",
+			"vgpu.uuid":                "",
+		})
+	}()
 
 	v := d.volatileGet()
 
@@ -192,9 +194,9 @@ func (d *gpuMdev) postStop() error {
 		path := fmt.Sprintf("/sys/bus/mdev/devices/%s", v["vgpu.uuid"])
 
 		if shared.PathExists(path) {
-			err := ioutil.WriteFile(filepath.Join(path, "remove"), []byte("1\n"), 0200)
+			err := os.WriteFile(filepath.Join(path, "remove"), []byte("1\n"), 0200)
 			if err != nil {
-				d.logger.Error("Failed to remove vgpu", log.Ctx{"device": v["vgpu.uuid"], "err": err})
+				d.logger.Error("Failed to remove vgpu", logger.Ctx{"device": v["vgpu.uuid"], "err": err})
 			}
 		}
 	}

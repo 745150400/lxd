@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -19,32 +18,33 @@ import (
 	"time"
 
 	"github.com/canonical/candid/candidclient"
-	dqliteclient "github.com/canonical/go-dqlite/client"
+	dqliteClient "github.com/canonical/go-dqlite/client"
 	"github.com/canonical/go-dqlite/driver"
 	"github.com/gorilla/mux"
+	liblxc "github.com/lxc/go-lxc"
 	"golang.org/x/sys/unix"
-	log "gopkg.in/inconshreveable/log15.v2"
-	liblxc "gopkg.in/lxc/go-lxc.v2"
+	"gopkg.in/macaroon-bakery.v3/bakery"
+	"gopkg.in/macaroon-bakery.v3/bakery/checkers"
+	"gopkg.in/macaroon-bakery.v3/bakery/identchecker"
+	"gopkg.in/macaroon-bakery.v3/httpbakery"
 
-	client "github.com/canonical/go-dqlite/client"
-	"gopkg.in/macaroon-bakery.v2/bakery"
-	"gopkg.in/macaroon-bakery.v2/bakery/checkers"
-	"gopkg.in/macaroon-bakery.v2/bakery/identchecker"
-	"gopkg.in/macaroon-bakery.v2/httpbakery"
-
+	"github.com/lxc/lxd/lxd/acme"
 	"github.com/lxc/lxd/lxd/bgp"
 	"github.com/lxc/lxd/lxd/cluster"
+	clusterConfig "github.com/lxc/lxd/lxd/cluster/config"
 	"github.com/lxc/lxd/lxd/daemon"
 	"github.com/lxc/lxd/lxd/db"
+	clusterDB "github.com/lxc/lxd/lxd/db/cluster"
+	"github.com/lxc/lxd/lxd/db/warningtype"
 	"github.com/lxc/lxd/lxd/dns"
 	"github.com/lxc/lxd/lxd/endpoints"
 	"github.com/lxc/lxd/lxd/events"
 	"github.com/lxc/lxd/lxd/firewall"
 	"github.com/lxc/lxd/lxd/fsmonitor"
-	devmonitor "github.com/lxc/lxd/lxd/fsmonitor"
 	"github.com/lxc/lxd/lxd/instance"
 	instanceDrivers "github.com/lxc/lxd/lxd/instance/drivers"
 	"github.com/lxc/lxd/lxd/instance/instancetype"
+	"github.com/lxc/lxd/lxd/loki"
 	"github.com/lxc/lxd/lxd/maas"
 	networkZone "github.com/lxc/lxd/lxd/network/zone"
 	"github.com/lxc/lxd/lxd/node"
@@ -56,12 +56,14 @@ import (
 	storagePools "github.com/lxc/lxd/lxd/storage"
 	storageDrivers "github.com/lxc/lxd/lxd/storage/drivers"
 	"github.com/lxc/lxd/lxd/storage/filesystem"
+	"github.com/lxc/lxd/lxd/storage/s3/miniod"
 	"github.com/lxc/lxd/lxd/sys"
 	"github.com/lxc/lxd/lxd/task"
 	"github.com/lxc/lxd/lxd/ucred"
 	"github.com/lxc/lxd/lxd/util"
 	"github.com/lxc/lxd/lxd/warnings"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/cancel"
 	"github.com/lxc/lxd/shared/idmap"
 	"github.com/lxc/lxd/shared/logger"
 	"github.com/lxc/lxd/shared/version"
@@ -71,17 +73,17 @@ import (
 type Daemon struct {
 	clientCerts *certificateCache
 	os          *sys.OS
-	db          *db.Node
+	db          *db.DB
 	firewall    firewall.Firewall
 	maas        *maas.Controller
 	bgp         *bgp.Server
 	dns         *dns.Server
 	rbac        *rbac.Server
-	cluster     *db.Cluster
 
 	// Event servers
-	devlxdEvents *events.DevLXDServer
-	events       *events.Server
+	devlxdEvents     *events.DevLXDServer
+	events           *events.Server
+	internalListener *events.InternalListener
 
 	// Tasks registry for long-running background tasks
 	// Keep clustering tasks separate as they cause a lot of CPU wakeups
@@ -119,19 +121,29 @@ type Daemon struct {
 
 	// Status control.
 	setupChan      chan struct{}      // Closed when basic Daemon setup is completed
-	readyChan      chan struct{}      // Closed when LXD is fully ready
+	waitReady      *cancel.Canceller  // Cancelled when LXD is fully ready
 	shutdownCtx    context.Context    // Cancelled when shutdown starts.
 	shutdownCancel context.CancelFunc // Cancels the shutdownCtx to indicate shutdown starting.
 	shutdownDoneCh chan error         // Receives the result of the d.Stop() function and tells LXD to end.
 
 	// Device monitor for watching filesystem events
-	devmonitor devmonitor.FSMonitor
+	devmonitor fsmonitor.FSMonitor
 
 	// Keep track of skews.
 	timeSkew bool
 
-	// Kernel version.
-	kernelVersion version.DottedVersion
+	// Configuration.
+	globalConfig   *clusterConfig.Config
+	localConfig    *node.Config
+	globalConfigMu sync.Mutex
+
+	// Cluster.
+	serverName string
+
+	lokiClient *loki.Client
+
+	// HTTP-01 challenge provider for ACME
+	http01Provider acme.HTTP01Provider
 }
 
 type externalAuth struct {
@@ -191,9 +203,11 @@ func newDaemon(config *DaemonConfig, os *sys.OS) *Daemon {
 		config:         config,
 		devlxdEvents:   devlxdEvents,
 		events:         lxdEvents,
+		db:             &db.DB{},
+		http01Provider: acme.NewHTTP01Provider(),
 		os:             os,
 		setupChan:      make(chan struct{}),
-		readyChan:      make(chan struct{}),
+		waitReady:      cancel.New(context.Background()),
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
 		shutdownDoneCh: make(chan error),
@@ -225,6 +239,7 @@ type APIEndpoint struct {
 	Path    string             // Path pattern for this endpoint.
 	Aliases []APIEndpointAlias // Any aliases for this endpoint.
 	Get     APIEndpointAction
+	Head    APIEndpointAction
 	Put     APIEndpointAction
 	Post    APIEndpointAction
 	Delete  APIEndpointAction
@@ -252,7 +267,7 @@ func allowAuthenticated(d *Daemon, r *http.Request) response.Response {
 	return response.EmptySyncResponse
 }
 
-// allowProjectPermission is a wrapper to check access against the project, its features and RBAC permission
+// allowProjectPermission is a wrapper to check access against the project, its features and RBAC permission.
 func allowProjectPermission(feature string, permission string) func(d *Daemon, r *http.Request) response.Response {
 	return func(d *Daemon, r *http.Request) response.Response {
 		// Shortcut for speed
@@ -272,7 +287,7 @@ func allowProjectPermission(feature string, permission string) func(d *Daemon, r
 	}
 }
 
-// Convenience function around Authenticate
+// Convenience function around Authenticate.
 func (d *Daemon) checkTrustedClient(r *http.Request) error {
 	trusted, _, _, err := d.Authenticate(nil, r)
 	if !trusted || err != nil {
@@ -287,7 +302,7 @@ func (d *Daemon) checkTrustedClient(r *http.Request) error {
 }
 
 // getTrustedCertificates returns trusted certificates key on DB type and fingerprint.
-func (d *Daemon) getTrustedCertificates() map[db.CertificateType]map[string]x509.Certificate {
+func (d *Daemon) getTrustedCertificates() map[clusterDB.CertificateType]map[string]x509.Certificate {
 	d.clientCerts.Lock.Lock()
 	defer d.clientCerts.Lock.Unlock()
 
@@ -307,7 +322,7 @@ func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request) (bool, str
 	// Allow internal cluster traffic by checking against the trusted certfificates.
 	if r.TLS != nil {
 		for _, i := range r.TLS.PeerCertificates {
-			trusted, fingerprint := util.CheckTrustState(*i, trustedCerts[db.CertificateTypeServer], d.endpoints.NetworkCert(), false)
+			trusted, fingerprint := util.CheckTrustState(*i, trustedCerts[clusterDB.CertificateTypeServer], d.endpoints.NetworkCert(), false)
 			if trusted {
 				return true, fingerprint, "cluster", nil
 			}
@@ -374,15 +389,12 @@ func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request) (bool, str
 	}
 
 	// Validate normal TLS access.
-	trustCACertificates, err := cluster.ConfigGetBool(d.cluster, "core.trust_ca_certificates")
-	if err != nil {
-		return false, "", "", err
-	}
+	trustCACertificates := d.globalConfig.TrustCACertificates()
 
 	// Validate metrics certificates.
 	if r.URL.Path == "/1.0/metrics" {
 		for _, i := range r.TLS.PeerCertificates {
-			trusted, username := util.CheckTrustState(*i, trustedCerts[db.CertificateTypeMetrics], d.endpoints.NetworkCert(), trustCACertificates)
+			trusted, username := util.CheckTrustState(*i, trustedCerts[clusterDB.CertificateTypeMetrics], d.endpoints.NetworkCert(), trustCACertificates)
 			if trusted {
 				return true, username, "tls", nil
 			}
@@ -390,7 +402,7 @@ func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request) (bool, str
 	}
 
 	for _, i := range r.TLS.PeerCertificates {
-		trusted, username := util.CheckTrustState(*i, trustedCerts[db.CertificateTypeClient], d.endpoints.NetworkCert(), trustCACertificates)
+		trusted, username := util.CheckTrustState(*i, trustedCerts[clusterDB.CertificateTypeClient], d.endpoints.NetworkCert(), trustCACertificates)
 		if trusted {
 			return true, username, "tls", nil
 		}
@@ -410,7 +422,7 @@ func writeMacaroonsRequiredResponse(b *identchecker.Bakery, r *http.Request, w h
 		ctx, httpbakery.RequestVersion(r), caveats, derr.Ops...)
 	if err != nil {
 		resp := response.ErrorResponse(http.StatusInternalServerError, err.Error())
-		resp.Render(w)
+		_ = resp.Render(w)
 		return
 	}
 
@@ -422,7 +434,6 @@ func writeMacaroonsRequiredResponse(b *identchecker.Bakery, r *http.Request, w h
 		})
 	herr.(*httpbakery.Error).Info.CookieNameSuffix = "auth"
 	httpbakery.WriteError(ctx, w, herr)
-	return
 }
 
 // State creates a new State instance linked to our internal db and os.
@@ -431,17 +442,21 @@ func (d *Daemon) State() *state.State {
 	// This information will be available throughout the code, and can be used to prevent new
 	// operations from starting during shutdown.
 
-	// Build a list of supported instance types.
-	supportedInstanceTypesInfo, _ := instanceDrivers.SupportedInstanceTypes()
-	supportedInstanceTypes := make(map[instancetype.Type]struct{}, len(supportedInstanceTypesInfo))
-	for instanceType := range supportedInstanceTypesInfo {
-		supportedInstanceTypes[instanceType] = struct{}{}
+	// Build a list of instance types.
+	drivers := instanceDrivers.DriverStatuses()
+	instanceTypes := make(map[instancetype.Type]error, len(drivers))
+	for driverType, driver := range drivers {
+		instanceTypes[driverType] = driver.Info.Error
 	}
 
+	d.globalConfigMu.Lock()
+	globalConfig := d.globalConfig
+	localConfig := d.localConfig
+	d.globalConfigMu.Unlock()
+
 	return &state.State{
-		Context:                d.shutdownCtx,
-		Node:                   d.db,
-		Cluster:                d.cluster,
+		ShutdownCtx:            d.shutdownCtx,
+		DB:                     d.db,
 		MAAS:                   d.maas,
 		BGP:                    d.bgp,
 		DNS:                    d.dns,
@@ -453,9 +468,11 @@ func (d *Daemon) State() *state.State {
 		Proxy:                  d.proxy,
 		ServerCert:             d.serverCert,
 		UpdateCertificateCache: func() { updateCertificateCache(d) },
-		InstanceTypes:          supportedInstanceTypes,
+		InstanceTypes:          instanceTypes,
 		DevMonitor:             d.devmonitor,
-		KernelVersion:          d.kernelVersion,
+		GlobalConfig:           globalConfig,
+		LocalConfig:            localConfig,
+		ServerName:             d.serverName,
 	}
 }
 
@@ -474,8 +491,10 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 	var uri string
 	if c.Path == "" {
 		uri = fmt.Sprintf("/%s", version)
-	} else {
+	} else if version != "" {
 		uri = fmt.Sprintf("/%s/%s", version, c.Path)
+	} else {
+		uri = fmt.Sprintf("/%s", c.Path)
 	}
 
 	route := restAPI.HandleFunc(uri, func(w http.ResponseWriter, r *http.Request) {
@@ -488,7 +507,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 			case <-d.setupChan:
 			default:
 				response := response.Unavailable(fmt.Errorf("LXD daemon setup in progress"))
-				response.Render(w)
+				_ = response.Render(w)
 				return
 			}
 		}
@@ -499,7 +518,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 			// If not a macaroon discharge request, return the error
 			_, ok := err.(*bakery.DischargeRequiredError)
 			if !ok {
-				response.InternalError(err).Render(w)
+				_ = response.InternalError(err).Render(w)
 				return
 			}
 		}
@@ -508,13 +527,13 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 		if version == "internal" && !shared.StringInSlice(protocol, []string{"unix", "cluster"}) {
 			// Except for the initial cluster accept request (done over trusted TLS)
 			if !trusted || c.Path != "cluster/accept" || protocol != "tls" {
-				logger.Warn("Rejecting remote internal API request", log.Ctx{"ip": r.RemoteAddr})
-				response.Forbidden(nil).Render(w)
+				logger.Warn("Rejecting remote internal API request", logger.Ctx{"ip": r.RemoteAddr})
+				_ = response.Forbidden(nil).Render(w)
 				return
 			}
 		}
 
-		logCtx := log.Ctx{"method": r.Method, "url": r.URL.RequestURI(), "ip": r.RemoteAddr, "protocol": protocol}
+		logCtx := logger.Ctx{"method": r.Method, "url": r.URL.RequestURI(), "ip": r.RemoteAddr, "protocol": protocol}
 		if protocol == "cluster" {
 			logCtx["fingerprint"] = username
 		} else {
@@ -580,7 +599,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 			if err != nil {
 				logCtx["err"] = err
 				logger.Warn("Rejecting remote API request", logCtx)
-				response.Forbidden(nil).Render(w)
+				_ = response.Forbidden(nil).Render(w)
 				return
 			}
 
@@ -599,13 +618,13 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 
 			r = r.WithContext(ctx)
 		} else if untrustedOk && r.Header.Get("X-LXD-authenticated") == "" {
-			logger.Debug(fmt.Sprintf("Allowing untrusted %s", r.Method), log.Ctx{"url": r.URL.RequestURI(), "ip": r.RemoteAddr})
+			logger.Debug(fmt.Sprintf("Allowing untrusted %s", r.Method), logger.Ctx{"url": r.URL.RequestURI(), "ip": r.RemoteAddr})
 		} else if derr, ok := err.(*bakery.DischargeRequiredError); ok {
 			writeMacaroonsRequiredResponse(d.externalAuth.bakery, r, w, derr, d.externalAuth.expiry)
 			return
 		} else {
-			logger.Warn("Rejecting request from untrusted client", log.Ctx{"ip": r.RemoteAddr})
-			response.Forbidden(nil).Render(w)
+			logger.Warn("Rejecting request from untrusted client", logger.Ctx{"ip": r.RemoteAddr})
+			_ = response.Forbidden(nil).Render(w)
 			return
 		}
 
@@ -614,18 +633,18 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 			newBody := &bytes.Buffer{}
 			captured := &bytes.Buffer{}
 			multiW := io.MultiWriter(newBody, captured)
-			if _, err := io.Copy(multiW, r.Body); err != nil {
-				response.InternalError(err).Render(w)
+			_, err := io.Copy(multiW, r.Body)
+			if err != nil {
+				_ = response.InternalError(err).Render(w)
 				return
 			}
 
 			r.Body = shared.BytesReadCloser{Buf: newBody}
-			util.DebugJSON("API Request", captured, log.New(logCtx))
+			util.DebugJSON("API Request", captured, logger.AddContext(logger.Log, logCtx))
 		}
 
 		// Actually process the request
 		var resp response.Response
-		resp = response.NotImplemented(nil)
 
 		// Return Unavailable Error (503) if daemon is shutting down.
 		// There are some exceptions:
@@ -651,7 +670,7 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 		}
 
 		if d.shutdownCtx.Err() == context.Canceled && !allowedDuringShutdown() {
-			response.Unavailable(fmt.Errorf("LXD is shutting down")).Render(w)
+			_ = response.Unavailable(fmt.Errorf("LXD is shutting down")).Render(w)
 			return
 		}
 
@@ -679,6 +698,8 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 		switch r.Method {
 		case "GET":
 			resp = handleRequest(c.Get)
+		case "HEAD":
+			resp = handleRequest(c.Head)
 		case "PUT":
 			resp = handleRequest(c.Put)
 		case "POST":
@@ -688,15 +709,15 @@ func (d *Daemon) createCmd(restAPI *mux.Router, version string, c APIEndpoint) {
 		case "PATCH":
 			resp = handleRequest(c.Patch)
 		default:
-			resp = response.NotFound(fmt.Errorf("Method '%s' not found", r.Method))
+			resp = response.NotFound(fmt.Errorf("Method %q not found", r.Method))
 		}
 
 		// Handle errors
 		err = resp.Render(w)
 		if err != nil {
-			err := response.InternalError(err).Render(w)
+			writeErr := response.InternalError(err).Render(w)
 			if err != nil {
-				logger.Error("Failed writing error for HTTP response", log.Ctx{"url": uri, "error": err})
+				logger.Error("Failed writing error for HTTP response", logger.Ctx{"url": uri, "err": err, "writeErr": writeErr})
 			}
 		}
 	})
@@ -730,13 +751,15 @@ func setupSharedMounts() error {
 	}
 
 	// Mount a new tmpfs
-	if err := unix.Mount("tmpfs", path, "tmpfs", 0, "size=100k,mode=0711"); err != nil {
+	err := unix.Mount("tmpfs", path, "tmpfs", 0, "size=100k,mode=0711")
+	if err != nil {
 		return err
 	}
 
 	// Mark as MS_SHARED and MS_REC
 	var flags uintptr = unix.MS_SHARED | unix.MS_REC
-	if err := unix.Mount(path, path, "none", flags, ""); err != nil {
+	err = unix.Mount(path, path, "none", flags, "")
+	if err != nil {
 		return err
 	}
 
@@ -754,19 +777,43 @@ func (d *Daemon) Init() error {
 	// cleanup any state we produced so far. Errors happening here will be
 	// ignored.
 	if err != nil {
-		logger.Error("Failed to start the daemon", log.Ctx{"err": err})
-		d.Stop(context.Background(), unix.SIGINT)
+		logger.Error("Failed to start the daemon", logger.Ctx{"err": err})
+		_ = d.Stop(context.Background(), unix.SIGINT)
 		return err
 	}
 
 	return nil
 }
 
+func (d *Daemon) setupLoki(URL string, cert string, key string, caCert string, labels []string, logLevel string, types []string) error {
+	if d.lokiClient != nil {
+		d.lokiClient.Stop()
+	}
+
+	if URL == "" || logLevel == "" || len(types) == 0 {
+		return nil
+	}
+
+	u, err := url.Parse(URL)
+	if err != nil {
+		return err
+	}
+
+	d.lokiClient = loki.NewClient(d.shutdownCtx, u, cert, key, caCert, labels, logLevel, types)
+
+	d.internalListener.AddHandler("loki", d.lokiClient.HandleEvent)
+
+	return nil
+}
+
 func (d *Daemon) init() error {
-	var dbWarnings []db.Warning
+	var dbWarnings []clusterDB.Warning
 
 	// Setup logger
 	events.LoggingServer = d.events
+
+	// Setup internal event listener
+	d.internalListener = events.NewInternalListener(d.shutdownCtx, d.events)
 
 	// Lets check if there's an existing LXD running
 	err := endpoints.CheckAlreadyRunning(d.UnixSocket())
@@ -786,7 +833,7 @@ func (d *Daemon) init() error {
 		mode = "mock"
 	}
 
-	logger.Info("LXD is starting", log.Ctx{"version": version.Version, "mode": mode, "path": shared.VarPath("")})
+	logger.Info("LXD is starting", logger.Ctx{"version": version.Version, "mode": mode, "path": shared.VarPath("")})
 
 	/* List of sub-systems to trace */
 	trace := d.config.Trace
@@ -831,20 +878,13 @@ func (d *Daemon) init() error {
 		"idmapped_mounts_v2",
 		"core_scheduling",
 	}
+
 	for _, extension := range lxcExtensions {
 		d.os.LXCFeatures[extension] = liblxc.HasApiExtension(extension)
 	}
 
 	// Look for kernel features
 	logger.Infof("Kernel features:")
-
-	uname, _ := shared.Uname()
-	if uname != nil {
-		kernelVersion, err := version.Parse(strings.Split(uname.Release, "-")[0])
-		if err == nil {
-			d.kernelVersion = *kernelVersion
-		}
-	}
 
 	d.os.CloseRange = canUseCloseRange()
 	if d.os.CloseRange {
@@ -863,6 +903,7 @@ func (d *Daemon) init() error {
 	if canUsePidFds() && d.os.LXCFeatures["pidfd"] {
 		d.os.PidFds = true
 	}
+
 	if d.os.PidFds {
 		logger.Info(" - pidfds: yes")
 	} else {
@@ -941,7 +982,7 @@ func (d *Daemon) init() error {
 	logger.Infof(" - cgroup layout: %s", d.os.CGInfo.Mode())
 
 	for _, w := range dbWarnings {
-		logger.Warnf(" - %s, %s", db.WarningTypeNames[db.WarningType(w.TypeCode)], w.LastMessage)
+		logger.Warnf(" - %s, %s", warningtype.TypeNames[warningtype.Type(w.TypeCode)], w.LastMessage)
 	}
 
 	// Detect shiftfs support.
@@ -957,7 +998,7 @@ func (d *Daemon) init() error {
 	}
 
 	// Detect idmapped mounts support.
-	if shared.IsTrue(os.Getenv("LXD_SHIFTFS_DISABLE")) {
+	if shared.IsTrue(os.Getenv("LXD_IDMAPPED_MOUNTS_DISABLE")) {
 		logger.Info(" - idmapped mounts kernel support: disabled")
 	} else if kernelSupportsIdmappedMounts() {
 		d.os.IdmappedMounts = true
@@ -967,13 +1008,17 @@ func (d *Daemon) init() error {
 	}
 
 	// Detect and cached available instance types from operational drivers.
-	_, instanceTypesWarnings := instanceDrivers.SupportedInstanceTypes()
-	dbWarnings = append(dbWarnings, instanceTypesWarnings...)
+	drivers := instanceDrivers.DriverStatuses()
+	for _, driver := range drivers {
+		if driver.Warning != nil {
+			dbWarnings = append(dbWarnings, *driver.Warning)
+		}
+	}
 
 	// Validate the devices storage.
 	testDev := shared.VarPath("devices", ".test")
 	testDevNum := int(unix.Mkdev(0, 0))
-	os.Remove(testDev)
+	_ = os.Remove(testDev)
 	err = unix.Mknod(testDev, 0600|unix.S_IFCHR, testDevNum)
 	if err == nil {
 		fd, err := os.Open(testDev)
@@ -981,12 +1026,13 @@ func (d *Daemon) init() error {
 			logger.Warn("Unable to access device nodes, LXD likely running on a nodev mount")
 			d.os.Nodev = true
 		}
-		fd.Close()
-		os.Remove(testDev)
+
+		_ = fd.Close()
+		_ = os.Remove(testDev)
 	}
 
 	/* Initialize the database */
-	dump, err := initializeDbObject(d)
+	err = initializeDbObject(d)
 	if err != nil {
 		return err
 	}
@@ -1009,25 +1055,24 @@ func (d *Daemon) init() error {
 		return err
 	}
 
-	clustered, err := cluster.Enabled(d.db)
+	clustered, err := cluster.Enabled(d.db.Node)
 	if err != nil {
 		return fmt.Errorf("Failed checking if clustered: %w", err)
 	}
 
 	// Detect if clustered, but not yet upgraded to per-server client certificates.
-	if clustered && len(d.clientCerts.Certificates[db.CertificateTypeServer]) < 1 {
+	if clustered && len(d.clientCerts.Certificates[clusterDB.CertificateTypeServer]) < 1 {
 		// If the cluster has not yet upgraded to per-server client certificates (by running patch
 		// patchClusteringServerCertTrust) then temporarily use the network (cluster) certificate as client
 		// certificate, and cause us to trust it for use as client certificate from the other members.
 		networkCertFingerPrint := networkCert.Fingerprint()
-		logger.Warn("No local trusted server certificates found, falling back to trusting network certificate", log.Ctx{"fingerprint": networkCertFingerPrint})
-		logger.Info("Set client certificate to network certificate", log.Ctx{"fingerprint": networkCertFingerPrint})
+		logger.Warn("No local trusted server certificates found, falling back to trusting network certificate", logger.Ctx{"fingerprint": networkCertFingerPrint})
+		logger.Info("Set client certificate to network certificate", logger.Ctx{"fingerprint": networkCertFingerPrint})
 		d.serverCertInt = networkCert
-
 	} else {
 		// If standalone or the local trusted certificates table is populated with server certificates then
 		// use our local server certificate as client certificate for intra-cluster communication.
-		logger.Info("Set client certificate to server certificate", log.Ctx{"fingerprint": serverCert.Fingerprint()})
+		logger.Info("Set client certificate to server certificate", logger.Ctx{"fingerprint": serverCert.Fingerprint()})
 		d.serverCertInt = serverCert
 	}
 
@@ -1036,16 +1081,18 @@ func (d *Daemon) init() error {
 	if shared.StringInSlice("dqlite", trace) {
 		clusterLogLevel = "TRACE"
 	}
+
 	d.gateway, err = cluster.NewGateway(
 		d.shutdownCtx,
-		d.db,
+		d.db.Node,
 		networkCert,
-		d.serverCert,
+		d.State,
 		cluster.Latency(d.config.RaftLatency),
 		cluster.LogLevel(clusterLogLevel))
 	if err != nil {
 		return err
 	}
+
 	d.gateway.HeartbeatNodeHook = d.nodeRefreshTask
 
 	/* Setup some mounts (nice to have) */
@@ -1053,35 +1100,33 @@ func (d *Daemon) init() error {
 		// Attempt to mount the shmounts tmpfs
 		err := setupSharedMounts()
 		if err != nil {
-			logger.Warn("Failed settting up shared mounts", log.Ctx{"err": err})
+			logger.Warn("Failed setting up shared mounts", logger.Ctx{"err": err})
 		}
 
 		// Attempt to Mount the devlxd tmpfs
 		devlxd := filepath.Join(d.os.VarDir, "devlxd")
 		if !filesystem.IsMountPoint(devlxd) {
-			unix.Mount("tmpfs", devlxd, "tmpfs", 0, "size=100k,mode=0755")
+			err = unix.Mount("tmpfs", devlxd, "tmpfs", 0, "size=100k,mode=0755")
+			if err != nil {
+				logger.Warn("Failed to mount devlxd", logger.Ctx{"err": err})
+			}
 		}
 	}
 
-	address, err := node.HTTPSAddress(d.db)
+	logger.Info("Loading daemon configuration")
+	err = d.db.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
+		d.localConfig, err = node.ConfigLoad(ctx, tx)
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("Failed to fetch node address: %w", err)
+		return err
 	}
 
-	clusterAddress, err := node.ClusterAddress(d.db)
-	if err != nil {
-		return fmt.Errorf("Failed to fetch cluster address: %w", err)
-	}
-
-	debugAddress, err := node.DebugAddress(d.db)
-	if err != nil {
-		return fmt.Errorf("Failed to fetch debug address: %w", err)
-	}
-
-	metricsAddress, err := node.MetricsAddress(d.db)
-	if err != nil {
-		return fmt.Errorf("Failed to fetch metrics address: %w", err)
-	}
+	localHTTPAddress := d.localConfig.HTTPSAddress()
+	localClusterAddress := d.localConfig.ClusterAddress()
+	debugAddress := d.localConfig.DebugAddress()
+	metricsAddress := d.localConfig.MetricsAddress()
+	storageBucketsAddress := d.localConfig.StorageBucketsAddress()
 
 	if os.Getenv("LISTEN_PID") != "" {
 		d.systemdSocketActivated = true
@@ -1089,18 +1134,29 @@ func (d *Daemon) init() error {
 
 	/* Setup the web server */
 	config := &endpoints.Config{
-		Dir:                  d.os.VarDir,
-		UnixSocket:           d.UnixSocket(),
-		Cert:                 networkCert,
-		RestServer:           restServer(d),
-		DevLxdServer:         devLxdServer(d),
-		LocalUnixSocketGroup: d.config.Group,
-		NetworkAddress:       address,
-		ClusterAddress:       clusterAddress,
-		DebugAddress:         debugAddress,
-		MetricsAddress:       metricsAddress,
-		MetricsServer:        metricsServer(d),
+		Dir:                   d.os.VarDir,
+		UnixSocket:            d.UnixSocket(),
+		Cert:                  networkCert,
+		RestServer:            restServer(d),
+		DevLxdServer:          devLxdServer(d),
+		LocalUnixSocketGroup:  d.config.Group,
+		NetworkAddress:        localHTTPAddress,
+		ClusterAddress:        localClusterAddress,
+		DebugAddress:          debugAddress,
+		MetricsAddress:        metricsAddress,
+		MetricsServer:         metricsServer(d),
+		StorageBucketsAddress: storageBucketsAddress,
+		StorageBucketsServer:  storageBucketsServer(d),
+		VsockServer:           vSockServer(d),
+		VsockSupport:          false,
 	}
+
+	// Enable vsock server support if VM instances supported.
+	err, found := d.State().InstanceTypes[instancetype.VM]
+	if found && err == nil {
+		config.VsockSupport = true
+	}
+
 	d.endpoints, err = endpoints.Up(config)
 	if err != nil {
 		return err
@@ -1133,10 +1189,10 @@ func (d *Daemon) init() error {
 		}
 
 		if shared.StringInSlice("database", trace) {
-			options = append(options, driver.WithTracing(dqliteclient.LogDebug))
+			options = append(options, driver.WithTracing(dqliteClient.LogDebug))
 		}
 
-		d.cluster, err = db.OpenCluster(context.Background(), "db.bin", store, clusterAddress, dir, d.config.DqliteSetupTimeout, dump, options...)
+		d.db.Cluster, err = db.OpenCluster(context.Background(), "db.bin", store, localClusterAddress, dir, d.config.DqliteSetupTimeout, nil, options...)
 		if err == nil {
 			logger.Info("Initialized global database")
 			break
@@ -1150,16 +1206,16 @@ func (d *Daemon) init() error {
 			// The only thing we want to still do on this node is
 			// to run the heartbeat task, in case we are the raft
 			// leader.
-			d.gateway.Cluster = d.cluster
+			d.gateway.Cluster = d.db.Cluster
 			taskFunc, taskSchedule := cluster.HeartbeatTask(d.gateway)
 			hbGroup := task.Group{}
 			d.taskClusterHeartbeat = hbGroup.Add(taskFunc, taskSchedule)
 			hbGroup.Start(d.shutdownCtx)
 			d.gateway.WaitUpgradeNotification()
-			hbGroup.Stop(time.Second)
+			_ = hbGroup.Stop(time.Second)
 			d.gateway.Cluster = nil
 
-			d.cluster.Close()
+			_ = d.db.Cluster.Close()
 
 			continue
 		}
@@ -1168,16 +1224,17 @@ func (d *Daemon) init() error {
 	}
 
 	d.firewall = firewall.New()
-	logger.Info("Firewall loaded driver", log.Ctx{"driver": d.firewall})
+	logger.Info("Firewall loaded driver", logger.Ctx{"driver": d.firewall})
 
 	err = cluster.NotifyUpgradeCompleted(d.State(), networkCert, d.serverCert())
 	if err != nil {
 		// Ignore the error, since it's not fatal for this particular
 		// node. In most cases it just means that some nodes are
 		// offline.
-		logger.Warn("Could not notify all nodes of database upgrade", log.Ctx{"err": err})
+		logger.Warn("Could not notify all nodes of database upgrade", logger.Ctx{"err": err})
 	}
-	d.gateway.Cluster = d.cluster
+
+	d.gateway.Cluster = d.db.Cluster
 
 	// This logic used to belong to patchUpdateFromV10, but has been moved
 	// here because it needs database access.
@@ -1237,8 +1294,8 @@ func (d *Daemon) init() error {
 	}
 
 	// Get daemon configuration.
-	bgpAddress := ""
-	bgpRouterID := ""
+	bgpAddress := d.localConfig.BGPAddress()
+	bgpRouterID := d.localConfig.BGPRouterID()
 	bgpASN := int64(0)
 
 	candidAPIURL := ""
@@ -1246,7 +1303,7 @@ func (d *Daemon) init() error {
 	candidDomains := ""
 	candidExpiry := int64(0)
 
-	dnsAddress := ""
+	dnsAddress := d.localConfig.DNSAddress()
 
 	rbacAPIURL := ""
 	rbacAPIKey := ""
@@ -1258,48 +1315,51 @@ func (d *Daemon) init() error {
 
 	maasAPIURL := ""
 	maasAPIKey := ""
-	maasMachine := ""
+	maasMachine := d.localConfig.MAASMachine()
 
-	logger.Info("Loading daemon configuration")
-	err = d.db.Transaction(func(tx *db.NodeTx) error {
-		config, err := node.ConfigLoad(tx)
+	err = d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		config, err := clusterConfig.Load(ctx, tx)
 		if err != nil {
 			return err
 		}
 
-		maasMachine = config.MAASMachine()
-		bgpAddress = config.BGPAddress()
-		bgpRouterID = config.BGPRouterID()
-		dnsAddress = config.DNSAddress()
+		// Get the local node (will be used if clustered).
+		serverName, err := tx.GetLocalNodeName(ctx)
+		if err != nil {
+			return err
+		}
+
+		d.globalConfigMu.Lock()
+		d.serverName = serverName
+		d.globalConfig = config
+		d.globalConfigMu.Unlock()
 		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	err = d.cluster.Transaction(func(tx *db.ClusterTx) error {
-		config, err := cluster.ConfigLoad(tx)
+	// Get specific config keys.
+	d.globalConfigMu.Lock()
+	bgpASN = d.globalConfig.BGPASN()
+
+	d.proxy = shared.ProxyFromConfig(d.globalConfig.ProxyHTTPS(), d.globalConfig.ProxyHTTP(), d.globalConfig.ProxyIgnoreHosts())
+
+	candidAPIURL, candidAPIKey, candidExpiry, candidDomains = d.globalConfig.CandidServer()
+	maasAPIURL, maasAPIKey = d.globalConfig.MAASController()
+	rbacAPIURL, rbacAPIKey, rbacExpiry, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey = d.globalConfig.RBACServer()
+	d.gateway.HeartbeatOfflineThreshold = d.globalConfig.OfflineThreshold()
+	lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiLabels, lokiLoglevel, lokiTypes := d.globalConfig.LokiServer()
+
+	d.endpoints.NetworkUpdateTrustedProxy(d.globalConfig.HTTPSTrustedProxy())
+	d.globalConfigMu.Unlock()
+
+	// Setup Loki logger.
+	if lokiURL != "" {
+		err = d.setupLoki(lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiLabels, lokiLoglevel, lokiTypes)
 		if err != nil {
 			return err
 		}
-
-		bgpASN = config.BGPASN()
-
-		d.proxy = shared.ProxyFromConfig(
-			config.ProxyHTTPS(), config.ProxyHTTP(), config.ProxyIgnoreHosts(),
-		)
-
-		candidAPIURL, candidAPIKey, candidExpiry, candidDomains = config.CandidServer()
-		maasAPIURL, maasAPIKey = config.MAASController()
-		rbacAPIURL, rbacAPIKey, rbacExpiry, rbacAgentURL, rbacAgentUsername, rbacAgentPrivateKey, rbacAgentPublicKey = config.RBACServer()
-		d.gateway.HeartbeatOfflineThreshold = config.OfflineThreshold()
-
-		d.endpoints.NetworkUpdateTrustedProxy(config.HTTPSTrustedProxy())
-
-		return nil
-	})
-	if err != nil {
-		return err
 	}
 
 	// Setup RBAC authentication.
@@ -1325,28 +1385,43 @@ func (d *Daemon) init() error {
 		if err != nil {
 			return err
 		}
+
 		logger.Info("Started BGP server")
 	}
 
 	// Setup DNS listener.
-	d.dns = dns.NewServer(d.cluster, func(name string) (*dns.Zone, error) {
+	d.dns = dns.NewServer(d.db.Cluster, func(name string, full bool) (*dns.Zone, error) {
 		// Fetch the zone.
 		zone, err := networkZone.LoadByName(d.State(), name)
 		if err != nil {
 			return nil, err
 		}
-		zoneInfo := zone.Info()
 
-		zoneBuilder, err := zone.Content()
-		if err != nil {
-			logger.Errorf("Failed to render DNS zone %q: %v", name, err)
-			return nil, err
-		}
+		zoneInfo := zone.Info()
 
 		// Fill in the zone information.
 		resp := &dns.Zone{}
 		resp.Info = *zoneInfo
-		resp.Content = strings.TrimSpace(zoneBuilder.String())
+
+		if full {
+			// Full content was requested.
+			zoneBuilder, err := zone.Content()
+			if err != nil {
+				logger.Errorf("Failed to render DNS zone %q: %v", name, err)
+				return nil, err
+			}
+
+			resp.Content = strings.TrimSpace(zoneBuilder.String())
+		} else {
+			// SOA only.
+			zoneBuilder, err := zone.SOA()
+			if err != nil {
+				logger.Errorf("Failed to render DNS zone %q: %v", name, err)
+				return nil, err
+			}
+
+			resp.Content = strings.TrimSpace(zoneBuilder.String())
+		}
 
 		return resp, nil
 	})
@@ -1355,6 +1430,7 @@ func (d *Daemon) init() error {
 		if err != nil {
 			return err
 		}
+
 		logger.Info("Started DNS server")
 	}
 
@@ -1365,8 +1441,16 @@ func (d *Daemon) init() error {
 		return err
 	}
 
+	// Apply all patches that need to be run after networks are initialised.
+	err = patchesApply(d, patchPostNetworks)
+	if err != nil {
+		return err
+	}
+
 	// Cleanup leftover images.
 	pruneLeftoverImages(d)
+
+	var instances []instance.Instance
 
 	if !d.os.MockMode {
 		// Start the scheduler
@@ -1379,14 +1463,20 @@ func (d *Daemon) init() error {
 
 		logger.Info("Starting device monitor")
 
-		d.devmonitor, err = fsmonitor.New(d.State().Context, prefixPath)
+		d.devmonitor, err = fsmonitor.New(d.State().ShutdownCtx, prefixPath)
 		if err != nil {
 			return err
 		}
 
+		// Must occur after d.devmonitor has been initialised.
+		instances, err = instance.LoadNodeAll(d.State(), instancetype.Any)
+		if err != nil {
+			return fmt.Errorf("Failed loading local instances: %w", err)
+		}
+
 		// Register devices on running instances to receive events and reconnect to VM monitor sockets.
 		// This should come after the event handler go routines have been started.
-		devicesRegister(d.State())
+		devicesRegister(instances)
 
 		// Setup seccomp handler
 		if d.os.SeccompListener {
@@ -1396,8 +1486,9 @@ func (d *Daemon) init() error {
 			if err != nil {
 				return err
 			}
+
 			d.seccomp = seccompServer
-			logger.Info("Started seccomp handler", log.Ctx{"path": shared.VarPath("seccomp.socket")})
+			logger.Info("Started seccomp handler", logger.Ctx{"path": shared.VarPath("seccomp.socket")})
 		}
 
 		// Read the trusted certificates
@@ -1411,14 +1502,14 @@ func (d *Daemon) init() error {
 				for {
 					err = d.setupMAASController(maasAPIURL, maasAPIKey, maasMachine)
 					if err == nil {
-						logger.Info("Connected to MAAS controller", log.Ctx{"url": maasAPIURL})
+						logger.Info("Connected to MAAS controller", logger.Ctx{"url": maasAPIURL})
 						break
 					}
 
-					logger.Warn("Unable to connect to MAAS, trying again in a minute", log.Ctx{"url": maasAPIURL, "err": err})
+					logger.Warn("Unable to connect to MAAS, trying again in a minute", logger.Ctx{"url": maasAPIURL, "err": err})
 
 					if !warningAdded {
-						d.cluster.UpsertWarningLocalNode("", -1, -1, db.WarningUnableToConnectToMAAS, err.Error())
+						_ = d.db.Cluster.UpsertWarningLocalNode("", -1, -1, warningtype.UnableToConnectToMAAS, err.Error())
 
 						warningAdded = true
 					}
@@ -1428,66 +1519,35 @@ func (d *Daemon) init() error {
 
 				// Resolve any previously created warning once connected
 				if warningAdded {
-					warnings.ResolveWarningsByLocalNodeAndType(d.cluster, db.WarningUnableToConnectToMAAS)
+					_ = warnings.ResolveWarningsByLocalNodeAndType(d.db.Cluster, warningtype.UnableToConnectToMAAS)
 				}
 			}()
 		}
+	}
+
+	// Remove volatile.last_state.ready key as LXD doesn't know if the instances are ready.
+	err = d.db.Cluster.DeleteReadyStateFromLocalInstances()
+	if err != nil {
+		return fmt.Errorf("Failed deleting volatile.last_state.ready: %w", err)
 	}
 
 	close(d.setupChan)
 
 	// Create warnings that have been collected
 	for _, w := range dbWarnings {
-		err := d.cluster.UpsertWarningLocalNode("", -1, -1, db.WarningType(w.TypeCode), w.LastMessage)
+		err := d.db.Cluster.UpsertWarningLocalNode("", -1, -1, warningtype.Type(w.TypeCode), w.LastMessage)
 		if err != nil {
-			logger.Warn("Failed to create warning", log.Ctx{"err": err})
+			logger.Warn("Failed to create warning", logger.Ctx{"err": err})
 		}
 	}
 
 	// Resolve warnings older than the daemon start time
-	err = warnings.ResolveWarningsByLocalNodeOlderThan(d.cluster, d.startTime)
+	err = warnings.ResolveWarningsByLocalNodeOlderThan(d.db.Cluster, d.startTime)
 	if err != nil {
-		logger.Warn("Failed to resolve warnings", log.Ctx{"err": err})
+		logger.Warn("Failed to resolve warnings", logger.Ctx{"err": err})
 	}
 
-	// Run the post initialization actions
-	err = d.Ready()
-	if err != nil {
-		return err
-	}
-
-	logger.Info("Daemon started")
-
-	return nil
-}
-
-func (d *Daemon) startClusterTasks() {
-	// Add initial event listeners from global database members.
-	// Run asynchronously so that connecting to remote members doesn't delay starting up other cluster tasks.
-	go cluster.EventsUpdateListeners(d.endpoints, d.cluster, d.serverCert, nil, d.events.Inject)
-
-	// Heartbeats
-	d.taskClusterHeartbeat = d.clusterTasks.Add(cluster.HeartbeatTask(d.gateway))
-
-	// Auto-sync images across the cluster (hourly)
-	d.clusterTasks.Add(autoSyncImagesTask(d))
-
-	// Start all background tasks
-	d.clusterTasks.Start(d.shutdownCtx)
-}
-
-func (d *Daemon) stopClusterTasks() {
-	d.clusterTasks.Stop(3 * time.Second)
-	d.clusterTasks = task.Group{}
-}
-
-func (d *Daemon) Ready() error {
-	// Check if clustered
-	clustered, err := cluster.Enabled(d.db)
-	if err != nil {
-		return err
-	}
-
+	// Start cluster tasks if needed.
 	if clustered {
 		d.startClusterTasks()
 	}
@@ -1514,8 +1574,8 @@ func (d *Daemon) Ready() error {
 		// Remove expired container backups (hourly)
 		d.tasks.Add(pruneExpiredContainerBackupsTask(d))
 
-		// Take snapshot of containers (minutely check of configurable cron expression)
-		d.tasks.Add(autoCreateContainerSnapshotsTask(d))
+		// Take snapshot of instances (minutely check of configurable cron expression)
+		d.tasks.Add(autoCreateInstanceSnapshotsTask(d))
 
 		// Remove expired instance snapshots (minutely)
 		d.tasks.Add(pruneExpiredInstanceSnapshotsTask(d))
@@ -1528,31 +1588,54 @@ func (d *Daemon) Ready() error {
 
 		// Remove resolved warnings (daily)
 		d.tasks.Add(pruneResolvedWarningsTask(d))
+
+		// Auto-renew server certificate (daily)
+		d.tasks.Add(autoRenewCertificateTask(d))
+
+		// Remove expired tokens (hourly)
+		d.tasks.Add(autoRemoveExpiredTokensTask(d))
 	}
 
 	// Start all background tasks
 	d.tasks.Start(d.shutdownCtx)
 
-	// Get daemon state struct
-	s := d.State()
-
 	// Restore instances
-	if !d.cluster.LocalNodeIsEvacuated() {
-		instances, err := instance.LoadNodeAll(s, instancetype.Any)
-		if err != nil {
-			return fmt.Errorf("Failed loading instances to restore: %w", err)
-		}
-
-		instancesStart(s, instances)
+	if !d.db.Cluster.LocalNodeIsEvacuated() {
+		instancesStart(d.State(), instances)
 	}
 
 	// Re-balance in case things changed while LXD was down
-	deviceTaskBalance(s)
+	deviceTaskBalance(d.State())
 
 	// Unblock incoming requests
-	close(d.readyChan)
+	d.waitReady.Cancel()
+
+	logger.Info("Daemon started")
 
 	return nil
+}
+
+func (d *Daemon) startClusterTasks() {
+	// Add initial event listeners from global database members.
+	// Run asynchronously so that connecting to remote members doesn't delay starting up other cluster tasks.
+	go cluster.EventsUpdateListeners(d.endpoints, d.db.Cluster, d.serverCert, nil, d.events.Inject)
+
+	// Heartbeats
+	d.taskClusterHeartbeat = d.clusterTasks.Add(cluster.HeartbeatTask(d.gateway))
+
+	// Auto-sync images across the cluster (hourly)
+	d.clusterTasks.Add(autoSyncImagesTask(d))
+
+	// Remove orphaned operations
+	d.clusterTasks.Add(autoRemoveOrphanedOperationsTask(d))
+
+	// Start all background tasks
+	d.clusterTasks.Start(d.shutdownCtx)
+}
+
+func (d *Daemon) stopClusterTasks() {
+	_ = d.clusterTasks.Stop(3 * time.Second)
+	d.clusterTasks = task.Group{}
 }
 
 // numRunningInstances returns the number of running instances.
@@ -1569,7 +1652,7 @@ func (d *Daemon) numRunningInstances(instances []instance.Instance) int {
 
 // Stop stops the shared daemon.
 func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
-	logger.Info("Starting shutdown sequence", log.Ctx{"signal": sig})
+	logger.Info("Starting shutdown sequence", logger.Ctx{"signal": sig})
 
 	// Cancelling the context will make everyone aware that we're shutting down.
 	d.shutdownCancel()
@@ -1579,53 +1662,47 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 
 		err := handoverMemberRole(d)
 		if err != nil {
-			logger.Warn("Could not handover member's responsibilities", log.Ctx{"err": err})
+			logger.Warn("Could not handover member's responsibilities", logger.Ctx{"err": err})
 			d.gateway.Kill()
 		}
 	}
 
 	s := d.State()
 
-	var err error
-	var instances []instance.Instance     // If this is left as nil this indicates an error loading instances.
-	var shutDownTimeout = 5 * time.Minute // Default time to wait for operations if not specified in DB.
+	// Stop any running minio processes cleanly before unmount storage pools.
+	miniod.StopAll()
 
-	if d.cluster != nil {
+	var err error
+	var instances []instance.Instance
+	var instancesLoaded bool // If this is left as false this indicates an error loading instances.
+
+	if d.db.Cluster != nil {
 		instances, err = instance.LoadNodeAll(s, instancetype.Any)
 		if err != nil {
 			// List all instances on disk.
-			logger.Warn("Loading local instances from disk as database is not available", log.Ctx{"err": err})
+			logger.Warn("Loading local instances from disk as database is not available", logger.Ctx{"err": err})
 			instances, err = instancesOnDisk(s)
 			if err != nil {
-				logger.Warn("Failed loading instances from disk", log.Ctx{"err": err})
+				logger.Warn("Failed loading instances from disk", logger.Ctx{"err": err})
 			}
 
 			// Make all future queries fail fast as DB is not available.
 			d.gateway.Kill()
-			d.cluster.Close()
+			_ = d.db.Cluster.Close()
 		}
 
-		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			config, err := cluster.ConfigLoad(tx)
-			if err != nil {
-				return err
-			}
-			shutDownTimeout = config.ShutdownTimeout()
-			return nil
-		})
-		if err != nil {
-			logger.Warn("Failed getting shutdown timeout", log.Ctx{"err": err})
+		if err == nil {
+			instancesLoaded = true
 		}
 	}
 
 	// Handle shutdown (unix.SIGPWR) and reload (unix.SIGTERM) signals.
 	if sig == unix.SIGPWR || sig == unix.SIGTERM {
-		if d.cluster != nil {
+		if d.db.Cluster != nil {
 			// waitForOperations will block until all operations are done, or it's forced to shut down.
 			// For the latter case, we re-use the shutdown channel which is filled when a shutdown is
 			// initiated using `lxd shutdown`.
-			logger.Info("Waiting for operations to finish")
-			waitForOperations(ctx, shutDownTimeout)
+			waitForOperations(ctx, d.db.Cluster, s.GlobalConfig.ShutdownTimeout())
 		}
 
 		// Unmount daemon image and backup volumes if set.
@@ -1634,7 +1711,7 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 		go func() {
 			err := daemonStorageVolumesUnmount(s)
 			if err != nil {
-				logger.Error("Failed to unmount image and backup volumes", log.Ctx{"err": err})
+				logger.Error("Failed to unmount image and backup volumes", logger.Ctx{"err": err})
 			}
 
 			done <- struct{}{}
@@ -1657,21 +1734,21 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 
 			// Unmount storage pools after instances stopped.
 			logger.Info("Stopping storage pools")
-			pools, err := s.Cluster.GetStoragePoolNames()
+			pools, err := s.DB.Cluster.GetStoragePoolNames()
 			if err != nil && !response.IsNotFoundError(err) {
-				logger.Error("Failed to get storage pools", log.Ctx{"err": err})
+				logger.Error("Failed to get storage pools", logger.Ctx{"err": err})
 			}
 
 			for _, poolName := range pools {
-				pool, err := storagePools.GetPoolByName(s, poolName)
+				pool, err := storagePools.LoadByName(s, poolName)
 				if err != nil {
-					logger.Error("Failed to get storage pool", log.Ctx{"pool": poolName, "err": err})
+					logger.Error("Failed to get storage pool", logger.Ctx{"pool": poolName, "err": err})
 					continue
 				}
 
 				_, err = pool.Unmount()
 				if err != nil {
-					logger.Error("Unable to unmount storage pool", log.Ctx{"pool": poolName, "err": err})
+					logger.Error("Unable to unmount storage pool", logger.Ctx{"pool": poolName, "err": err})
 					continue
 				}
 			}
@@ -1693,17 +1770,18 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 	trackError(d.clusterTasks.Stop(3*time.Second), "Stop cluster tasks") // Give tasks a bit of time to cleanup.
 
 	n := d.numRunningInstances(instances)
-	shouldUnmount := instances != nil && n <= 0
+	shouldUnmount := instancesLoaded && n <= 0
 
-	if d.cluster != nil {
+	if d.db.Cluster != nil {
 		logger.Info("Closing the database")
-		err := d.cluster.Close()
+		err := d.db.Cluster.Close()
 		if err != nil {
-			logger.Debug("Could not close global database cleanly", log.Ctx{"err": err})
+			logger.Debug("Could not close global database cleanly", logger.Ctx{"err": err})
 		}
 	}
-	if d.db != nil {
-		trackError(d.db.Close(), "Close local database")
+
+	if d.db != nil && d.db.Node != nil {
+		trackError(d.db.Node.Close(), "Close local database")
 	}
 
 	if d.gateway != nil {
@@ -1717,8 +1795,8 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 	if shouldUnmount {
 		logger.Info("Unmounting temporary filesystems")
 
-		unix.Unmount(shared.VarPath("devlxd"), unix.MNT_DETACH)
-		unix.Unmount(shared.VarPath("shmounts"), unix.MNT_DETACH)
+		_ = unix.Unmount(shared.VarPath("devlxd"), unix.MNT_DETACH)
+		_ = unix.Unmount(shared.VarPath("shmounts"), unix.MNT_DETACH)
 
 		logger.Info("Done unmounting temporary filesystems")
 	} else {
@@ -1729,21 +1807,24 @@ func (d *Daemon) Stop(ctx context.Context, sig os.Signal) error {
 		trackError(d.seccomp.Stop(), "Stop seccomp")
 	}
 
-	if n := len(errs); n > 0 {
+	n = len(errs)
+	if n > 0 {
 		format := "%v"
 		if n > 1 {
 			format += fmt.Sprintf(" (and %d more errors)", n)
 		}
+
 		err = fmt.Errorf(format, errs[0])
 	}
+
 	if err != nil {
-		logger.Error("Failed to cleanly shutdown daemon", log.Ctx{"err": err})
+		logger.Error("Failed to cleanly shutdown daemon", logger.Ctx{"err": err})
 	}
 
 	return err
 }
 
-// Setup external authentication
+// Setup external authentication.
 func (d *Daemon) setupExternalAuthentication(authEndpoint string, authPubkey string, expiry int64, domains string) error {
 	// Parse the list of domains
 	authDomains := []string{}
@@ -1826,7 +1907,7 @@ func (d *Daemon) setupExternalAuthentication(authEndpoint string, authPubkey str
 	return nil
 }
 
-// Setup RBAC
+// Setup RBAC.
 func (d *Daemon) setupRBACServer(rbacURL string, rbacKey string, rbacExpiry int64, rbacAgentURL string, rbacAgentUsername string, rbacAgentPrivateKey string, rbacAgentPublicKey string) error {
 	if d.rbac != nil || rbacURL == "" || rbacAgentURL == "" || rbacAgentUsername == "" || rbacAgentPrivateKey == "" || rbacAgentPublicKey == "" {
 		return nil
@@ -1841,9 +1922,9 @@ func (d *Daemon) setupRBACServer(rbacURL string, rbacKey string, rbacExpiry int6
 	// Set projects helper
 	server.ProjectsFunc = func() (map[int64]string, error) {
 		var result map[int64]string
-		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
+		err := d.db.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
 			var err error
-			result, err = tx.GetProjectIDsToNames()
+			result, err = clusterDB.GetProjectIDsToNames(ctx, tx.Tx())
 			return err
 		})
 
@@ -1876,7 +1957,7 @@ func (d *Daemon) setupRBACServer(rbacURL string, rbacKey string, rbacExpiry int6
 	return nil
 }
 
-// Setup MAAS
+// Setup MAAS.
 func (d *Daemon) setupMAASController(server string, key string, machine string) error {
 	var err error
 	d.maas = nil
@@ -1906,33 +1987,8 @@ func (d *Daemon) setupMAASController(server string, key string, machine string) 
 }
 
 // Create a database connection and perform any updates needed.
-func initializeDbObject(d *Daemon) (*db.Dump, error) {
+func initializeDbObject(d *Daemon) error {
 	logger.Info("Initializing local database")
-	// Rename the old database name if needed.
-	if shared.PathExists(d.os.LegacyLocalDatabasePath()) {
-		if shared.PathExists(d.os.LocalDatabasePath()) {
-			return nil, fmt.Errorf("Both legacy and new local database files exists")
-		}
-		logger.Info("Renaming local database file from lxd.db to database/local.db")
-		err := os.Rename(d.os.LegacyLocalDatabasePath(), d.os.LocalDatabasePath())
-		if err != nil {
-			return nil, fmt.Errorf("Failed to rename legacy local database file: %w", err)
-		}
-	}
-
-	// NOTE: we use the legacyPatches parameter to run a few
-	// legacy non-db updates that were in place before the
-	// patches mechanism was introduced in lxd/patches.go. The
-	// rest of non-db patches will be applied separately via
-	// patchesApplyAll. See PR #3322 for more details.
-	legacy := map[int]*db.LegacyPatch{}
-	for i, patch := range legacyPatches {
-		legacy[i] = &db.LegacyPatch{
-			Hook: func(tx *sql.Tx) error {
-				return patch(tx)
-			},
-		}
-	}
 
 	// Hook to run when the local database is created from scratch. It will
 	// create the default profile and mark all patches as applied.
@@ -1945,14 +2001,14 @@ func initializeDbObject(d *Daemon) (*db.Dump, error) {
 		}
 		return nil
 	}
+
 	var err error
-	var dump *db.Dump
-	d.db, dump, err = db.OpenNode(filepath.Join(d.os.VarDir, "database"), freshHook, legacy)
+	d.db.Node, err = db.OpenNode(filepath.Join(d.os.VarDir, "database"), freshHook)
 	if err != nil {
-		return nil, fmt.Errorf("Error creating database: %s", err)
+		return fmt.Errorf("Error creating database: %s", err)
 	}
 
-	return dump, nil
+	return nil
 }
 
 // hasMemberStateChanged returns true if the number of members, their addresses or state has changed.
@@ -1990,24 +2046,25 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 
 	if hbData.Time.Add(5*time.Second).Before(now) || hbData.Time.Add(-5*time.Second).After(now) {
 		if !d.timeSkew {
-			logger.Warn("Time skew detected between leader and local", log.Ctx{"leaderTime": hbData.Time, "localTime": now})
+			logger.Warn("Time skew detected between leader and local", logger.Ctx{"leaderTime": hbData.Time, "localTime": now})
 
-			if d.cluster != nil {
-				err := d.cluster.UpsertWarningLocalNode("", -1, -1, db.WarningClusterTimeSkew, fmt.Sprintf("leaderTime: %s, localTime: %s", hbData.Time, now))
+			if d.db.Cluster != nil {
+				err := d.db.Cluster.UpsertWarningLocalNode("", -1, -1, warningtype.ClusterTimeSkew, fmt.Sprintf("leaderTime: %s, localTime: %s", hbData.Time, now))
 				if err != nil {
-					logger.Warn("Failed to create cluster time skew warning", log.Ctx{"err": err})
+					logger.Warn("Failed to create cluster time skew warning", logger.Ctx{"err": err})
 				}
 			}
 		}
+
 		d.timeSkew = true
 	} else {
 		if d.timeSkew {
 			logger.Warn("Time skew resolved")
 
-			if d.cluster != nil {
-				err := warnings.ResolveWarningsByLocalNodeAndType(d.cluster, db.WarningClusterTimeSkew)
+			if d.db.Cluster != nil {
+				err := warnings.ResolveWarningsByLocalNodeAndType(d.db.Cluster, warningtype.ClusterTimeSkew)
 				if err != nil {
-					logger.Warn("Failed to resolve cluster time skew warning", log.Ctx{"err": err})
+					logger.Warn("Failed to resolve cluster time skew warning", logger.Ctx{"err": err})
 				}
 			}
 
@@ -2020,7 +2077,7 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 	for _, node := range hbData.Members {
 		if node.RaftID > 0 {
 			raftNodes = append(raftNodes, db.RaftNode{
-				NodeInfo: client.NodeInfo{
+				NodeInfo: dqliteClient.NodeInfo{
 					ID:      node.RaftID,
 					Address: node.Address,
 					Role:    db.RaftRole(node.RaftRole),
@@ -2038,17 +2095,17 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 	}
 
 	// Accept raft node list from any heartbeat type so that we get freshest data quickly.
-	logger.Debug("Replace current raft nodes", log.Ctx{"raftMembers": raftNodes})
-	err = d.db.Transaction(func(tx *db.NodeTx) error {
+	logger.Debug("Replace current raft nodes", logger.Ctx{"raftMembers": raftNodes})
+	err = d.db.Node.Transaction(context.TODO(), func(ctx context.Context, tx *db.NodeTx) error {
 		return tx.ReplaceRaftNodes(raftNodes)
 	})
 	if err != nil {
-		logger.Error("Error updating raft members", log.Ctx{"err": err})
+		logger.Error("Error updating raft members", logger.Ctx{"err": err})
 		http.Error(w, "500 failed to update raft nodes", http.StatusInternalServerError)
 		return
 	}
 
-	localAddress, _ := node.ClusterAddress(d.db)
+	localClusterAddress := d.State().LocalConfig.ClusterAddress()
 
 	if hbData.FullStateList {
 		// If there is an ongoing heartbeat round (and by implication this is the leader), then this could
@@ -2069,10 +2126,8 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 			return
 		}
 
-		logger.Info("Partial heartbeat received", log.Ctx{"local": localAddress})
+		logger.Info("Partial heartbeat received", logger.Ctx{"local": localClusterAddress})
 	}
-
-	return
 }
 
 // nodeRefreshTask is run when a full state heartbeat is sent (on the leader) or received (by a non-leader member).
@@ -2082,39 +2137,49 @@ func (d *Daemon) heartbeatHandler(w http.ResponseWriter, r *http.Request, isLead
 // round (but may not be considered actually offline at this stage). These unavailable members will not be used for
 // role rebalancing.
 func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader bool, unavailableMembers []string) {
+	s := d.State()
+
 	// Don't process the heartbeat until we're fully online.
-	if d.cluster == nil || d.cluster.GetNodeID() == 0 {
+	if d.db.Cluster == nil || d.db.Cluster.GetNodeID() == 0 {
 		return
 	}
 
-	localAddress, _ := node.ClusterAddress(d.db)
+	localClusterAddress := d.State().LocalConfig.ClusterAddress()
 
 	if !heartbeatData.FullStateList || len(heartbeatData.Members) <= 0 {
-		logger.Error("Heartbeat member refresh task called with partial state list", log.Ctx{"local": localAddress})
+		logger.Error("Heartbeat member refresh task called with partial state list", logger.Ctx{"local": localClusterAddress})
 		return
 	}
 
 	// If the max version of the cluster has changed, check whether we need to upgrade.
 	if d.lastNodeList == nil || d.lastNodeList.Version.APIExtensions != heartbeatData.Version.APIExtensions || d.lastNodeList.Version.Schema != heartbeatData.Version.Schema {
-		err := cluster.MaybeUpdate(d.State())
+		err := cluster.MaybeUpdate(s)
 		if err != nil {
-			logger.Error("Error updating", log.Ctx{"err": err})
+			logger.Error("Error updating", logger.Ctx{"err": err})
 			return
 		}
 	}
 
 	stateChangeTaskFailure := false // Records whether any of the state change tasks failed.
+
+	// Handle potential OVN chassis changes.
+	err := networkUpdateOVNChassis(s, heartbeatData, localClusterAddress)
+	if err != nil {
+		stateChangeTaskFailure = true
+		logger.Error("Error restarting OVN networks", logger.Ctx{"err": err})
+	}
+
 	if d.hasMemberStateChanged(heartbeatData) {
-		logger.Info("Cluster member state has changed", log.Ctx{"local": localAddress})
+		logger.Info("Cluster member state has changed", logger.Ctx{"local": localClusterAddress})
 
 		// Refresh cluster certificates cached.
 		updateCertificateCache(d)
 
 		// Refresh forkdns peers.
-		err := networkUpdateForkdnsServersTask(d.State(), heartbeatData)
+		err := networkUpdateForkdnsServersTask(s, heartbeatData)
 		if err != nil {
 			stateChangeTaskFailure = true
-			logger.Error("Error refreshing forkdns", log.Ctx{"err": err, "local": localAddress})
+			logger.Error("Error refreshing forkdns", logger.Ctx{"err": err, "local": localClusterAddress})
 		}
 	}
 
@@ -2124,7 +2189,7 @@ func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader b
 
 	wg.Add(1)
 	go func() {
-		cluster.EventsUpdateListeners(d.endpoints, d.cluster, d.serverCert, heartbeatData.Members, d.events.Inject)
+		cluster.EventsUpdateListeners(d.endpoints, d.db.Cluster, d.serverCert, heartbeatData.Members, d.events.Inject)
 		wg.Done()
 	}()
 
@@ -2162,42 +2227,31 @@ func (d *Daemon) nodeRefreshTask(heartbeatData *cluster.APIHeartbeat, isLeader b
 			}
 		}
 
-		var maxVoters int64
-		var maxStandBy int64
-		err := d.cluster.Transaction(func(tx *db.ClusterTx) error {
-			config, err := cluster.ConfigLoad(tx)
-			if err != nil {
-				return err
-			}
-			maxVoters = config.MaxVoters()
-			maxStandBy = config.MaxStandBy()
-			return nil
-		})
-		if err != nil {
-			logger.Error("Error loading cluster configuration", log.Ctx{"err": err, "local": localAddress})
-			return
-		}
+		maxVoters := s.GlobalConfig.MaxVoters()
+		maxStandBy := s.GlobalConfig.MaxStandBy()
 
 		// If there are offline members that have voter or stand-by database roles, let's see if we can
 		// replace them with spare ones. Also, if we don't have enough voters or standbys, let's see if we
 		// can upgrade some member.
 		if isDegraded || onlineVoters < int(maxVoters) || onlineStandbys < int(maxStandBy) {
 			d.clusterMembershipMutex.Lock()
-			logger.Debug("Rebalancing member roles in heartbeat", log.Ctx{"local": localAddress})
+			logger.Debug("Rebalancing member roles in heartbeat", logger.Ctx{"local": localClusterAddress})
 			err := rebalanceMemberRoles(d, nil, unavailableMembers)
 			if err != nil && !errors.Is(err, cluster.ErrNotLeader) {
-				logger.Warn("Could not rebalance cluster member roles", log.Ctx{"err": err, "local": localAddress})
+				logger.Warn("Could not rebalance cluster member roles", logger.Ctx{"err": err, "local": localClusterAddress})
 			}
+
 			d.clusterMembershipMutex.Unlock()
 		}
 
 		if hasNodesNotPartOfRaft {
 			d.clusterMembershipMutex.Lock()
-			logger.Debug("Upgrading members without raft role in heartbeat", log.Ctx{"local": localAddress})
+			logger.Debug("Upgrading members without raft role in heartbeat", logger.Ctx{"local": localClusterAddress})
 			err := upgradeNodesWithoutRaftRole(d)
 			if err != nil && !errors.Is(err, cluster.ErrNotLeader) {
-				logger.Warn("Failed upgrading raft roles:", log.Ctx{"err": err, "local": localAddress})
+				logger.Warn("Failed upgrading raft roles:", logger.Ctx{"err": err, "local": localClusterAddress})
 			}
+
 			d.clusterMembershipMutex.Unlock()
 		}
 	}

@@ -34,7 +34,7 @@ func (c *cmdMigratedumpsuccess) Command() *cobra.Command {
 func (c *cmdMigratedumpsuccess) Run(cmd *cobra.Command, args []string) error {
 	// Quick checks.
 	if len(args) < 2 {
-		cmd.Help()
+		_ = cmd.Help()
 
 		if len(args) == 0 {
 			return nil
@@ -51,6 +51,7 @@ func (c *cmdMigratedumpsuccess) Run(cmd *cobra.Command, args []string) error {
 	lxdArgs := lxd.ConnectionArgs{
 		SkipGetServer: true,
 	}
+
 	d, err := lxd.ConnectLXDUnix("", &lxdArgs)
 	if err != nil {
 		return err
@@ -61,7 +62,8 @@ func (c *cmdMigratedumpsuccess) Run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	conn.Close()
+
+	_ = conn.Close()
 
 	resp, _, err := d.RawQuery("GET", fmt.Sprintf("%s/wait", args[0]), nil, "")
 	if err != nil {

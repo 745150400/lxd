@@ -4,7 +4,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"runtime"
@@ -12,14 +11,14 @@ import (
 
 	"github.com/juju/persistent-cookiejar"
 	schemaform "gopkg.in/juju/environschema.v1/form"
-	"gopkg.in/macaroon-bakery.v2/httpbakery"
-	"gopkg.in/macaroon-bakery.v2/httpbakery/form"
+	"gopkg.in/macaroon-bakery.v3/httpbakery"
+	"gopkg.in/macaroon-bakery.v3/httpbakery/form"
 
 	"github.com/lxc/lxd/client"
 	"github.com/lxc/lxd/shared"
 )
 
-// Remote holds details for communication with a remote daemon
+// Remote holds details for communication with a remote daemon.
 type Remote struct {
 	Addr     string `yaml:"addr"`
 	AuthType string `yaml:"auth_type,omitempty"`
@@ -31,7 +30,7 @@ type Remote struct {
 	Static   bool   `yaml:"-"`
 }
 
-// ParseRemote splits remote and object
+// ParseRemote splits remote and object.
 func (c *Config) ParseRemote(raw string) (string, string, error) {
 	result := strings.SplitN(raw, ":", 2)
 	if len(result) == 1 {
@@ -51,7 +50,7 @@ func (c *Config) ParseRemote(raw string) (string, string, error) {
 	return result[0], result[1], nil
 }
 
-// GetInstanceServer returns a InstanceServer struct for the remote
+// GetInstanceServer returns a InstanceServer struct for the remote.
 func (c *Config) GetInstanceServer(name string) (lxd.InstanceServer, error) {
 	// Handle "local" on non-Linux
 	if name == "local" && runtime.GOOS != "linux" {
@@ -114,7 +113,7 @@ func (c *Config) GetInstanceServer(name string) (lxd.InstanceServer, error) {
 	return d, nil
 }
 
-// GetImageServer returns a ImageServer struct for the remote
+// GetImageServer returns a ImageServer struct for the remote.
 func (c *Config) GetImageServer(name string) (lxd.ImageServer, error) {
 	// Handle "local" on non-Linux
 	if name == "local" && runtime.GOOS != "linux" {
@@ -189,7 +188,7 @@ func (c *Config) GetImageServer(name string) (lxd.ImageServer, error) {
 }
 
 func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
-	remote, _ := c.Remotes[name]
+	remote := c.Remotes[name]
 	args := lxd.ConnectionArgs{
 		UserAgent: c.UserAgent,
 		AuthType:  remote.AuthType,
@@ -239,6 +238,7 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 			if c.cookieJars == nil {
 				c.cookieJars = map[string]*cookiejar.Jar{}
 			}
+
 			c.cookieJars[name] = jar
 		}
 
@@ -252,7 +252,7 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 
 	// Server certificate
 	if shared.PathExists(c.ServerCertPath(name)) {
-		content, err := ioutil.ReadFile(c.ServerCertPath(name))
+		content, err := os.ReadFile(c.ServerCertPath(name))
 		if err != nil {
 			return nil, err
 		}
@@ -267,7 +267,7 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 
 	// Client certificate
 	if shared.PathExists(c.ConfigPath("client.crt")) {
-		content, err := ioutil.ReadFile(c.ConfigPath("client.crt"))
+		content, err := os.ReadFile(c.ConfigPath("client.crt"))
 		if err != nil {
 			return nil, err
 		}
@@ -277,7 +277,7 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 
 	// Client CA
 	if shared.PathExists(c.ConfigPath("client.ca")) {
-		content, err := ioutil.ReadFile(c.ConfigPath("client.ca"))
+		content, err := os.ReadFile(c.ConfigPath("client.ca"))
 		if err != nil {
 			return nil, err
 		}
@@ -287,13 +287,16 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 
 	// Client key
 	if shared.PathExists(c.ConfigPath("client.key")) {
-		content, err := ioutil.ReadFile(c.ConfigPath("client.key"))
+		content, err := os.ReadFile(c.ConfigPath("client.key"))
 		if err != nil {
 			return nil, err
 		}
 
 		pemKey, _ := pem.Decode(content)
-		if x509.IsEncryptedPEMBlock(pemKey) {
+		// Golang has deprecated all methods relating to PEM encryption due to a vulnerability.
+		// However, the weakness does not make PEM unsafe for our purposes as it pertains to password protection on the
+		// key file (client.key is only readable to the user in any case), so we'll ignore deprecation.
+		if x509.IsEncryptedPEMBlock(pemKey) { //nolint:staticcheck
 			if c.PromptPassword == nil {
 				return nil, fmt.Errorf("Private key is password protected and no helper was configured")
 			}
@@ -303,7 +306,7 @@ func (c *Config) getConnectionArgs(name string) (*lxd.ConnectionArgs, error) {
 				return nil, err
 			}
 
-			derKey, err := x509.DecryptPEMBlock(pemKey, []byte(password))
+			derKey, err := x509.DecryptPEMBlock(pemKey, []byte(password)) //nolint:staticcheck
 			if err != nil {
 				return nil, err
 			}

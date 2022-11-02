@@ -36,6 +36,7 @@ type Network interface {
 	Status() string
 	LocalStatus() string
 	Config() map[string]string
+	Locations() []string
 	IsUsed() (bool, error)
 	IsManaged() bool
 	DHCPv4Subnet() *net.IPNet
@@ -61,6 +62,11 @@ type Network interface {
 	ForwardCreate(forward api.NetworkForwardsPost, clientType request.ClientType) error
 	ForwardUpdate(listenAddress string, newForward api.NetworkForwardPut, clientType request.ClientType) error
 	ForwardDelete(listenAddress string, clientType request.ClientType) error
+
+	// Load Balancers.
+	LoadBalancerCreate(loadBalancer api.NetworkLoadBalancersPost, clientType request.ClientType) error
+	LoadBalancerUpdate(listenAddress string, newLoadBalancer api.NetworkLoadBalancerPut, clientType request.ClientType) error
+	LoadBalancerDelete(listenAddress string, clientType request.ClientType) error
 
 	// Peerings.
 	PeerCreate(forward api.NetworkPeersPost) error

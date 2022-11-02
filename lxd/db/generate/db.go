@@ -1,3 +1,5 @@
+//go:build linux && cgo && !agent
+
 package main
 
 import (
@@ -25,7 +27,7 @@ func newDb() *cobra.Command {
 
 	// Workaround for subcommand usage errors. See: https://github.com/spf13/cobra/issues/706
 	cmd.Args = cobra.NoArgs
-	cmd.Run = func(cmd *cobra.Command, args []string) { cmd.Usage() }
+	cmd.Run = func(cmd *cobra.Command, args []string) { _ = cmd.Usage() }
 	return cmd
 }
 
@@ -59,17 +61,21 @@ func newDbMapper() *cobra.Command {
 
 func newDbMapperReset() *cobra.Command {
 	var target string
+	var build string
+	var iface bool
 
 	cmd := &cobra.Command{
 		Use:   "reset",
 		Short: "Reset target source file and its interface file.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return file.Reset(target, db.Imports)
+			return file.Reset(target, db.Imports, build, iface)
 		},
 	}
 
 	flags := cmd.Flags()
+	flags.BoolVarP(&iface, "interface", "i", false, "create interface files")
 	flags.StringVarP(&target, "target", "t", "-", "target source file to generate")
+	flags.StringVarP(&build, "build", "b", "", "build comment to include")
 
 	return cmd
 }
@@ -101,14 +107,14 @@ func newDbMapperStmt() *cobra.Command {
 				return err
 			}
 
-			return file.Append(target, stmt)
+			return file.Append(entity, target, stmt, false)
 		},
 	}
 
 	flags := cmd.Flags()
 	flags.StringVarP(&target, "target", "t", "-", "target source file to generate")
-	flags.StringVarP(&database, "database", "d", "cluster", "target database")
-	flags.StringVarP(&pkg, "package", "p", "api", "Go package where the entity struct is declared")
+	flags.StringVarP(&database, "database", "d", "", "target database")
+	flags.StringVarP(&pkg, "package", "p", "", "Go package where the entity struct is declared")
 	flags.StringVarP(&entity, "entity", "e", "", "database entity to generate the statement for")
 
 	return cmd
@@ -119,6 +125,7 @@ func newDbMapperMethod() *cobra.Command {
 	var database string
 	var pkg string
 	var entity string
+	var iface bool
 
 	cmd := &cobra.Command{
 		Use:   "method [kind] [param1=value1 ... paramN=valueN]",
@@ -141,14 +148,15 @@ func newDbMapperMethod() *cobra.Command {
 				return err
 			}
 
-			return file.Append(target, method)
+			return file.Append(entity, target, method, iface)
 		},
 	}
 
 	flags := cmd.Flags()
+	flags.BoolVarP(&iface, "interface", "i", false, "create interface files")
 	flags.StringVarP(&target, "target", "t", "-", "target source file to generate")
-	flags.StringVarP(&database, "database", "d", "cluster", "target database")
-	flags.StringVarP(&pkg, "package", "p", "api", "Go package where the entity struct is declared")
+	flags.StringVarP(&database, "database", "d", "", "target database")
+	flags.StringVarP(&pkg, "package", "p", "", "Go package where the entity struct is declared")
 	flags.StringVarP(&entity, "entity", "e", "", "database entity to generate the method for")
 
 	return cmd
@@ -161,6 +169,7 @@ func parseParams(args []string) (map[string]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("Invalid config parameter: %w", err)
 		}
+
 		config[key] = value
 	}
 

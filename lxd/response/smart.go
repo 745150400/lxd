@@ -11,7 +11,7 @@ import (
 )
 
 var httpResponseErrors = map[int][]error{
-	http.StatusNotFound:  {os.ErrNotExist, sql.ErrNoRows, db.ErrNoSuchObject},
+	http.StatusNotFound:  {os.ErrNotExist, sql.ErrNoRows},
 	http.StatusForbidden: {os.ErrPermission},
 	http.StatusConflict:  {db.ErrAlreadyDefined},
 }
@@ -23,7 +23,8 @@ func SmartError(err error) Response {
 		return EmptySyncResponse
 	}
 
-	if statusCode, found := api.StatusErrorMatch(err); found {
+	statusCode, found := api.StatusErrorMatch(err)
+	if found {
 		return &errorResponse{statusCode, err.Error()}
 	}
 
@@ -47,7 +48,7 @@ func SmartError(err error) Response {
 
 // IsNotFoundError returns true if the error is considered a Not Found error.
 func IsNotFoundError(err error) bool {
-	if _, found := api.StatusErrorMatch(err, http.StatusNotFound); found {
+	if api.StatusErrorCheck(err, http.StatusNotFound) {
 		return true
 	}
 

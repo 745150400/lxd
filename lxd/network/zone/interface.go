@@ -1,11 +1,11 @@
 package zone
 
 import (
+	"strings"
+
 	"github.com/lxc/lxd/lxd/cluster/request"
 	"github.com/lxc/lxd/lxd/state"
 	"github.com/lxc/lxd/shared/api"
-
-	"strings"
 )
 
 // NetworkZone represents a Network zone.
@@ -17,9 +17,10 @@ type NetworkZone interface {
 	ID() int64
 	Project() string
 	Info() *api.NetworkZone
-	Etag() []interface{}
+	Etag() []any
 	UsedBy() ([]string, error)
 	Content() (*strings.Builder, error)
+	SOA() (*strings.Builder, error)
 
 	// Records.
 	AddRecord(req api.NetworkZoneRecordsPost) error

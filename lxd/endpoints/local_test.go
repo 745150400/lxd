@@ -1,14 +1,14 @@
 package endpoints_test
 
 import (
-	"io/ioutil"
 	"net"
 	"os"
 	"testing"
 
-	"github.com/lxc/lxd/shared"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/lxc/lxd/shared"
 )
 
 // If no socket-based activation is detected, a new local unix socket will be
@@ -31,11 +31,11 @@ func TestEndpoints_LocalCreateUnixSocket(t *testing.T) {
 // Endpoints' unix socket.
 func TestEndpoints_LocalSocketBasedActivation(t *testing.T) {
 	listener := newUnixListener(t)
-	defer listener.Close() // This will also remove the underlying file
+	defer func() { _ = listener.Close() }() // This will also remove the underlying file
 
 	file, err := listener.File()
 	require.NoError(t, err)
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	endpoints, config, cleanup := newEndpoints(t)
 	defer cleanup()
@@ -92,12 +92,13 @@ func TestEndpoints_LocalAlreadyRunning(t *testing.T) {
 
 // Create a UnixListener using a random and unique file name.
 func newUnixListener(t *testing.T) *net.UnixListener {
-	file, err := ioutil.TempFile("", "lxd-endpoints-test")
+	file, err := os.CreateTemp("", "lxd-endpoints-test")
 	require.NoError(t, err)
 
 	path := file.Name()
-	file.Close()
-	os.Remove(path)
+	require.NoError(t, file.Close())
+	err = os.Remove(path)
+	require.NoError(t, err)
 
 	addr, err := net.ResolveUnixAddr("unix", path)
 	require.NoError(t, err)
