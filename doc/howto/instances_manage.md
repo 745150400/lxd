@@ -5,10 +5,11 @@ Enter the following command to list all instances:
 
     lxc list
 
-You can filter the instances that are displayed, for example, by type or status:
+You can filter the instances that are displayed, for example, by type, status or the cluster member where the instance is located:
 
     lxc list type=container
     lxc list status=running
+    lxc list location=server1
 
 You can also filter by name.
 To list several instances, use a regular expression for the name.
@@ -36,6 +37,14 @@ Enter the following command to start an instance:
 
 You will get an error if the instance does not exist or if it is running already.
 
+To immediately attach to the console when starting, pass the `--console` flag.
+For example:
+
+    lxc start <instance_name> --console
+
+See {ref}`instances-console` for more information.
+
+(instances-manage-stop)=
 ## Stop an instance
 
 Enter the following command to stop an instance:
